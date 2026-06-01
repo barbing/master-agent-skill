@@ -1,0 +1,5 @@
+interface:
+  display_name: "Master Coding Agent"
+  short_description: "Scoped work-order execution"
+  default_prompt: "Use $master-coding-agent to execute this bounded work order and return a coding receipt."
+

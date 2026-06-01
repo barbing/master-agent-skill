@@ -1,0 +1,5 @@
+interface:
+  display_name: "Master Review Agent"
+  short_description: "Independent evidence verdicts"
+  default_prompt: "Use $master-review-agent to review this receipt and return an evidence-based verdict."
+

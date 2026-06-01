@@ -1,0 +1,4 @@
+interface:
+  display_name: "Master Strategy Agent"
+  short_description: "Bounded strategy packet drafting"
+  default_prompt: "Use $master-strategy-agent to turn a decision point into a strategy packet for the Master Agent."
