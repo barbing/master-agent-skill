@@ -1492,10 +1492,12 @@ def detect_agent_anomalies(state_dir: Path, agent_id: str) -> list[dict]:
             }
         )
 
+    repeated_loop_detected = False
     if len(history) >= 3:
         last_three = history[-3:]
         next_actions = [entry.get("next_action", "") for entry in last_three]
         if next_actions[0] and len(set(next_actions)) == 1:
+            repeated_loop_detected = True
             add(
                 "repeated-next-action-loop",
                 "high",
@@ -1542,12 +1544,41 @@ def detect_agent_anomalies(state_dir: Path, agent_id: str) -> list[dict]:
             )
 
     if latest.get("self_reported_anomaly"):
-        add(
-            "self-reported-anomaly",
-            "medium",
-            latest.get("self_reported_anomaly", ""),
-            "inspect and remediate",
-        )
+        anomaly_text = latest.get("self_reported_anomaly", "")
+        normalized_anomaly = anomaly_text.lower()
+        if any(
+            marker in normalized_anomaly
+            for marker in ["attention", "context overload", "context bloat", "lost focus"]
+        ):
+            if not repeated_loop_detected:
+                add(
+                    "attention-drift",
+                    "high",
+                    anomaly_text,
+                    "spawn successor with compact inherited context",
+                )
+        else:
+            add(
+                "self-reported-anomaly",
+                "medium",
+                anomaly_text,
+                "inspect and remediate",
+            )
+
+    if latest.get("risk"):
+        risk_text = latest.get("risk", "")
+        normalized_risk = risk_text.lower()
+        if any(
+            marker in normalized_risk
+            for marker in ["attention drift", "context overload", "context bloat", "lost focus"]
+        ):
+            if not repeated_loop_detected:
+                add(
+                    "attention-drift",
+                    "high",
+                    risk_text,
+                    "spawn successor with compact inherited context",
+                )
 
     budget_exit, budget_messages = budget_findings(state_dir)
     if budget_exit >= 1 and broad_next_action(latest.get("next_action", "")):
@@ -1587,6 +1618,15 @@ def repeated_next_action(history: list[dict]) -> str:
     if next_actions[0] and len(set(next_actions)) == 1:
         return next_actions[0]
     return ""
+
+
+def optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def agent_token_status(state_dir: Path, agent_id: str) -> str:
@@ -1672,6 +1712,108 @@ def write_remediation_packet(
     return output_path
 
 
+def write_session_rotation_packets(
+    state_dir: Path,
+    agent_id: str,
+    successor_agent_id: str,
+    reason: str,
+    predecessor_state_packet: Path | None,
+) -> tuple[Path, Path]:
+    agents = load_agents(state_dir)
+    if agent_id not in agents:
+        raise SystemExit(f"Unknown agent id: {agent_id}")
+    predecessor = agents[agent_id]
+    history = load_agent_heartbeats(state_dir, agent_id)
+    latest = history[-1] if history else predecessor
+    current_plan = current_strategy_plan(state_dir)
+    current_plan_id = current_plan.get("plan_id") if current_plan else latest.get("plan_id", "")
+    forbidden_repeat = repeated_next_action(history)
+    output_dir = state_dir / "packets" / "session-rotation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    save_request = output_dir / f"{agent_id}-save-state-request.md"
+    save_text = f"""# Agent State Save Request
+
+## Instruction
+
+Stop current implementation and return a compact predecessor state packet before doing any more task work.
+
+## Required State
+
+- Agent id: {agent_id}
+- Task id: {predecessor.get('task_id', '')}
+- Objective: {predecessor.get('objective', '')}
+- Scope: {predecessor.get('scope', '')}
+- Accepted plan id: {current_plan_id or ''}
+- Current artifact/file: {latest.get('current', '')}
+- Last concrete progress: {latest.get('last_action', '')}
+- Next intended action: {latest.get('next_action', '')}
+- Files changed: {latest.get('files_changed', '')}
+- Artifacts: {latest.get('artifacts', '')}
+- Commands: {latest.get('commands', '')}
+- Open risks: {latest.get('risk', '')}
+- Token status: {agent_token_status(state_dir, agent_id)}
+- Forbidden repeats: {forbidden_repeat}
+
+## Output Contract
+
+Return only a compact state packet with completed work, changed files, validation, unresolved blockers, risks, and the next atomic safe step. Do not continue implementation in this session.
+"""
+    atomic_write_text(save_request, save_text)
+
+    predecessor_state_source = "latest heartbeat"
+    predecessor_state_text = ""
+    if predecessor_state_packet:
+        predecessor_state_source = str(predecessor_state_packet)
+        predecessor_state_text = predecessor_state_packet.read_text(encoding="utf-8")
+
+    successor_context = output_dir / f"{agent_id}-to-{successor_agent_id}-context.md"
+    context_text = f"""# Successor Context Packet
+
+## Rotation Metadata
+
+- Predecessor agent id: {agent_id}
+- Successor agent id: {successor_agent_id}
+- Inheritance reason: {reason}
+- State save request: {save_request}
+- Predecessor state source: {predecessor_state_source}
+
+## Assignment
+
+- Role: {predecessor.get('role', '')}
+- Task id: {predecessor.get('task_id', '')}
+- Objective: {predecessor.get('objective', '')}
+- Scope: {predecessor.get('scope', '')}
+- Accepted plan id: {current_plan_id or ''}
+
+## Latest Predecessor State
+
+- Current artifact/file: {latest.get('current', '')}
+- Last concrete progress: {latest.get('last_action', '')}
+- Next intended action: {latest.get('next_action', '')}
+- Files changed: {latest.get('files_changed', '')}
+- Artifacts: {latest.get('artifacts', '')}
+- Commands: {latest.get('commands', '')}
+- Open risks: {latest.get('risk', '')}
+- Token status: {agent_token_status(state_dir, agent_id)}
+- Forbidden repeats: {forbidden_repeat}
+
+## Predecessor State Packet
+
+{predecessor_state_text or '- No final predecessor state packet was supplied; use the latest structured heartbeat and state save request as the continuity baseline.'}
+
+## Successor Instructions
+
+- Treat this packet as the authority for inherited context.
+- Do not read or rely on raw predecessor chat history unless the Master explicitly authorizes it.
+- Start from the next atomic safe step, not from the predecessor's repeated loop.
+- Preserve the accepted plan, scope, validation requirements, and stop conditions.
+- Report the first heartbeat before making risky edits.
+"""
+    atomic_write_text(successor_context, context_text)
+    return save_request, successor_context
+
+
 def command_remediate_agent(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
     agents = load_agents(state_dir)
@@ -1753,6 +1895,8 @@ def remediation_action_for_anomaly(anomaly: dict) -> str:
     anomaly_type = anomaly.get("type", "")
     if anomaly_type in {"scope-drift", "plan-mismatch"}:
         return "stop-agent"
+    if anomaly_type in {"attention-drift", "repeated-next-action-loop"}:
+        return "spawn-successor"
     if anomaly_type == "token-risk":
         return "split-task"
     return "reinforce-context"
@@ -2477,6 +2621,166 @@ def command_session_archive(args: argparse.Namespace) -> int:
         },
     )
     print(f"Archived session {args.agent_id}")
+    return 0
+
+
+def command_rotate_session(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    agents = load_agents(state_dir)
+    if args.agent_id not in agents:
+        print(f"Unknown agent id: {args.agent_id}", file=sys.stderr)
+        return 1
+    if args.successor_agent_id in agents:
+        print(
+            f"Successor agent already exists: {args.successor_agent_id}",
+            file=sys.stderr,
+        )
+        return 2
+
+    predecessor = agents[args.agent_id]
+    predecessor_state_packet: Path | None = None
+    if args.predecessor_state_packet:
+        predecessor_state_packet = Path(args.predecessor_state_packet).resolve()
+        if not predecessor_state_packet.exists():
+            print(
+                f"Predecessor state packet does not exist: {predecessor_state_packet}",
+                file=sys.stderr,
+            )
+            return 2
+    elif args.require_predecessor_state:
+        print(
+            "Rotation requires --predecessor-state-packet when --require-predecessor-state is set.",
+            file=sys.stderr,
+        )
+        return 2
+
+    predecessor_event = latest_session_event(state_dir, args.agent_id)
+    provider = args.provider or (
+        str(predecessor_event.get("provider") or "file") if predecessor_event else "file"
+    )
+    if provider == "codex" and not required_provider_command(args, provider):
+        return 2
+
+    safety_code, safety_status, safety_reasons = assess_safety(
+        state_dir=state_dir,
+        action="spawn-successor",
+        role=predecessor.get("role", ""),
+        scope=predecessor.get("scope", ""),
+        budget_impact=args.budget_impact,
+    )
+    if safety_code == 2:
+        print("Safety blocked session rotation")
+        for reason in safety_reasons:
+            print(f"- {reason}")
+        return 2
+
+    save_request, successor_context = write_session_rotation_packets(
+        state_dir=state_dir,
+        agent_id=args.agent_id,
+        successor_agent_id=args.successor_agent_id,
+        reason=args.reason,
+        predecessor_state_packet=predecessor_state_packet,
+    )
+
+    if predecessor_event:
+        send_code = command_session_send(
+            argparse.Namespace(
+                state_dir=str(state_dir),
+                agent_id=args.agent_id,
+                message=(
+                    "Save current state for session rotation, stop current implementation, "
+                    f"and follow this packet: {save_request}"
+                ),
+                provider_command=args.provider_command,
+                provider_timeout_seconds=args.provider_timeout_seconds,
+                at=args.at,
+            )
+        )
+        if send_code:
+            return send_code
+        archive_code = command_session_archive(
+            argparse.Namespace(
+                state_dir=str(state_dir),
+                agent_id=args.agent_id,
+                provider_command=args.provider_command,
+                provider_timeout_seconds=args.provider_timeout_seconds,
+                at=args.at,
+            )
+        )
+        if archive_code:
+            return archive_code
+
+    successor_role = args.successor_role or predecessor.get("role", "")
+    successor_task_id = args.successor_task_id or predecessor.get("task_id", "")
+    successor_objective = args.successor_objective or predecessor.get("objective", "")
+    successor_scope = args.successor_scope or predecessor.get("scope", "")
+    token_budget = (
+        args.token_budget
+        if args.token_budget is not None
+        else optional_int(predecessor.get("token_budget"))
+    )
+    max_heartbeats = (
+        args.max_heartbeats
+        if args.max_heartbeats is not None
+        else optional_int(predecessor.get("max_heartbeats"))
+    )
+    register_code = command_register_agent(
+        argparse.Namespace(
+            state_dir=str(state_dir),
+            agent_id=args.successor_agent_id,
+            role=successor_role,
+            task_id=successor_task_id,
+            objective=successor_objective,
+            scope=successor_scope,
+            status="starting",
+            token_budget=token_budget,
+            max_heartbeats=max_heartbeats,
+            plan_id=predecessor.get("plan_id", ""),
+            at=args.at,
+        )
+    )
+    if register_code:
+        return register_code
+
+    agents = load_agents(state_dir)
+    agents[args.agent_id]["status"] = "stopping"
+    agents[args.agent_id]["stop_reason"] = f"rotated: {args.reason}"
+    agents[args.agent_id]["successor_agent_id"] = args.successor_agent_id
+    save_agents(state_dir, agents)
+    render_running_agents(state_dir, agents)
+
+    create_code = command_session_create(
+        argparse.Namespace(
+            state_dir=str(state_dir),
+            agent_id=args.successor_agent_id,
+            role=successor_role,
+            context_packet=str(successor_context),
+            provider=provider,
+            provider_command=args.provider_command,
+            provider_timeout_seconds=args.provider_timeout_seconds,
+            predecessor_agent_id=args.agent_id,
+            reason=args.reason,
+            at=args.at,
+        )
+    )
+    if create_code:
+        return create_code
+
+    append_event_log(
+        state_dir=state_dir,
+        event_type="session-rotation",
+        related_packet=str(successor_context),
+        summary=f"rotated {args.agent_id} to {args.successor_agent_id}: {args.reason}",
+        evidence=f"{save_request}; {successor_context}",
+        ledger_update="predecessor stopped and successor session created",
+        next_action=f"monitor {args.successor_agent_id} first heartbeat",
+        at=format_time(parse_time(args.at)),
+    )
+    print(f"Rotated session {args.agent_id} -> {args.successor_agent_id}")
+    print(f"Save-state request: {save_request}")
+    print(f"Successor context: {successor_context}")
+    if safety_status != "allowed":
+        print(f"Safety status: {safety_status}")
     return 0
 
 
@@ -3567,6 +3871,26 @@ def build_parser() -> argparse.ArgumentParser:
     session_archive.add_argument("--provider-timeout-seconds", type=float, default=60)
     session_archive.add_argument("--at")
     session_archive.set_defaults(func=command_session_archive)
+
+    rotate = subparsers.add_parser("rotate-session", help="Freeze a drifting sub-agent and launch a successor session.")
+    rotate.add_argument("--state-dir", required=True)
+    rotate.add_argument("--agent-id", required=True)
+    rotate.add_argument("--successor-agent-id", required=True)
+    rotate.add_argument("--reason", required=True)
+    rotate.add_argument("--provider", choices=["file", "codex"])
+    rotate.add_argument("--provider-command")
+    rotate.add_argument("--provider-timeout-seconds", type=float, default=60)
+    rotate.add_argument("--predecessor-state-packet")
+    rotate.add_argument("--require-predecessor-state", action="store_true")
+    rotate.add_argument("--successor-role")
+    rotate.add_argument("--successor-task-id")
+    rotate.add_argument("--successor-objective")
+    rotate.add_argument("--successor-scope")
+    rotate.add_argument("--token-budget", type=int)
+    rotate.add_argument("--max-heartbeats", type=int)
+    rotate.add_argument("--budget-impact", type=int, default=0)
+    rotate.add_argument("--at")
+    rotate.set_defaults(func=command_rotate_session)
 
     session_reconcile = subparsers.add_parser("session-reconcile", help="Reconcile requested sessions with provider evidence.")
     session_reconcile.add_argument("--state-dir", required=True)

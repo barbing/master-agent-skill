@@ -1,6 +1,6 @@
 ---
 name: master-agent-system
-description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, managing token budgets, optimizing sub-agent token use, defining or activating project-specific agent roles, or standardizing strategy, coding, review, and policy handoffs.
+description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, defining or activating project-specific agent roles, or standardizing strategy, coding, review, and policy handoffs.
 ---
 
 # Master Agent System
@@ -15,7 +15,7 @@ The system keeps long project continuity outside conversation history by using l
 
 Read `references/master-agent-system.md` when setting up the system, designing a new project adapter, or resolving a coordination ambiguity.
 
-Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, accepts strategy plans, records heartbeats, audits anomalies, creates remediation packets, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
+Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, accepts strategy plans, records heartbeats, audits anomalies, creates remediation packets, rotates overloaded sessions into successor agents, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
 
 Copy templates from `assets/templates/` when a single artifact is needed without bootstrapping the full state pack.
 
@@ -73,6 +73,7 @@ Define custom roles only when a project has a recurring or specialized responsib
 | Need to check roadmap, policy, boundaries, or acceptance criteria | Policy Review Agent |
 | Need a recurring specialized responsibility not covered by active roles | Draft `role-proposal.md`, then define and activate a custom role |
 | Need to reconcile accepted packets, update next action, or stop drift | Master Agent only |
+| Need to replace an overloaded or looping sub-agent without losing continuity | `rotate-session` |
 
 ## Parallelism Gate
 
@@ -153,6 +154,8 @@ python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --ag
 python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --agent-id strategy-live --provider-command "<provider command>"
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir> --provider-command "<provider command>"
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-live-1 --successor-agent-id coding-live-2 --reason attention-drift --provider codex --provider-command "<provider command>"
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"

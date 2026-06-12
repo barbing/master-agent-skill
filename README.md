@@ -9,7 +9,7 @@ The system is designed to keep project continuity outside chat history by using 
 - A main `master-agent-system` Codex skill.
 - Role skills for Strategy, Coding, Review, and Policy Review agents.
 - State-pack templates under `assets/templates/`.
-- CLI helpers under `scripts/` for bootstrapping, validation, session control, role governance, heartbeat monitoring, token tracking, supervisor lifecycle, and recovery.
+- CLI helpers under `scripts/` for bootstrapping, validation, session control, session rotation, role governance, heartbeat monitoring, token tracking, supervisor lifecycle, and recovery.
 - Regression tests for safety-critical behavior.
 - A detailed reference manual at `references/master-agent-system.md`.
 
@@ -91,6 +91,7 @@ Read `references/master-agent-system.md` before deploying the workflow on a real
 
 - The local file provider is for offline testing and state simulation.
 - Live Codex session control requires a provider adapter passed with `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER`.
+- Use `rotate-session` to freeze an overloaded predecessor, create a successor context, archive the predecessor session, register the successor, and start the successor session with inheritance metadata.
 - Long-running supervision should be launched through the operating system scheduler or service wrapper appropriate for the deployment environment.
 - Custom roles must have explicit approval evidence, scope, positive token budget, heartbeat cap, and deactivation conditions before activation.
 

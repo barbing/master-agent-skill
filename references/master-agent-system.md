@@ -185,11 +185,19 @@ python scripts/master_agent_tool.py watch-heartbeats --state-dir <state-dir> --s
 
 `check-heartbeats` and `watch-heartbeats` exit `1` when any monitored agent is stale. Use that non-zero exit as the Master Agent's escalation trigger.
 
-`supervise` is the durable runtime loop for unattended monitoring. Each cycle validates the state pack, checks stale heartbeats, checks token budget pressure, reads strategy sync, audits monitored agents, applies safety-envelope remediation, and renders `runtime-status.md`. Repeated identical remediation for the same agent stops the agent and creates a Strategy review packet. Critical safety breaches stop the affected agent immediately. Quiet periods defer noncritical work until the next wakeup.
+`supervise` is the durable runtime loop for unattended monitoring. Each cycle validates the state pack, checks stale heartbeats, checks token budget pressure, reads strategy sync, audits monitored agents, applies safety-envelope remediation, and renders `runtime-status.md`. Repeated next-action loops and attention-drift signals create successor handoff packets. Repeated identical remediation for the same agent stops the agent and creates a Strategy review packet. Critical safety breaches stop the affected agent immediately. Quiet periods defer noncritical work until the next wakeup.
 
 Use `supervisor-start --spawn`, `supervisor-status`, `supervisor-stop`, and `supervisor-recover` as the process lifecycle surface around `supervise`. On Windows, the deployment model is intentionally dependency-light: use Task Scheduler or a service wrapper to launch the command from the project root, write logs to a known path, and use `supervisor-stop` for graceful shutdown rather than killing unrelated processes. `supervisor-status` verifies the recorded PID, supervisor identity nonce, lock file, crash marker, stop request, and heartbeat freshness before reporting the supervisor as running. `supervisor-recover` refuses to clear a live supervisor unless `--force` is supplied; use forced recovery only after independently confirming the recorded process must be overridden.
 
-Use `session-create`, `session-send`, `session-read`, `session-archive`, and `session-reconcile` as a provider-neutral adapter. The file provider is a local mock for testing and offline use. The `codex` provider requires `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER` for every live operation; the command receives a JSON request on stdin and must return JSON with confirmed session state plus provider evidence. Provider commands are parsed as argv, not executed through a shell. Unsupported providers stay in `pending-manual-provider` rather than silently reporting success.
+Use `session-create`, `session-send`, `session-read`, `session-archive`, `session-reconcile`, and `rotate-session` as a provider-neutral adapter. The file provider is a local mock for testing and offline use. The `codex` provider requires `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER` for every live operation; the command receives a JSON request on stdin and must return JSON with confirmed session state plus provider evidence. Provider commands are parsed as argv, not executed through a shell. Unsupported providers stay in `pending-manual-provider` rather than silently reporting success.
+
+Use `rotate-session` when a sub-agent has accumulated too much context, loops on the same next action, reports attention drift, exceeds heartbeat caps, or needs a clean successor session. The command performs the controlled transition: creates a save-state request for the predecessor, optionally includes a supplied predecessor state packet, sends the save request to the predecessor session when one exists, archives the predecessor session, registers the successor agent, creates the successor context packet, starts the successor session with predecessor metadata, stops the predecessor in `running-agents.md`, and appends an event-log entry.
+
+```bash
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-live-1 --successor-agent-id coding-live-2 --reason attention-drift --provider codex --provider-command "<provider command>"
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id strategy-1 --successor-agent-id strategy-2 --reason context-overload --predecessor-state-packet packets/strategy-1-final-state.md --require-predecessor-state
+```
 
 Use `record-incident`, `alert-status`, `acknowledge-alert`, and `telemetry-summary` for production observability. Critical incidents automatically open alerts, and supervisor-detected critical safety breaches or repeated remediation failures create incidents so they cannot pass silently. Acknowledgement appends an audit record instead of deleting the original alert.
 
@@ -260,6 +268,7 @@ The Master must check strategy sync before issuing implementation or review work
 Use `audit-agent` after heartbeats, validation, or suspicious progress reports. The audit checks for:
 
 - Repeated identical next actions across three heartbeats.
+- Attention drift, context overload, context bloat, or lost-focus signals in self-reported anomalies or risk fields.
 - Scope status of `no` or `unsure`.
 - Plan alignment of `no` or a plan id that differs from the accepted plan.
 - Complete status without commands, artifacts, changed files, or concrete evidence.
@@ -278,7 +287,7 @@ Supported actions:
 - `split-task`: create a split-task packet when scope is too large.
 - `stop-agent`: mark the agent stopping and require review before continuation.
 
-If safety returns a hard block, no remediation packet is created. If safety returns an internal-review condition, the packet is created but should be reviewed before spawning more work.
+If safety returns a hard block, no remediation packet is created. If safety returns an internal-review condition, the packet is created but should be reviewed before spawning more work. For actual session replacement, use `rotate-session` after the successor handoff is accepted or when the Master has enough state to safely rotate without another review.
 
 ## Token Optimization Strategy
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "Master Agent System"
-  short_description: "Master-agent runtime, session, role, heartbeat, token, and recovery controls"
-  default_prompt: "Use $master-agent-system to set up a project-neutral Master Agent state pack with safety envelopes, governed roles, strategy sync, heartbeats, token telemetry, runtime supervision, session control, observability, and state recovery."
+  short_description: "Master-agent runtime, session rotation, role, heartbeat, token, and recovery controls"
+  default_prompt: "Use $master-agent-system to set up a project-neutral Master Agent state pack with safety envelopes, governed roles, strategy sync, heartbeats, token telemetry, runtime supervision, session control and rotation, observability, and state recovery."

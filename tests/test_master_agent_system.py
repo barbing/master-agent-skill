@@ -2011,7 +2011,7 @@ class MasterAgentToolTests(unittest.TestCase):
             )
         runtime_path = self.state_dir / "state" / "runtime.json"
         runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-        runtime["last_recoveries"] = {"coding-1:reinforce-context": 2}
+        runtime["last_recoveries"] = {"coding-1:spawn-successor": 2}
         runtime_path.write_text(json.dumps(runtime, indent=2) + "\n", encoding="utf-8")
 
         run_cmd(
@@ -2771,6 +2771,215 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(event["predecessor_agent_id"], "coding-1")
         self.assertEqual(event["inheritance_reason"], "attention-drift")
         self.assertEqual(Path(event["context_packet"]).read_text(encoding="utf-8"), "# Successor Context\n\nInherited state\n")
+
+    def test_rotate_session_freezes_predecessor_and_launches_successor(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        strategy_packet = self.tmp / "strategy-packet.md"
+        strategy_packet.write_text("# Strategy Packet\n", encoding="utf-8")
+        run_cmd(
+            [
+                TOOL,
+                "accept-strategy",
+                "--state-dir",
+                self.state_dir,
+                "--packet",
+                strategy_packet,
+                "--plan-id",
+                "PLAN-ROTATE",
+                "--summary",
+                "Rotate overloaded coding session",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-ROTATE",
+                "--objective",
+                "Finish parser repair",
+                "--scope",
+                "src/parser",
+                "--plan-id",
+                "PLAN-ROTATE",
+                "--token-budget",
+                "8000",
+                "--max-heartbeats",
+                "4",
+            ]
+        )
+        predecessor_context = self.tmp / "predecessor-context.md"
+        predecessor_context.write_text("# Predecessor Context\n", encoding="utf-8")
+        run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--context-packet",
+                predecessor_context,
+                "--provider",
+                "file",
+            ]
+        )
+        for index in range(3):
+            run_cmd(
+                [
+                    TOOL,
+                    "heartbeat",
+                    "--state-dir",
+                    self.state_dir,
+                    "--agent-id",
+                    "coding-1",
+                    "--state",
+                    "active",
+                    "--current",
+                    "src/parser/tokenizer.py",
+                    "--last-action",
+                    "patched parser state tracking" if index == 2 else f"attempt {index}",
+                    "--next-action",
+                    "continue patching parser",
+                    "--scope-status",
+                    "yes",
+                    "--confidence",
+                    "medium",
+                    "--files-changed",
+                    "src/parser/tokenizer.py",
+                    "--commands",
+                    "python -m unittest tests.test_parser",
+                    "--risk",
+                    "attention drift after long session",
+                ]
+            )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "rotate-session",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--successor-agent-id",
+                "coding-2",
+                "--reason",
+                "attention-drift",
+                "--provider",
+                "file",
+            ]
+        )
+        self.assertIn("Rotated session coding-1 -> coding-2", result.stdout)
+
+        save_request = (
+            self.state_dir
+            / "packets"
+            / "session-rotation"
+            / "coding-1-save-state-request.md"
+        )
+        successor_context = (
+            self.state_dir
+            / "packets"
+            / "session-rotation"
+            / "coding-1-to-coding-2-context.md"
+        )
+        self.assertTrue(save_request.exists())
+        self.assertTrue(successor_context.exists())
+        self.assertIn("Stop current implementation", save_request.read_text(encoding="utf-8"))
+        context_text = successor_context.read_text(encoding="utf-8")
+        self.assertIn("Predecessor agent id: coding-1", context_text)
+        self.assertIn("Successor agent id: coding-2", context_text)
+        self.assertIn("Inheritance reason: attention-drift", context_text)
+        self.assertIn("Last concrete progress: patched parser state tracking", context_text)
+        self.assertIn("Forbidden repeats: continue patching parser", context_text)
+
+        agents = json.loads((self.state_dir / "state" / "agents.json").read_text(encoding="utf-8"))
+        self.assertEqual(agents["coding-1"]["status"], "stopping")
+        self.assertEqual(agents["coding-1"]["stop_reason"], "rotated: attention-drift")
+        self.assertEqual(agents["coding-2"]["role"], "Coding")
+        self.assertEqual(agents["coding-2"]["objective"], "Finish parser repair")
+        self.assertEqual(agents["coding-2"]["plan_id"], "PLAN-ROTATE")
+
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "session-control.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertIn("session-sent", [event["event"] for event in events])
+        self.assertIn("session-archived", [event["event"] for event in events])
+        successor_event = events[-1]
+        self.assertEqual(successor_event["event"], "session-created")
+        self.assertEqual(successor_event["agent_id"], "coding-2")
+        self.assertEqual(successor_event["predecessor_agent_id"], "coding-1")
+        self.assertEqual(successor_event["inheritance_reason"], "attention-drift")
+        self.assertEqual(
+            Path(successor_event["context_packet"]).read_text(encoding="utf-8"),
+            successor_context.read_text(encoding="utf-8"),
+        )
+
+    def test_supervise_uses_successor_handoff_for_attention_drift_loop(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-LOOP",
+                "--objective",
+                "Finish bounded work",
+                "--scope",
+                "src/module",
+            ]
+        )
+        for index in range(3):
+            run_cmd(
+                [
+                    TOOL,
+                    "heartbeat",
+                    "--state-dir",
+                    self.state_dir,
+                    "--agent-id",
+                    "coding-1",
+                    "--state",
+                    "active",
+                    "--current",
+                    "src/module/file.py",
+                    "--last-action",
+                    f"attempt {index}",
+                    "--next-action",
+                    "continue patching",
+                    "--scope-status",
+                    "yes",
+                    "--confidence",
+                    "medium",
+                    "--risk",
+                    "attention drift",
+                ]
+            )
+
+        run_cmd([TOOL, "supervise", "--state-dir", self.state_dir, "--max-cycles", "1"])
+        runtime = json.loads((self.state_dir / "state" / "runtime.json").read_text(encoding="utf-8"))
+        self.assertIn("coding-1:spawn-successor", " ".join(runtime["active_interventions"]))
+        self.assertTrue(
+            (self.state_dir / "packets" / "remediation" / "coding-1-spawn-successor.md").exists()
+        )
 
     def test_incident_and_alert_templates_are_created(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
