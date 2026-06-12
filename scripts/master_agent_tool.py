@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -71,6 +72,32 @@ USAGE_CONFIDENCES = ("low", "medium", "high")
 LARGE_CONTINUATION_TOKENS = 5_000
 CURRENT_SCHEMA_VERSION = "1.0"
 ORDERED_MIGRATIONS = ["0001-base-state", "0002-runtime-session-observability"]
+DEFAULT_CODEX_APP_READ_MAX_MINUTES = 60.0
+
+PREDECESSOR_STATE_HEADINGS = [
+    "# Predecessor State Packet",
+    "## Objective",
+    "## Plan Id",
+    "## Completed Work",
+    "## Changed Files And Artifacts",
+    "## Validation Evidence",
+    "## Known Failures",
+    "## Risks",
+    "## Next Safe Step",
+    "## Forbidden Repeats",
+    "## Token Usage",
+    "## Open Questions",
+]
+
+PREDECESSOR_STATE_REQUIRED_SECTIONS = {
+    "## Objective",
+    "## Plan Id",
+    "## Completed Work",
+    "## Changed Files And Artifacts",
+    "## Validation Evidence",
+    "## Next Safe Step",
+    "## Token Usage",
+}
 
 DEFAULT_ROLES = {
     "Master": {
@@ -245,6 +272,43 @@ def table_value(value: object) -> str:
     if value is None:
         return ""
     return str(value).replace("|", "/").replace("\n", " ").strip()
+
+
+def parse_markdown_sections(text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if line.startswith("#"):
+            current = line.strip()
+            sections.setdefault(current, [])
+            continue
+        if current:
+            sections[current].append(line)
+    return {heading: "\n".join(lines).strip() for heading, lines in sections.items()}
+
+
+def section_has_content(value: str) -> bool:
+    stripped = "\n".join(
+        line.strip()
+        for line in value.splitlines()
+        if line.strip() and line.strip() not in {"-", "- ", "TODO", "TBD"}
+    ).strip()
+    return bool(stripped)
+
+
+def validate_predecessor_state_packet(path: Path) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"predecessor state packet does not exist: {path}"]
+    text = path.read_text(encoding="utf-8")
+    for heading in PREDECESSOR_STATE_HEADINGS:
+        if heading not in text:
+            errors.append(f"missing heading: {heading}")
+    sections = parse_markdown_sections(text)
+    for heading in sorted(PREDECESSOR_STATE_REQUIRED_SECTIONS):
+        if heading in sections and not section_has_content(sections[heading]):
+            errors.append(f"empty required section: {heading}")
+    return errors
 
 
 def yaml_quoted(value: object) -> str:
@@ -2294,15 +2358,55 @@ def load_session_events(state_dir: Path) -> list[dict]:
     return events
 
 
+def session_event_is_terminal(event: dict) -> bool:
+    return event.get("event") in {"session-archived", "session-stale"}
+
+
+def event_session_ref(event: dict) -> str:
+    return str(
+        event.get("provider_session_ref")
+        or event.get("provider_session_path")
+        or event.get("provider_session_id")
+        or ""
+    )
+
+
 def latest_session_event(state_dir: Path, agent_id: str) -> dict | None:
     for event in reversed(load_session_events(state_dir)):
         if event.get("agent_id") != agent_id:
             continue
-        if event.get("event") in {"session-archived", "session-stale"}:
+        if session_event_is_terminal(event):
             return None
-        if event.get("provider_session_path"):
+        if event.get("event") == "session-created" and event_session_ref(event):
             return event
     return None
+
+
+def latest_session_event_of_type(
+    state_dir: Path,
+    agent_id: str,
+    event_types: set[str],
+) -> dict | None:
+    for event in reversed(load_session_events(state_dir)):
+        if event.get("agent_id") == agent_id and event.get("event") in event_types:
+            return event
+    return None
+
+
+def latest_confirmed_read_event(state_dir: Path, agent_id: str) -> dict | None:
+    for event in reversed(load_session_events(state_dir)):
+        if (
+            event.get("agent_id") == agent_id
+            and event.get("event") == "session-read"
+            and event.get("provider") == "codex-app"
+            and event.get("provider_confirmed")
+        ):
+            return event
+    return None
+
+
+def codex_app_ref(thread_id: str) -> str:
+    return f"codex-app:{thread_id}"
 
 
 def run_session_provider_command(
@@ -2396,12 +2500,18 @@ def command_session_create(args: argparse.Namespace) -> int:
     session_dir.mkdir(parents=True, exist_ok=True)
     provider_session_path = session_dir / f"{args.agent_id}.json"
     provider_session_id = f"{args.provider}:{args.agent_id}"
+    provider_session_ref = str(provider_session_path)
     provider_confirmed = False
+    initial_status = "active" if args.provider == "file" else "pending-manual-provider"
+    if args.provider == "codex-app":
+        initial_status = "pending-codex-app-confirmation"
+        provider_session_id = ""
+        provider_session_ref = ""
     session = {
         "provider_session_id": provider_session_id,
         "agent_id": args.agent_id,
         "role": role_name,
-        "status": "active" if args.provider == "file" else "pending-manual-provider",
+        "status": initial_status,
         "context_packet": str(context_packet),
         "predecessor_agent_id": args.predecessor_agent_id or "",
         "inheritance_reason": args.reason or "",
@@ -2461,15 +2571,23 @@ def command_session_create(args: argparse.Namespace) -> int:
             return 2
         session["status"] = "active"
         session["provider_session_id"] = provider_session_id
+        provider_session_ref = str(provider_session_path)
         provider_confirmed = True
+    elif args.provider == "codex-app":
+        provider_session_path = Path("")
+        print(
+            "Codex app session create requested. Use create_thread, then run "
+            "`session-confirm-create` with the returned thread id."
+        )
     event = {
         "at": timestamp,
-        "event": "session-created",
+        "event": "session-create-requested" if args.provider == "codex-app" else "session-created",
         "agent_id": args.agent_id,
         "role": role_name,
         "provider": args.provider,
         "provider_session_id": provider_session_id,
-        "provider_session_path": str(provider_session_path),
+        "provider_session_path": "" if args.provider == "codex-app" else str(provider_session_path),
+        "provider_session_ref": provider_session_ref,
         "context_packet": str(context_packet),
         "predecessor_agent_id": args.predecessor_agent_id or "",
         "inheritance_reason": args.reason or "",
@@ -2477,7 +2595,147 @@ def command_session_create(args: argparse.Namespace) -> int:
         "provider_confirmed": provider_confirmed,
     }
     append_session_event(state_dir, event)
-    print(f"Created session {provider_session_id}")
+    if args.provider == "codex-app":
+        print(f"Requested Codex app session for {args.agent_id}")
+    else:
+        print(f"Created session {provider_session_id}")
+    return 0
+
+
+def command_session_confirm_create(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    request = latest_session_event_of_type(
+        state_dir,
+        args.agent_id,
+        {"session-create-requested"},
+    )
+    if not request:
+        print(f"No Codex app create request found for {args.agent_id}", file=sys.stderr)
+        return 1
+    if request.get("provider") != "codex-app":
+        print(f"Latest create request for {args.agent_id} is not codex-app", file=sys.stderr)
+        return 2
+    timestamp = format_time(parse_time(args.at))
+    event = {
+        "at": timestamp,
+        "event": "session-created",
+        "agent_id": args.agent_id,
+        "role": request.get("role", ""),
+        "provider": "codex-app",
+        "provider_session_id": args.thread_id,
+        "provider_session_path": "",
+        "provider_session_ref": codex_app_ref(args.thread_id),
+        "context_packet": request.get("context_packet", ""),
+        "predecessor_agent_id": request.get("predecessor_agent_id", ""),
+        "inheritance_reason": request.get("inheritance_reason", ""),
+        "status": "active",
+        "provider_confirmed": True,
+        "confirmation": args.note or "Codex app thread created",
+    }
+    append_session_event(state_dir, event)
+    print(f"Confirmed Codex app session {args.thread_id} for {args.agent_id}")
+    return 0
+
+
+def require_codex_app_session(state_dir: Path, agent_id: str) -> dict | None:
+    event = latest_session_event(state_dir, agent_id)
+    if not event:
+        print(f"No active session found for {agent_id}", file=sys.stderr)
+        return None
+    if event.get("provider") != "codex-app":
+        print(f"Session for {agent_id} is not a Codex app session", file=sys.stderr)
+        return None
+    if not event.get("provider_confirmed"):
+        print(f"Codex app session for {agent_id} is not confirmed", file=sys.stderr)
+        return None
+    return event
+
+
+def command_session_confirm_send(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    event = require_codex_app_session(state_dir, args.agent_id)
+    if not event:
+        return 1
+    request = latest_session_event_of_type(
+        state_dir,
+        args.agent_id,
+        {"session-send-requested"},
+    )
+    message = args.message or (request.get("message", "") if request else "")
+    if not message:
+        print("session-confirm-send requires --message when no send request exists", file=sys.stderr)
+        return 2
+    timestamp = format_time(parse_time(args.at))
+    append_session_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "session-sent",
+            "agent_id": args.agent_id,
+            "role": event.get("role", ""),
+            "provider": "codex-app",
+            "provider_session_id": args.thread_id or event.get("provider_session_id", ""),
+            "provider_session_path": "",
+            "provider_session_ref": codex_app_ref(args.thread_id or event.get("provider_session_id", "")),
+            "message": message,
+            "provider_confirmed": True,
+            "confirmation": args.note or "Codex app send_message_to_thread confirmed",
+        },
+    )
+    print(f"Confirmed Codex app send for {args.agent_id}")
+    return 0
+
+
+def command_session_confirm_read(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    event = require_codex_app_session(state_dir, args.agent_id)
+    if not event:
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    append_session_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "session-read",
+            "agent_id": args.agent_id,
+            "role": event.get("role", ""),
+            "provider": "codex-app",
+            "provider_session_id": args.thread_id or event.get("provider_session_id", ""),
+            "provider_session_path": "",
+            "provider_session_ref": codex_app_ref(args.thread_id or event.get("provider_session_id", "")),
+            "message_count": args.turn_count,
+            "summary": args.summary,
+            "provider_confirmed": True,
+            "confirmation": args.note or "Codex app read_thread confirmed",
+        },
+    )
+    print(f"Confirmed Codex app read for {args.agent_id}")
+    return 0
+
+
+def command_session_confirm_archive(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    event = require_codex_app_session(state_dir, args.agent_id)
+    if not event:
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    append_session_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "session-archived",
+            "agent_id": args.agent_id,
+            "role": event.get("role", ""),
+            "provider": "codex-app",
+            "provider_session_id": args.thread_id or event.get("provider_session_id", ""),
+            "provider_session_path": "",
+            "provider_session_ref": codex_app_ref(args.thread_id or event.get("provider_session_id", "")),
+            "status": "archived",
+            "provider_confirmed": True,
+            "confirmation": args.note or "Codex app archive confirmed",
+        },
+    )
+    print(f"Confirmed Codex app archive for {args.agent_id}")
     return 0
 
 
@@ -2498,8 +2756,29 @@ def command_session_send(args: argparse.Namespace) -> int:
     if not event:
         print(f"No session found for {args.agent_id}", file=sys.stderr)
         return 1
-    provider_session_path = Path(event["provider_session_path"])
+    provider_session_path = Path(event.get("provider_session_path") or "")
     timestamp = format_time(parse_time(args.at))
+    if event.get("provider") == "codex-app":
+        append_session_event(
+            state_dir,
+            {
+                "at": timestamp,
+                "event": "session-send-requested",
+                "agent_id": args.agent_id,
+                "role": event.get("role", ""),
+                "provider": "codex-app",
+                "provider_session_id": event.get("provider_session_id", ""),
+                "provider_session_path": "",
+                "provider_session_ref": event.get("provider_session_ref", ""),
+                "message": args.message,
+                "provider_confirmed": False,
+            },
+        )
+        print(
+            "Codex app send requested. Use send_message_to_thread, then run "
+            "`session-confirm-send`."
+        )
+        return 0
     if event.get("provider") == "codex":
         provider_payload, exit_code = run_live_session_operation(
             args,
@@ -2529,6 +2808,7 @@ def command_session_send(args: argparse.Namespace) -> int:
             "provider": event.get("provider", "file"),
             "provider_session_id": event.get("provider_session_id", ""),
             "provider_session_path": str(provider_session_path),
+            "provider_session_ref": event.get("provider_session_ref", str(provider_session_path)),
             "message": args.message,
             "provider_confirmed": event.get("provider") == "codex",
         },
@@ -2543,8 +2823,28 @@ def command_session_read(args: argparse.Namespace) -> int:
     if not event:
         print(f"No session found for {args.agent_id}", file=sys.stderr)
         return 1
-    provider_session_path = Path(event["provider_session_path"])
+    provider_session_path = Path(event.get("provider_session_path") or "")
     timestamp = format_time(parse_time(args.at))
+    if event.get("provider") == "codex-app":
+        append_session_event(
+            state_dir,
+            {
+                "at": timestamp,
+                "event": "session-read-requested",
+                "agent_id": args.agent_id,
+                "role": event.get("role", ""),
+                "provider": "codex-app",
+                "provider_session_id": event.get("provider_session_id", ""),
+                "provider_session_path": "",
+                "provider_session_ref": event.get("provider_session_ref", ""),
+                "provider_confirmed": False,
+            },
+        )
+        print(
+            "Codex app read requested. Use read_thread, then run "
+            "`session-confirm-read` with a compact summary."
+        )
+        return 0
     if event.get("provider") == "codex":
         provider_payload, exit_code = run_live_session_operation(
             args,
@@ -2575,6 +2875,7 @@ def command_session_read(args: argparse.Namespace) -> int:
             "provider": event.get("provider", "file"),
             "provider_session_id": event.get("provider_session_id", ""),
             "provider_session_path": str(provider_session_path),
+            "provider_session_ref": event.get("provider_session_ref", str(provider_session_path)),
             "message_count": len(session.get("messages", [])),
             "provider_confirmed": event.get("provider") == "codex",
         },
@@ -2588,8 +2889,29 @@ def command_session_archive(args: argparse.Namespace) -> int:
     if not event:
         print(f"No session found for {args.agent_id}", file=sys.stderr)
         return 1
-    provider_session_path = Path(event["provider_session_path"])
+    provider_session_path = Path(event.get("provider_session_path") or "")
     provider_confirmed = False
+    if event.get("provider") == "codex-app":
+        append_session_event(
+            state_dir,
+            {
+                "at": format_time(parse_time(args.at)),
+                "event": "session-archive-requested",
+                "agent_id": args.agent_id,
+                "role": event.get("role", ""),
+                "provider": "codex-app",
+                "provider_session_id": event.get("provider_session_id", ""),
+                "provider_session_path": "",
+                "provider_session_ref": event.get("provider_session_ref", ""),
+                "status": "pending-archive-confirmation",
+                "provider_confirmed": False,
+            },
+        )
+        print(
+            "Codex app archive requested. Use set_thread_archived, then run "
+            "`session-confirm-archive`."
+        )
+        return 0
     if event.get("provider") == "codex":
         provider_payload, exit_code = run_live_session_operation(
             args,
@@ -2616,11 +2938,68 @@ def command_session_archive(args: argparse.Namespace) -> int:
             "provider": event.get("provider", "file"),
             "provider_session_id": event.get("provider_session_id", ""),
             "provider_session_path": str(provider_session_path),
+            "provider_session_ref": event.get("provider_session_ref", str(provider_session_path)),
             "status": "archived",
             "provider_confirmed": provider_confirmed,
         },
     )
     print(f"Archived session {args.agent_id}")
+    return 0
+
+
+def command_validate_predecessor_state(args: argparse.Namespace) -> int:
+    packet = Path(args.packet).resolve()
+    errors = validate_predecessor_state_packet(packet)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    print(f"Predecessor state packet is valid: {packet}")
+    return 0
+
+
+def command_request_rotation(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    agents = load_agents(state_dir)
+    if args.agent_id not in agents:
+        print(f"Unknown agent id: {args.agent_id}", file=sys.stderr)
+        return 1
+    save_request, _successor_context = write_session_rotation_packets(
+        state_dir=state_dir,
+        agent_id=args.agent_id,
+        successor_agent_id=args.successor_agent_id,
+        reason=args.reason,
+        predecessor_state_packet=None,
+    )
+    predecessor_event = latest_session_event(state_dir, args.agent_id)
+    if predecessor_event:
+        send_code = command_session_send(
+            argparse.Namespace(
+                state_dir=str(state_dir),
+                agent_id=args.agent_id,
+                message=(
+                    "Save current state for strict session rotation, stop current task work, "
+                    f"and return a predecessor-state-packet using this request: {save_request}"
+                ),
+                provider_command=args.provider_command,
+                provider_timeout_seconds=args.provider_timeout_seconds,
+                at=args.at,
+            )
+        )
+        if send_code:
+            return send_code
+    append_event_log(
+        state_dir=state_dir,
+        event_type="rotation-request",
+        related_packet=str(save_request),
+        summary=f"requested strict rotation state from {args.agent_id}",
+        evidence=str(save_request),
+        ledger_update="rotation request issued; successor not launched yet",
+        next_action="wait for validated predecessor-state-packet",
+        at=format_time(parse_time(args.at)),
+    )
+    print(f"Rotation state requested for {args.agent_id}")
+    print(f"Save-state request: {save_request}")
     return 0
 
 
@@ -2641,15 +3020,16 @@ def command_rotate_session(args: argparse.Namespace) -> int:
     predecessor_state_packet: Path | None = None
     if args.predecessor_state_packet:
         predecessor_state_packet = Path(args.predecessor_state_packet).resolve()
-        if not predecessor_state_packet.exists():
-            print(
-                f"Predecessor state packet does not exist: {predecessor_state_packet}",
-                file=sys.stderr,
-            )
+        errors = validate_predecessor_state_packet(predecessor_state_packet)
+        if errors:
+            for error in errors:
+                print(error, file=sys.stderr)
             return 2
-    elif args.require_predecessor_state:
+    elif not args.emergency_without_predecessor_state:
         print(
-            "Rotation requires --predecessor-state-packet when --require-predecessor-state is set.",
+            "Strict rotation requires --predecessor-state-packet. "
+            "Use request-rotation first, or pass --emergency-without-predecessor-state "
+            "to record degraded continuity.",
             file=sys.stderr,
         )
         return 2
@@ -2772,7 +3152,11 @@ def command_rotate_session(args: argparse.Namespace) -> int:
         related_packet=str(successor_context),
         summary=f"rotated {args.agent_id} to {args.successor_agent_id}: {args.reason}",
         evidence=f"{save_request}; {successor_context}",
-        ledger_update="predecessor stopped and successor session created",
+        ledger_update=(
+            "predecessor stopped and successor session requested"
+            if provider == "codex-app"
+            else "predecessor stopped and successor session created"
+        ),
         next_action=f"monitor {args.successor_agent_id} first heartbeat",
         at=format_time(parse_time(args.at)),
     )
@@ -2797,6 +3181,45 @@ def command_session_reconcile(args: argparse.Namespace) -> int:
     for agent_id, event in sorted(latest_by_agent.items()):
         provider_path = Path(event.get("provider_session_path", ""))
         provider_status = "active"
+        if event.get("provider") == "codex-app":
+            read_event = latest_confirmed_read_event(state_dir, agent_id)
+            if not read_event:
+                stale.append(agent_id)
+                append_session_event(
+                    state_dir,
+                    {
+                        "at": timestamp,
+                        "event": "session-stale",
+                        "agent_id": agent_id,
+                        "provider": "codex-app",
+                        "provider_session_id": event.get("provider_session_id", ""),
+                        "provider_session_path": "",
+                        "provider_session_ref": event.get("provider_session_ref", ""),
+                        "status": "stale",
+                        "reason": "missing recent session-confirm-read evidence",
+                    },
+                )
+                continue
+            read_at = parse_time(str(read_event.get("at") or timestamp))
+            max_age = timedelta(minutes=args.codex_app_read_max_minutes)
+            if parse_time(args.at) - read_at > max_age:
+                stale.append(agent_id)
+                append_session_event(
+                    state_dir,
+                    {
+                        "at": timestamp,
+                        "event": "session-stale",
+                        "agent_id": agent_id,
+                        "provider": "codex-app",
+                        "provider_session_id": event.get("provider_session_id", ""),
+                        "provider_session_path": "",
+                        "provider_session_ref": event.get("provider_session_ref", ""),
+                        "status": "stale",
+                        "reason": "session-confirm-read evidence is stale",
+                    },
+                )
+                continue
+            continue
         if event.get("provider") == "codex":
             provider_payload, exit_code = run_live_session_operation(
                 args,
@@ -2820,6 +3243,7 @@ def command_session_reconcile(args: argparse.Namespace) -> int:
                     "agent_id": agent_id,
                     "provider": event.get("provider", "file"),
                     "provider_session_path": str(provider_path),
+                    "provider_session_ref": event.get("provider_session_ref", str(provider_path)),
                     "status": "stale",
                 },
             )
@@ -2830,6 +3254,238 @@ def command_session_reconcile(args: argparse.Namespace) -> int:
         return 1
     print("No stale sessions")
     return 0
+
+
+def markdown_list_values(section_text: str) -> list[str]:
+    values: list[str] = []
+    for line in section_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        value = stripped[1:].strip().strip("`").strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def load_master_boundary_patterns(state_dir: Path) -> tuple[list[str], list[str]]:
+    boundary_path = state_dir / "master-boundary.md"
+    if not boundary_path.exists():
+        return [], [f"missing master boundary file: {boundary_path}"]
+    sections = parse_markdown_sections(boundary_path.read_text(encoding="utf-8"))
+    allowed = markdown_list_values(sections.get("## Allowed Master Write Paths", ""))
+    errors: list[str] = []
+    if not allowed:
+        errors.append("master-boundary.md has no allowed Master write paths")
+    return allowed, errors
+
+
+def normalize_repo_path(value: str) -> str:
+    return value.replace("\\", "/").strip().lstrip("./")
+
+
+def path_matches_pattern(path: str, pattern: str) -> bool:
+    path = normalize_repo_path(path)
+    pattern = normalize_repo_path(pattern)
+    if pattern.endswith("/**"):
+        prefix = pattern[:-3].rstrip("/")
+        return path == prefix or path.startswith(prefix + "/")
+    return fnmatch.fnmatch(path, pattern)
+
+
+def git_changed_paths(project_root: Path) -> tuple[list[str], str | None]:
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"cannot enforce boundary: git is unavailable ({exc})"
+    if root_result.returncode != 0:
+        return [], "cannot enforce boundary: project root is not inside a Git repository"
+    git_root = Path(root_result.stdout.strip()).resolve()
+    status = subprocess.run(
+        ["git", "-C", str(git_root), "status", "--porcelain=v1", "--untracked-files=all"],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    if status.returncode != 0:
+        return [], f"cannot enforce boundary: git status failed ({status.stderr.strip()})"
+    paths: list[str] = []
+    for line in status.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        paths.append(normalize_repo_path(path.strip('"')))
+    return paths, None
+
+
+def command_enforce_master_boundary(args: argparse.Namespace) -> int:
+    project_root = Path(args.project_root).resolve()
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    allowed, boundary_errors = load_master_boundary_patterns(state_dir)
+    changed, git_error = git_changed_paths(project_root)
+    if git_error:
+        append_incident(
+            state_dir=state_dir,
+            severity="critical",
+            summary=git_error,
+            source="enforce-master-boundary",
+            at=format_time(parse_time(args.at)),
+        )
+        print(git_error, file=sys.stderr)
+        return 2
+    if boundary_errors:
+        for error in boundary_errors:
+            print(error, file=sys.stderr)
+        return 2
+    blocked = [
+        path
+        for path in changed
+        if not any(path_matches_pattern(path, pattern) for pattern in allowed)
+    ]
+    if blocked:
+        append_incident(
+            state_dir=state_dir,
+            severity="critical",
+            summary="Master boundary violation: " + ", ".join(blocked[:5]),
+            source="enforce-master-boundary",
+            at=format_time(parse_time(args.at)),
+        )
+        print("Master boundary violation:")
+        for path in blocked:
+            print(f"- {path}")
+        return 1
+    print("Master boundary clean")
+    return 0
+
+
+def extract_labeled_value(section_text: str, label: str) -> str:
+    pattern = re.compile(rf"^\s*-\s*{re.escape(label)}\s*:\s*(.*)$", re.IGNORECASE)
+    for line in section_text.splitlines():
+        match = pattern.match(line)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def split_parallel_values(value: str) -> list[str]:
+    parts = re.split(r"[,;\n]+", value)
+    return [normalize_repo_path(part.strip()) for part in parts if part.strip()]
+
+
+def is_broad_parallel_scope(value: str) -> bool:
+    normalized = normalize_repo_path(value).lower()
+    return normalized in {"*", "**", ".", "/", "all", "repo", "repository", "entire repo"} or "**" in normalized
+
+
+def paths_overlap(left: str, right: str) -> bool:
+    left = normalize_repo_path(left)
+    right = normalize_repo_path(right)
+    if left == right:
+        return True
+    return left.startswith(right.rstrip("/") + "/") or right.startswith(left.rstrip("/") + "/")
+
+
+def assess_work_orders_for_parallelism(work_orders: list[Path]) -> tuple[str, list[str]]:
+    problems: list[str] = []
+    serial_reasons: list[str] = []
+    parsed: list[dict] = []
+    for path in work_orders:
+        if not path.exists():
+            problems.append(f"{path}: missing work order")
+            continue
+        sections = parse_markdown_sections(path.read_text(encoding="utf-8"))
+        parallel = sections.get("## Parallel Safety", "")
+        token = sections.get("## Token Budget", "")
+        validation = sections.get("## Required Validation", "")
+        write_set = split_parallel_values(extract_labeled_value(parallel, "Exclusive Write Set"))
+        artifact_namespace = split_parallel_values(extract_labeled_value(parallel, "Artifact Namespace"))
+        merge_owner = extract_labeled_value(parallel, "Merge Owner")
+        conflict_protocol = extract_labeled_value(parallel, "Conflict Protocol")
+        token_budget = extract_labeled_value(token, "Token budget")
+        max_heartbeats = extract_labeled_value(token, "Maximum heartbeats")
+        missing = []
+        if not write_set:
+            missing.append("Exclusive Write Set")
+        if not artifact_namespace:
+            missing.append("Artifact Namespace")
+        if not merge_owner:
+            missing.append("Merge Owner")
+        if not conflict_protocol:
+            missing.append("Conflict Protocol")
+        if not token_budget:
+            missing.append("Token budget")
+        if not max_heartbeats:
+            missing.append("Maximum heartbeats")
+        if not section_has_content(validation):
+            missing.append("Required Validation")
+        if missing:
+            problems.append(f"{path}: missing {', '.join(missing)}")
+            continue
+        for item in write_set + artifact_namespace:
+            if is_broad_parallel_scope(item):
+                serial_reasons.append(f"{path}: broad parallel scope {item}")
+        if re.search(r"\b(depends on|after other agent|same output|shared output)\b", parallel, re.IGNORECASE):
+            serial_reasons.append(f"{path}: dependent parallel safety language")
+        parsed.append(
+            {
+                "path": path,
+                "write_set": write_set,
+                "artifact_namespace": artifact_namespace,
+            }
+        )
+    for index, left in enumerate(parsed):
+        for right in parsed[index + 1 :]:
+            for left_path in left["write_set"]:
+                for right_path in right["write_set"]:
+                    if paths_overlap(left_path, right_path):
+                        serial_reasons.append(
+                            f"{left['path']} and {right['path']}: overlapping write set {left_path} / {right_path}"
+                        )
+            for left_path in left["artifact_namespace"]:
+                for right_path in right["artifact_namespace"]:
+                    if paths_overlap(left_path, right_path):
+                        serial_reasons.append(
+                            f"{left['path']} and {right['path']}: overlapping artifact namespace {left_path} / {right_path}"
+                        )
+    if problems:
+        return "invalid-work-order", problems + serial_reasons
+    if serial_reasons:
+        return "serial-required", serial_reasons
+    return "allow", ["work orders have disjoint write sets and artifact namespaces"]
+
+
+def command_assess_parallelism(args: argparse.Namespace) -> int:
+    verdict, reasons = assess_work_orders_for_parallelism(
+        [Path(path).resolve() for path in args.work_order]
+    )
+    lines = [
+        "# Parallelism Verdict",
+        "",
+        f"- Verdict: {verdict}",
+        "",
+        "## Reasons",
+        "",
+    ]
+    lines.extend(f"- {reason}" for reason in reasons)
+    text = "\n".join(lines) + "\n"
+    if args.output:
+        output = Path(args.output).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(output, text)
+    print(text, end="")
+    if verdict == "allow":
+        return 0
+    if verdict == "serial-required":
+        return 1
+    return 2
 
 
 def load_jsonl_entries(path: Path) -> list[dict]:
@@ -3839,13 +4495,21 @@ def build_parser() -> argparse.ArgumentParser:
     session_create.add_argument("--agent-id", required=True)
     session_create.add_argument("--role", required=True)
     session_create.add_argument("--context-packet", required=True)
-    session_create.add_argument("--provider", choices=["file", "manual-provider", "codex"], default="file")
+    session_create.add_argument("--provider", choices=["file", "manual-provider", "codex", "codex-app"], default="file")
     session_create.add_argument("--provider-command")
     session_create.add_argument("--provider-timeout-seconds", type=float, default=60)
     session_create.add_argument("--predecessor-agent-id")
     session_create.add_argument("--reason")
     session_create.add_argument("--at")
     session_create.set_defaults(func=command_session_create)
+
+    confirm_create = subparsers.add_parser("session-confirm-create", help="Confirm a Codex app thread was created for an agent.")
+    confirm_create.add_argument("--state-dir", required=True)
+    confirm_create.add_argument("--agent-id", required=True)
+    confirm_create.add_argument("--thread-id", required=True)
+    confirm_create.add_argument("--note")
+    confirm_create.add_argument("--at")
+    confirm_create.set_defaults(func=command_session_confirm_create)
 
     session_send = subparsers.add_parser("session-send", help="Send a message to a provider-backed session.")
     session_send.add_argument("--state-dir", required=True)
@@ -3856,6 +4520,15 @@ def build_parser() -> argparse.ArgumentParser:
     session_send.add_argument("--at")
     session_send.set_defaults(func=command_session_send)
 
+    confirm_send = subparsers.add_parser("session-confirm-send", help="Confirm a Codex app send_message_to_thread operation.")
+    confirm_send.add_argument("--state-dir", required=True)
+    confirm_send.add_argument("--agent-id", required=True)
+    confirm_send.add_argument("--message")
+    confirm_send.add_argument("--thread-id")
+    confirm_send.add_argument("--note")
+    confirm_send.add_argument("--at")
+    confirm_send.set_defaults(func=command_session_confirm_send)
+
     session_read = subparsers.add_parser("session-read", help="Read a provider-backed session transcript.")
     session_read.add_argument("--state-dir", required=True)
     session_read.add_argument("--agent-id", required=True)
@@ -3863,6 +4536,16 @@ def build_parser() -> argparse.ArgumentParser:
     session_read.add_argument("--provider-timeout-seconds", type=float, default=60)
     session_read.add_argument("--at")
     session_read.set_defaults(func=command_session_read)
+
+    confirm_read = subparsers.add_parser("session-confirm-read", help="Confirm a Codex app read_thread operation.")
+    confirm_read.add_argument("--state-dir", required=True)
+    confirm_read.add_argument("--agent-id", required=True)
+    confirm_read.add_argument("--summary", required=True)
+    confirm_read.add_argument("--turn-count", type=int, default=0)
+    confirm_read.add_argument("--thread-id")
+    confirm_read.add_argument("--note")
+    confirm_read.add_argument("--at")
+    confirm_read.set_defaults(func=command_session_confirm_read)
 
     session_archive = subparsers.add_parser("session-archive", help="Archive a provider-backed session.")
     session_archive.add_argument("--state-dir", required=True)
@@ -3872,16 +4555,39 @@ def build_parser() -> argparse.ArgumentParser:
     session_archive.add_argument("--at")
     session_archive.set_defaults(func=command_session_archive)
 
+    confirm_archive = subparsers.add_parser("session-confirm-archive", help="Confirm a Codex app set_thread_archived operation.")
+    confirm_archive.add_argument("--state-dir", required=True)
+    confirm_archive.add_argument("--agent-id", required=True)
+    confirm_archive.add_argument("--thread-id")
+    confirm_archive.add_argument("--note")
+    confirm_archive.add_argument("--at")
+    confirm_archive.set_defaults(func=command_session_confirm_archive)
+
+    validate_predecessor = subparsers.add_parser("validate-predecessor-state", help="Validate a predecessor state packet for strict session rotation.")
+    validate_predecessor.add_argument("--packet", required=True)
+    validate_predecessor.set_defaults(func=command_validate_predecessor_state)
+
+    request_rotation = subparsers.add_parser("request-rotation", help="Request a predecessor state packet before strict rotation.")
+    request_rotation.add_argument("--state-dir", required=True)
+    request_rotation.add_argument("--agent-id", required=True)
+    request_rotation.add_argument("--successor-agent-id", required=True)
+    request_rotation.add_argument("--reason", required=True)
+    request_rotation.add_argument("--provider-command")
+    request_rotation.add_argument("--provider-timeout-seconds", type=float, default=60)
+    request_rotation.add_argument("--at")
+    request_rotation.set_defaults(func=command_request_rotation)
+
     rotate = subparsers.add_parser("rotate-session", help="Freeze a drifting sub-agent and launch a successor session.")
     rotate.add_argument("--state-dir", required=True)
     rotate.add_argument("--agent-id", required=True)
     rotate.add_argument("--successor-agent-id", required=True)
     rotate.add_argument("--reason", required=True)
-    rotate.add_argument("--provider", choices=["file", "codex"])
+    rotate.add_argument("--provider", choices=["file", "codex", "codex-app"])
     rotate.add_argument("--provider-command")
     rotate.add_argument("--provider-timeout-seconds", type=float, default=60)
     rotate.add_argument("--predecessor-state-packet")
     rotate.add_argument("--require-predecessor-state", action="store_true")
+    rotate.add_argument("--emergency-without-predecessor-state", action="store_true")
     rotate.add_argument("--successor-role")
     rotate.add_argument("--successor-task-id")
     rotate.add_argument("--successor-objective")
@@ -3896,8 +4602,21 @@ def build_parser() -> argparse.ArgumentParser:
     session_reconcile.add_argument("--state-dir", required=True)
     session_reconcile.add_argument("--provider-command")
     session_reconcile.add_argument("--provider-timeout-seconds", type=float, default=60)
+    session_reconcile.add_argument("--codex-app-read-max-minutes", type=float, default=DEFAULT_CODEX_APP_READ_MAX_MINUTES)
     session_reconcile.add_argument("--at")
     session_reconcile.set_defaults(func=command_session_reconcile)
+
+    enforce_boundary = subparsers.add_parser("enforce-master-boundary", help="Fail when Master changes exceed the allowed state/doc boundary.")
+    enforce_boundary.add_argument("--project-root", required=True)
+    enforce_boundary.add_argument("--state-dir", required=True)
+    enforce_boundary.add_argument("--at")
+    enforce_boundary.set_defaults(func=command_enforce_master_boundary)
+
+    assess_parallel = subparsers.add_parser("assess-parallelism", help="Assess whether work orders are safe to run in parallel.")
+    assess_parallel.add_argument("--state-dir", required=True)
+    assess_parallel.add_argument("--work-order", action="append", required=True)
+    assess_parallel.add_argument("--output")
+    assess_parallel.set_defaults(func=command_assess_parallelism)
 
     incident = subparsers.add_parser("record-incident", help="Record a production incident and open alerts for critical severity.")
     incident.add_argument("--state-dir", required=True)

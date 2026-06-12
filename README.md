@@ -9,7 +9,7 @@ The system is designed to keep project continuity outside chat history by using 
 - A main `master-agent-system` Codex skill.
 - Role skills for Strategy, Coding, Review, and Policy Review agents.
 - State-pack templates under `assets/templates/`.
-- CLI helpers under `scripts/` for bootstrapping, validation, session control, session rotation, role governance, heartbeat monitoring, token tracking, supervisor lifecycle, and recovery.
+- CLI helpers under `scripts/` for bootstrapping, validation, session control, strict session rotation, role governance, heartbeat monitoring, token tracking, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, release validation, and recovery.
 - Regression tests for safety-critical behavior.
 - A detailed reference manual at `references/master-agent-system.md`.
 
@@ -90,8 +90,10 @@ Read `references/master-agent-system.md` before deploying the workflow on a real
 ## Runtime Notes
 
 - The local file provider is for offline testing and state simulation.
-- Live Codex session control requires a provider adapter passed with `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER`.
-- Use `rotate-session` to freeze an overloaded predecessor, create a successor context, archive the predecessor session, register the successor, and start the successor session with inheritance metadata.
+- `provider=codex` is the provider-command automation path. It requires `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER`.
+- `provider=codex-app` is the Codex desktop tool-mediated path. Use Codex thread tools for create/send/read/archive, then record evidence with `session-confirm-create`, `session-confirm-send`, `session-confirm-read`, and `session-confirm-archive`.
+- Use `request-rotation`, `validate-predecessor-state`, and `rotate-session` to replace overloaded agents. Normal rotation requires a validated predecessor-state packet; emergency rotation requires `--emergency-without-predecessor-state`.
+- Use `enforce-master-boundary` before completing Master-led work, and `assess-parallelism` before running multiple sub-agents.
 - Long-running supervision should be launched through the operating system scheduler or service wrapper appropriate for the deployment environment.
 - Custom roles must have explicit approval evidence, scope, positive token budget, heartbeat cap, and deactivation conditions before activation.
 
@@ -101,7 +103,7 @@ Run the core checks from the repository root:
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile scripts/bootstrap_project_state.py scripts/validate_state_pack.py scripts/master_agent_tool.py scripts/state_io.py tests/test_master_agent_system.py
+python -m py_compile scripts/bootstrap_project_state.py scripts/validate_state_pack.py scripts/master_agent_tool.py scripts/state_io.py scripts/release_validate.py tests/test_master_agent_system.py
 python scripts/validate_state_pack.py assets/templates
 ```
 
@@ -109,6 +111,12 @@ Validate the skill metadata with Codex's skill validator:
 
 ```bash
 python <path-to-skill-creator>/scripts/quick_validate.py <path-to-this-skill>
+```
+
+Run the release gate:
+
+```bash
+python scripts/release_validate.py --quick-validate <path-to-skill-creator>/scripts/quick_validate.py --installed-skill-dir <installed-master-agent-system>
 ```
 
 The tests are not required for minimal runtime installation, but they are recommended for source releases because they protect the safety-critical behavior of the skill pack.

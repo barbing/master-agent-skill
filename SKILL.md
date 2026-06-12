@@ -1,6 +1,6 @@
 ---
 name: master-agent-system
-description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, defining or activating project-specific agent roles, or standardizing strategy, coding, review, and policy handoffs.
+description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, or standardizing strategy, coding, review, and policy handoffs.
 ---
 
 # Master Agent System
@@ -15,7 +15,7 @@ The system keeps long project continuity outside conversation history by using l
 
 Read `references/master-agent-system.md` when setting up the system, designing a new project adapter, or resolving a coordination ambiguity.
 
-Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, accepts strategy plans, records heartbeats, audits anomalies, creates remediation packets, rotates overloaded sessions into successor agents, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
+Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, accepts strategy plans, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
 
 Copy templates from `assets/templates/` when a single artifact is needed without bootstrapping the full state pack.
 
@@ -34,6 +34,7 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Token strategy is required | Every project should set a project budget, per-agent budget when possible, heartbeat/session caps, and a token strategy before spawning sub-agents. |
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
 | Review is separate | Coding receipts are not accepted until reviewed, unless the user explicitly chooses to skip review. |
+| Rotation is strict | Launch a successor only from a validated predecessor-state packet, except explicit emergency recovery. |
 
 ## Roles
 
@@ -146,16 +147,25 @@ python scripts/master_agent_tool.py supervisor-stop --state-dir <state-dir>
 python scripts/master_agent_tool.py supervisor-recover --state-dir <state-dir>
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-1 --role Strategy --context-packet packets/context-packet.md --provider file
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-live --role Strategy --context-packet packets/context-packet.md --provider codex --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-app --role Strategy --context-packet packets/context-packet.md --provider codex-app
+python scripts/master_agent_tool.py session-confirm-create --state-dir <state-dir> --agent-id strategy-app --thread-id <codex-thread-id>
 python scripts/master_agent_tool.py session-send --state-dir <state-dir> --agent-id strategy-1 --message "Please return a strategy packet."
 python scripts/master_agent_tool.py session-send --state-dir <state-dir> --agent-id strategy-live --message "Please return a strategy packet." --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-confirm-send --state-dir <state-dir> --agent-id strategy-app
 python scripts/master_agent_tool.py session-read --state-dir <state-dir> --agent-id strategy-1
 python scripts/master_agent_tool.py session-read --state-dir <state-dir> --agent-id strategy-live --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-confirm-read --state-dir <state-dir> --agent-id strategy-app --summary "Packet returned" --turn-count 2
 python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --agent-id strategy-1
 python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --agent-id strategy-live --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-confirm-archive --state-dir <state-dir> --agent-id strategy-app
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir> --provider-command "<provider command>"
-python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file
-python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-live-1 --successor-agent-id coding-live-2 --reason attention-drift --provider codex --provider-command "<provider command>"
+python scripts/master_agent_tool.py request-rotation --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift
+python scripts/master_agent_tool.py validate-predecessor-state --packet packets/coding-1-predecessor-state-packet.md
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file --predecessor-state-packet packets/coding-1-predecessor-state-packet.md
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-app-1 --successor-agent-id coding-app-2 --reason attention-drift --provider codex-app --predecessor-state-packet packets/coding-app-1-predecessor-state-packet.md
+python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
+python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"
@@ -195,12 +205,14 @@ The state pack contains:
 - `running-agents.md`
 - `role-catalog.md`
 - `role-proposal.md`
+- `master-boundary.md`
 - `strategy-sync.md`
 - `anomaly-log.md`
 - `event-log.md`
 - `context-packet.md`
 - `heartbeat-packet.md`
 - `remediation-packet.md`
+- `predecessor-state-packet.md`
 - `runtime-supervisor.md`
 - `runtime-status.md`
 - `runtime-deployment.md`

@@ -20,12 +20,13 @@ sys.path.insert(0, str(SCRIPTS))
 from state_io import append_jsonl_locked, atomic_write_json  # noqa: E402
 
 
-def run_cmd(args, cwd=ROOT, check=True):
+def run_cmd(args, cwd=ROOT, check=True, env=None):
     result = subprocess.run(
         [PYTHON, *map(str, args)],
         cwd=cwd,
         text=True,
         capture_output=True,
+        env=env,
     )
     if check and result.returncode != 0:
         raise AssertionError(
@@ -69,6 +70,62 @@ def write_live_provider_script(path: Path, state_path: Path) -> None:
                 "    pass",
                 "state_path.write_text(json.dumps(state) + '\\n', encoding='utf-8')",
                 "json.dump(state, sys.stdout)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_predecessor_state_packet(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "# Predecessor State Packet",
+                "",
+                "## Objective",
+                "",
+                "- Finish parser repair",
+                "",
+                "## Plan Id",
+                "",
+                "- PLAN-ROTATE",
+                "",
+                "## Completed Work",
+                "",
+                "- Patched parser state tracking",
+                "",
+                "## Changed Files And Artifacts",
+                "",
+                "- src/parser/tokenizer.py",
+                "",
+                "## Validation Evidence",
+                "",
+                "- python -m unittest tests.test_parser",
+                "",
+                "## Known Failures",
+                "",
+                "- none",
+                "",
+                "## Risks",
+                "",
+                "- attention drift after long session",
+                "",
+                "## Next Safe Step",
+                "",
+                "- inspect parser state transition test",
+                "",
+                "## Forbidden Repeats",
+                "",
+                "- continue patching parser without narrowing",
+                "",
+                "## Token Usage",
+                "",
+                "- 3200 / 8000",
+                "",
+                "## Open Questions",
+                "",
+                "- none",
             ]
         )
         + "\n",
@@ -2772,6 +2829,221 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(event["inheritance_reason"], "attention-drift")
         self.assertEqual(Path(event["context_packet"]).read_text(encoding="utf-8"), "# Successor Context\n\nInherited state\n")
 
+    def test_codex_app_confirmation_events_and_reconcile(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        context = self.tmp / "context-packet.md"
+        context.write_text("# Context Packet\n", encoding="utf-8")
+
+        create = run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+                "--role",
+                "Strategy",
+                "--context-packet",
+                context,
+                "--provider",
+                "codex-app",
+            ]
+        )
+        self.assertIn("Requested Codex app session", create.stdout)
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+                "--thread-id",
+                "thread-123",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-send",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+                "--message",
+                "Return a strategy packet",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-send",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-read",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-read",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+                "--summary",
+                "Strategy packet returned",
+                "--turn-count",
+                "2",
+            ]
+        )
+        reconcile = run_cmd([TOOL, "session-reconcile", "--state-dir", self.state_dir])
+        self.assertIn("No stale sessions", reconcile.stdout)
+        run_cmd([TOOL, "session-archive", "--state-dir", self.state_dir, "--agent-id", "strategy-app"])
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-archive",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+            ]
+        )
+
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "session-control.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertIn("session-create-requested", [event["event"] for event in events])
+        self.assertIn("session-created", [event["event"] for event in events])
+        self.assertIn("session-send-requested", [event["event"] for event in events])
+        self.assertIn("session-sent", [event["event"] for event in events])
+        self.assertIn("session-read", [event["event"] for event in events])
+        self.assertEqual(
+            next(event for event in events if event["event"] == "session-created")[
+                "provider_session_ref"
+            ],
+            "codex-app:thread-123",
+        )
+
+    def test_codex_app_reconcile_requires_recent_read_confirmation(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        context = self.tmp / "context-packet.md"
+        context.write_text("# Context Packet\n", encoding="utf-8")
+        run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+                "--role",
+                "Strategy",
+                "--context-packet",
+                context,
+                "--provider",
+                "codex-app",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-app",
+                "--thread-id",
+                "thread-123",
+            ]
+        )
+
+        reconcile = run_cmd([TOOL, "session-reconcile", "--state-dir", self.state_dir], check=False)
+        self.assertEqual(reconcile.returncode, 1)
+        self.assertIn("stale", reconcile.stdout)
+
+    def test_rotate_session_requires_predecessor_state_unless_emergency(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-ROTATE",
+                "--objective",
+                "Finish parser repair",
+                "--scope",
+                "src/parser",
+            ]
+        )
+        strict = run_cmd(
+            [
+                TOOL,
+                "rotate-session",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--successor-agent-id",
+                "coding-2",
+                "--reason",
+                "attention-drift",
+            ],
+            check=False,
+        )
+        self.assertEqual(strict.returncode, 2)
+        self.assertIn("Strict rotation requires", strict.stderr)
+
+        emergency = run_cmd(
+            [
+                TOOL,
+                "rotate-session",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--successor-agent-id",
+                "coding-2",
+                "--reason",
+                "attention-drift",
+                "--emergency-without-predecessor-state",
+            ]
+        )
+        self.assertIn("Rotated session coding-1 -> coding-2", emergency.stdout)
+
+    def test_validate_predecessor_state_rejects_missing_required_fields(self):
+        invalid = self.tmp / "bad-predecessor.md"
+        invalid.write_text("# Predecessor State Packet\n\n## Objective\n\n- \n", encoding="utf-8")
+        result = run_cmd(
+            [TOOL, "validate-predecessor-state", "--packet", invalid],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing heading", result.stderr)
+
     def test_rotate_session_freezes_predecessor_and_launches_successor(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         strategy_packet = self.tmp / "strategy-packet.md"
@@ -2862,6 +3134,9 @@ class MasterAgentToolTests(unittest.TestCase):
                 ]
             )
 
+        predecessor_state = self.tmp / "predecessor-state-packet.md"
+        write_predecessor_state_packet(predecessor_state)
+
         result = run_cmd(
             [
                 TOOL,
@@ -2876,6 +3151,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "attention-drift",
                 "--provider",
                 "file",
+                "--predecessor-state-packet",
+                predecessor_state,
             ]
         )
         self.assertIn("Rotated session coding-1 -> coding-2", result.stdout)
@@ -3223,6 +3500,204 @@ class MasterAgentToolTests(unittest.TestCase):
         events = target.read_text(encoding="utf-8").splitlines()
         self.assertEqual(json.loads(events[-1])["event"], "after-stale-lock")
         self.assertFalse(lock_path.exists())
+
+    def test_enforce_master_boundary_allows_state_pack_changes_and_blocks_source(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        clean = run_cmd(
+            [
+                TOOL,
+                "enforce-master-boundary",
+                "--project-root",
+                self.tmp,
+                "--state-dir",
+                self.state_dir,
+            ]
+        )
+        self.assertIn("Master boundary clean", clean.stdout)
+
+        source = self.tmp / "src" / "app.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("print('production change')\n", encoding="utf-8")
+        blocked = run_cmd(
+            [
+                TOOL,
+                "enforce-master-boundary",
+                "--project-root",
+                self.tmp,
+                "--state-dir",
+                self.state_dir,
+            ],
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("src/app.py", blocked.stdout)
+
+    def test_enforce_master_boundary_fails_closed_outside_git(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        result = run_cmd(
+            [
+                TOOL,
+                "enforce-master-boundary",
+                "--project-root",
+                self.tmp,
+                "--state-dir",
+                self.state_dir,
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot enforce boundary", result.stderr)
+
+    def write_work_order(
+        self,
+        path: Path,
+        write_set: str,
+        artifact_namespace: str,
+        merge_owner: str = "Master Agent",
+        conflict_protocol: str = "stop and return to Master",
+        token_budget: str = "4000",
+        max_heartbeats: str = "3",
+    ) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "# Work Order",
+                    "",
+                    "## Objective",
+                    "",
+                    "- Task id: TASK",
+                    "- Coding Agent objective: bounded task",
+                    "",
+                    "## Allowed Scope",
+                    "",
+                    "- Files/modules/artifacts allowed: " + write_set,
+                    "",
+                    "## Parallel Safety",
+                    "",
+                    "- Exclusive Write Set: " + write_set,
+                    "- Artifact Namespace: " + artifact_namespace,
+                    "- Merge Owner: " + merge_owner,
+                    "- Conflict Protocol: " + conflict_protocol,
+                    "",
+                    "## Token Budget",
+                    "",
+                    "- Token budget: " + token_budget,
+                    "- Maximum heartbeats: " + max_heartbeats,
+                    "",
+                    "## Forbidden Changes",
+                    "",
+                    "- unrelated files",
+                    "",
+                    "## Required Validation",
+                    "",
+                    "- python -m unittest",
+                    "",
+                    "## Receipt Requirements",
+                    "",
+                    "- return receipt",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_assess_parallelism_allows_disjoint_work_orders(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        one = self.tmp / "one.md"
+        two = self.tmp / "two.md"
+        self.write_work_order(one, "src/parser", "artifacts/parser")
+        self.write_work_order(two, "src/render", "artifacts/render")
+
+        result = run_cmd(
+            [
+                TOOL,
+                "assess-parallelism",
+                "--state-dir",
+                self.state_dir,
+                "--work-order",
+                one,
+                "--work-order",
+                two,
+            ]
+        )
+        self.assertIn("Verdict: allow", result.stdout)
+
+    def test_assess_parallelism_blocks_overlap_and_missing_fields(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        one = self.tmp / "one.md"
+        two = self.tmp / "two.md"
+        missing = self.tmp / "missing.md"
+        self.write_work_order(one, "src/parser", "artifacts/parser")
+        self.write_work_order(two, "src/parser/tokenizer.py", "artifacts/parser")
+        missing.write_text("# Work Order\n\n## Parallel Safety\n\n", encoding="utf-8")
+
+        serial = run_cmd(
+            [
+                TOOL,
+                "assess-parallelism",
+                "--state-dir",
+                self.state_dir,
+                "--work-order",
+                one,
+                "--work-order",
+                two,
+            ],
+            check=False,
+        )
+        self.assertEqual(serial.returncode, 1)
+        self.assertIn("serial-required", serial.stdout)
+
+        invalid = run_cmd(
+            [
+                TOOL,
+                "assess-parallelism",
+                "--state-dir",
+                self.state_dir,
+                "--work-order",
+                missing,
+            ],
+            check=False,
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("invalid-work-order", invalid.stdout)
+
+    def test_assess_parallelism_blocks_broad_wildcards(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        order = self.tmp / "broad.md"
+        self.write_work_order(order, "**", "artifacts/all")
+        result = run_cmd(
+            [
+                TOOL,
+                "assess-parallelism",
+                "--state-dir",
+                self.state_dir,
+                "--work-order",
+                order,
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("broad parallel scope", result.stdout)
+
+    def test_release_validator_runs_fake_quick_validate_under_test_hook(self):
+        fake_quick = self.tmp / "quick_validate.py"
+        fake_quick.write_text("import sys\nprint('Skill is valid!')\n", encoding="utf-8")
+        env = os.environ.copy()
+        env["MASTER_AGENT_RELEASE_VALIDATE_SKIP_CORE"] = "1"
+
+        result = run_cmd(
+            [
+                ROOT / "scripts" / "release_validate.py",
+                "--quick-validate",
+                fake_quick,
+            ],
+            env=env,
+        )
+        self.assertIn("PASS: root skill quick_validate", result.stdout)
+        self.assertIn("PASS: personal path scan", result.stdout)
+        self.assertIn("PASS: secret scan", result.stdout)
 
     def test_generated_scripts_do_not_use_non_atomic_write_text(self):
         for relative_path in [

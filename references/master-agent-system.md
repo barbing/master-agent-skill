@@ -57,12 +57,14 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `running-agents.md` | Current sub-agent registry and heartbeat status. |
 | `role-catalog.md` | Active, proposed, and inactive roles governed by the Master Agent. |
 | `role-proposal.md` | Proposal template for creating or changing project-specific roles. |
+| `master-boundary.md` | Allowed Master write paths and non-implementation enforcement policy. |
 | `strategy-sync.md` | Current accepted strategy plan and Master awareness state. |
 | `anomaly-log.md` | Detected loops, plan drift, scope drift, reward-hacking, and token-risk anomalies. |
 | `event-log.md` | Append-only accepted events and rejected packets. |
 | `context-packet.md` | Task-specific context sent to a sub-agent. |
 | `heartbeat-packet.md` | Structured progress update from a running sub-agent. |
 | `remediation-packet.md` | Safety-checked context reinforcement, successor handoff, split-task, or stop packet. |
+| `predecessor-state-packet.md` | Required compact state packet for strict session rotation. |
 | `strategy-packet.md` | Strategy recommendation and proposed work order. |
 | `work-order.md` | Bounded implementation assignment. |
 | `token-strategy.md` | Master constraints and sub-agent self-optimization rules for token use. |
@@ -109,6 +111,12 @@ Run readiness validation after filling the ledger and policy pack:
 
 ```bash
 python scripts/master_agent_tool.py validate --state-dir <project-root>/docs/master-agent --strict
+```
+
+Run release validation before publishing the skill pack:
+
+```bash
+python scripts/release_validate.py --quick-validate <quick_validate.py> --installed-skill-dir <installed-master-agent-system>
 ```
 
 Install role skills into a Codex skills directory:
@@ -163,14 +171,21 @@ python scripts/master_agent_tool.py supervisor-stop --state-dir <state-dir>
 python scripts/master_agent_tool.py supervisor-recover --state-dir <state-dir>
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-1 --role Strategy --context-packet packets/context-packet.md --provider file
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-live --role Strategy --context-packet packets/context-packet.md --provider codex --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-app --role Strategy --context-packet packets/context-packet.md --provider codex-app
+python scripts/master_agent_tool.py session-confirm-create --state-dir <state-dir> --agent-id strategy-app --thread-id <codex-thread-id>
 python scripts/master_agent_tool.py session-send --state-dir <state-dir> --agent-id strategy-1 --message "Please return a strategy packet."
 python scripts/master_agent_tool.py session-send --state-dir <state-dir> --agent-id strategy-live --message "Please return a strategy packet." --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-confirm-send --state-dir <state-dir> --agent-id strategy-app
 python scripts/master_agent_tool.py session-read --state-dir <state-dir> --agent-id strategy-1
 python scripts/master_agent_tool.py session-read --state-dir <state-dir> --agent-id strategy-live --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-confirm-read --state-dir <state-dir> --agent-id strategy-app --summary "Strategy packet returned" --turn-count 2
 python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --agent-id strategy-1
 python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --agent-id strategy-live --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-confirm-archive --state-dir <state-dir> --agent-id strategy-app
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir> --provider-command "<provider command>"
+python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
+python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"
@@ -191,13 +206,18 @@ Use `supervisor-start --spawn`, `supervisor-status`, `supervisor-stop`, and `sup
 
 Use `session-create`, `session-send`, `session-read`, `session-archive`, `session-reconcile`, and `rotate-session` as a provider-neutral adapter. The file provider is a local mock for testing and offline use. The `codex` provider requires `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER` for every live operation; the command receives a JSON request on stdin and must return JSON with confirmed session state plus provider evidence. Provider commands are parsed as argv, not executed through a shell. Unsupported providers stay in `pending-manual-provider` rather than silently reporting success.
 
-Use `rotate-session` when a sub-agent has accumulated too much context, loops on the same next action, reports attention drift, exceeds heartbeat caps, or needs a clean successor session. The command performs the controlled transition: creates a save-state request for the predecessor, optionally includes a supplied predecessor state packet, sends the save request to the predecessor session when one exists, archives the predecessor session, registers the successor agent, creates the successor context packet, starts the successor session with predecessor metadata, stops the predecessor in `running-agents.md`, and appends an event-log entry.
+Use `provider=codex-app` when the Master Agent is operating through Codex desktop thread tools. The CLI records requests and confirmations; the Master Agent performs the actual app tool calls. Create the session request, call `create_thread`, then record `session-confirm-create`. For messages, call `session-send`, use `send_message_to_thread`, then record `session-confirm-send`. For status reads, call `session-read`, use `read_thread`, then record `session-confirm-read`. For archive, call `session-archive`, use `set_thread_archived`, then record `session-confirm-archive`. `session-reconcile` treats a Codex app session as stale unless it has recent `session-confirm-read` evidence.
+
+Use `request-rotation` when a sub-agent has accumulated too much context, loops on the same next action, reports attention drift, exceeds heartbeat caps, or needs a clean successor session. The predecessor must return a `predecessor-state-packet.md`. Validate it with `validate-predecessor-state`, then call `rotate-session`. Normal rotation requires `--predecessor-state-packet`; `--emergency-without-predecessor-state` is reserved for unrecoverable sessions and records degraded continuity.
 
 ```bash
-python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file
-python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-live-1 --successor-agent-id coding-live-2 --reason attention-drift --provider codex --provider-command "<provider command>"
-python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id strategy-1 --successor-agent-id strategy-2 --reason context-overload --predecessor-state-packet packets/strategy-1-final-state.md --require-predecessor-state
+python scripts/master_agent_tool.py request-rotation --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift
+python scripts/master_agent_tool.py validate-predecessor-state --packet packets/coding-1-predecessor-state-packet.md
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file --predecessor-state-packet packets/coding-1-predecessor-state-packet.md
+python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-app-1 --successor-agent-id coding-app-2 --reason attention-drift --provider codex-app --predecessor-state-packet packets/coding-app-1-predecessor-state-packet.md
 ```
+
+Use `enforce-master-boundary` before claiming Master-led work is complete. It checks Git status against `master-boundary.md`, fails closed when Git evidence is unavailable, and records an incident when the Master changed paths outside the allowed ledger/docs boundary.
 
 Use `record-incident`, `alert-status`, `acknowledge-alert`, and `telemetry-summary` for production observability. Critical incidents automatically open alerts, and supervisor-detected critical safety breaches or repeated remediation failures create incidents so they cannot pass silently. Acknowledgement appends an audit record instead of deleting the original alert.
 
@@ -467,6 +487,14 @@ Pause or stop the agent when:
 ## Parallel Sub-Agent Rules
 
 The Master Agent may enable parallel sub-agents only when the tasks are independent.
+
+Run the mechanical gate before launching parallel work:
+
+```bash
+python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
+```
+
+The verdict is `allow`, `serial-required`, or `invalid-work-order`.
 
 Allow parallelism when:
 
