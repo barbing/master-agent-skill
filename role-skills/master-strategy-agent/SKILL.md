@@ -28,8 +28,11 @@ Act as a short-lived Strategy Agent inside a Master Agent system. Reason about t
 - Stop and return a packet when authority is ambiguous.
 - Estimate token impact and recommend a sub-agent count and heartbeat cap.
 - Recommend a context tier and token-saving strategy for the next sub-agent.
+- Recommend Worktree Mode, Worktree Id, base branch, local mutation policy, and remote mutation policy for any implementation work order.
 - Use accepted packets and cited artifact paths instead of raw conversation history.
 - Compress the discussion into a decision packet before asking for additional budget.
+- Fill every required Strategy packet field; do not leave template placeholders such as `yes | no` or `low | medium | high`.
+- Expect the Master to run `strategy-packet-lint` before accepting or launching work from the packet.
 
 ## Output
 
@@ -46,3 +49,4 @@ Return a `strategy-packet.md` with:
 - Token impact.
 - Context tier and compression trigger.
 - Confidence and open risks.
+Every required field must be explicit enough to pass `strategy-packet-lint`.

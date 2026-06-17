@@ -66,6 +66,7 @@ def ensure_state_storage(target_dir: Path) -> None:
     roles_path = storage_dir / "roles.json"
     runtime_path = storage_dir / "runtime.json"
     session_control_path = storage_dir / "session-control.jsonl"
+    worktrees_path = storage_dir / "worktrees.jsonl"
     incidents_path = storage_dir / "incidents.jsonl"
     alerts_path = storage_dir / "alerts.jsonl"
     schema_path = storage_dir / "schema-version.json"
@@ -113,6 +114,8 @@ def ensure_state_storage(target_dir: Path) -> None:
         )
     if not session_control_path.exists():
         atomic_write_text(session_control_path, "")
+    if not worktrees_path.exists():
+        atomic_write_text(worktrees_path, "")
     if not incidents_path.exists():
         atomic_write_text(incidents_path, "")
     if not alerts_path.exists():

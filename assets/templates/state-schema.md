@@ -29,6 +29,7 @@
 - state/heartbeats.jsonl
 - state/strategy-sync.jsonl
 - state/session-control.jsonl
+- state/worktrees.jsonl
 - state/incidents.jsonl
 - state/alerts.jsonl
 

@@ -24,6 +24,11 @@
 
 - Exclusive Write Set:
 - Artifact Namespace:
+- Worktree Mode: codex-app | local-git | provider-command
+- Worktree Id:
+- Base Branch:
+- Local Mutation Policy: do not mutate local checkout
+- Remote Mutation Policy: do not push or create PR without release gate
 - Merge Owner:
 - Conflict Protocol:
 

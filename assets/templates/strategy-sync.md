@@ -6,6 +6,7 @@
 - Summary:
 - Accepted at:
 - Strategy packet:
+- Strategy packet validated: yes | no
 - Status: none | current | stale
 
 ## Strategy Sessions

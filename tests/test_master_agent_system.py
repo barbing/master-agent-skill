@@ -133,6 +133,107 @@ def write_predecessor_state_packet(path: Path) -> None:
     )
 
 
+def write_valid_strategy_packet(path: Path, plan_id: str = "PLAN-VALID") -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "# Strategy Packet",
+                "",
+                "## Question",
+                "",
+                "- Strategy session id: strategy-test-1",
+                "- Question being answered: Should the next bounded work order proceed?",
+                "- User decision requested: no",
+                "",
+                "## Authority",
+                "",
+                "- Authority docs consulted: project-policy-pack.md",
+                "- Master ledger state used: initial ledger",
+                "- Policy pack sections used: safety envelope",
+                "",
+                "## Plan Sync",
+                "",
+                f"- Proposed plan id: {plan_id}",
+                "- Current accepted plan id: none",
+                "- Plan version change: yes",
+                "- Master ledger update required: strategy-sync.md",
+                "- Resync trigger: new accepted plan",
+                "",
+                "## Diagnosis",
+                "",
+                "- Current diagnosis: the work is bounded and ready for a Coding Agent",
+                "- Current code path or process path: docs/master-agent",
+                "- Intended code path or process path: gated work order",
+                "- First failing boundary: none",
+                "",
+                "## Options Considered",
+                "",
+                "| Option | Benefit | Cost | Risk | Decision |",
+                "| --- | --- | --- | --- | --- |",
+                "| proceed | verifies gate | low | narrow | accept |",
+                "",
+                "## Recommendation",
+                "",
+                "- Recommended decision: proceed with bounded work order",
+                "- Reason: all controls are named",
+                "- Rejected alternatives: raw discussion handoff",
+                "- Confidence: high",
+                "",
+                "## Proposed Work Order",
+                "",
+                "- Proposed objective: execute bounded implementation",
+                "- Allowed scope: docs/master-agent",
+                "- Worktree mode: codex-app",
+                "- Worktree id: wt-plan",
+                "- Base branch: main",
+                "- Local mutation policy: do not mutate local checkout",
+                "- Remote mutation policy: do not push or create PR without release gate",
+                "- Forbidden changes: production implementation",
+                "- Validation required: release gate",
+                "- Expected artifacts: receipt and verdict",
+                "- Stop conditions: scope drift or missing validation",
+                "",
+                "## Open Risks",
+                "",
+                "- synthetic test packet",
+                "",
+                "## Token Impact",
+                "",
+                "- Estimated next-session token cost: 2000",
+                "- Recommended sub-agent count: 1",
+                "- Recommended heartbeat cap: 3",
+                "- Recommended context tier: minimal",
+                "- Recommended Master constraints: require packet gate",
+                "- Recommended sub-agent autonomous strategy: targeted reads only",
+                "- Compression or narrowing trigger: repeated next action",
+                "- Token risks: low",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def accept_valid_strategy(state_dir: Path, tmp: Path, plan_id: str = "PLAN-1") -> Path:
+    packet = tmp / f"strategy-packet-{plan_id}.md"
+    write_valid_strategy_packet(packet, plan_id)
+    run_cmd(
+        [
+            TOOL,
+            "accept-strategy",
+            "--state-dir",
+            state_dir,
+            "--packet",
+            packet,
+            "--plan-id",
+            plan_id,
+            "--summary",
+            f"Accepted {plan_id}",
+        ]
+    )
+    return packet
+
+
 class MasterAgentToolTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="master-agent-system-test-"))
@@ -210,6 +311,16 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIn("## Remediation Permissions", safety)
         self.assertIn("## Escalation Triggers", safety)
 
+    def test_init_creates_worktree_control_state(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        worktree_control = (self.state_dir / "worktree-control.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("# Worktree Control", worktree_control)
+        self.assertIn("## Worktree Policy", worktree_control)
+        self.assertTrue((self.state_dir / "state" / "worktrees.jsonl").exists())
+
     def test_validate_rejects_missing_safety_envelope(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         (self.state_dir / "safety-envelope.md").unlink()
@@ -273,10 +384,7 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_accept_strategy_updates_strategy_sync(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         packet = self.tmp / "strategy-packet.md"
-        packet.write_text(
-            "# Strategy Packet\n\n## Recommendation\n\n- Recommended decision: Proceed\n",
-            encoding="utf-8",
-        )
+        write_valid_strategy_packet(packet, "PLAN-1")
 
         result = run_cmd(
             [
@@ -304,15 +412,46 @@ class MasterAgentToolTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('"plan_id": "PLAN-1"', sync_history)
+        self.assertIn('"strategy_packet_validated": true', sync_history)
 
         event_log = (self.state_dir / "event-log.md").read_text(encoding="utf-8")
         self.assertIn("strategy-accepted", event_log)
         self.assertIn("PLAN-1", event_log)
 
-    def test_register_agent_requires_current_plan_when_strategy_sync_active(self):
+    def test_accept_strategy_rejects_incomplete_packet(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         packet = self.tmp / "strategy-packet.md"
         packet.write_text("# Strategy Packet\n", encoding="utf-8")
+
+        result = run_cmd(
+            [
+                TOOL,
+                "accept-strategy",
+                "--state-dir",
+                self.state_dir,
+                "--packet",
+                packet,
+                "--plan-id",
+                "PLAN-BAD",
+                "--summary",
+                "Incomplete packet should not become state",
+            ],
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing heading", result.stderr)
+        self.assertEqual(
+            "",
+            (self.state_dir / "state" / "strategy-sync.jsonl").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_register_agent_requires_current_plan_when_strategy_sync_active(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        packet = self.tmp / "strategy-packet.md"
+        write_valid_strategy_packet(packet, "PLAN-1")
         run_cmd(
             [
                 TOOL,
@@ -396,10 +535,49 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertIn("Registered agent coding-1", registered.stdout)
 
+    def test_register_agent_rejects_unvalidated_current_strategy_state(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        packet = self.tmp / "strategy-packet.md"
+        write_valid_strategy_packet(packet, "PLAN-LEGACY")
+        append_jsonl_locked(
+            self.state_dir / "state" / "strategy-sync.jsonl",
+            {
+                "accepted_at": "2026-06-01T00:00:00+00:00",
+                "packet": str(packet),
+                "plan_id": "PLAN-LEGACY",
+                "summary": "Legacy unvalidated state",
+            },
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-legacy",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-LEGACY",
+                "--objective",
+                "Must not run from unvalidated state",
+                "--scope",
+                "src/module",
+                "--plan-id",
+                "PLAN-LEGACY",
+            ],
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("has not been validated", result.stderr)
+
     def test_stale_strategy_plan_is_reported(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         packet = self.tmp / "strategy-packet.md"
-        packet.write_text("# Strategy Packet\n", encoding="utf-8")
+        write_valid_strategy_packet(packet, "PLAN-1")
         run_cmd(
             [
                 TOOL,
@@ -448,8 +626,96 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(stale.returncode, 1)
         self.assertIn("Plan status: stale", stale.stdout)
 
+    def test_strategy_packet_lint_rejects_unfilled_template(self):
+        packet = self.tmp / "strategy-packet.md"
+        packet.write_text(
+            (ROOT / "assets" / "templates" / "strategy-packet.md").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_cmd(
+            [TOOL, "strategy-packet-lint", "--packet", packet],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unfilled field", result.stderr)
+
+    def test_strategy_packet_lint_and_pre_work_gate_require_current_packet(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        packet = self.tmp / "strategy-packet.md"
+        write_valid_strategy_packet(packet, "PLAN-GATED")
+
+        lint = run_cmd([TOOL, "strategy-packet-lint", "--packet", packet])
+        self.assertIn("Strategy packet is valid", lint.stdout)
+
+        missing_plan = run_cmd(
+            [
+                TOOL,
+                "require-strategy-packet-before-work",
+                "--state-dir",
+                self.state_dir,
+                "--plan-id",
+                "PLAN-GATED",
+                "--packet",
+                packet,
+            ],
+            check=False,
+        )
+        self.assertEqual(missing_plan.returncode, 1)
+        self.assertIn("No current accepted strategy plan", missing_plan.stderr)
+
+        run_cmd(
+            [
+                TOOL,
+                "accept-strategy",
+                "--state-dir",
+                self.state_dir,
+                "--packet",
+                packet,
+                "--plan-id",
+                "PLAN-GATED",
+                "--summary",
+                "Accepted gated strategy packet",
+            ]
+        )
+
+        gate = run_cmd(
+            [
+                TOOL,
+                "require-strategy-packet-before-work",
+                "--state-dir",
+                self.state_dir,
+                "--plan-id",
+                "PLAN-GATED",
+                "--packet",
+                packet,
+            ]
+        )
+        self.assertIn("Strategy pre-work gate passed: PLAN-GATED", gate.stdout)
+
+        stale_packet = self.tmp / "stale-strategy-packet.md"
+        write_valid_strategy_packet(stale_packet, "PLAN-GATED")
+        stale = run_cmd(
+            [
+                TOOL,
+                "require-strategy-packet-before-work",
+                "--state-dir",
+                self.state_dir,
+                "--plan-id",
+                "PLAN-GATED",
+                "--packet",
+                stale_packet,
+            ],
+            check=False,
+        )
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("not the current accepted packet", stale.stderr)
+
     def test_audit_agent_detects_repeated_next_action_loop(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-REVIEW")
         run_cmd(
             [
                 TOOL,
@@ -466,6 +732,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Review evidence",
                 "--scope",
                 "docs/master-agent",
+                "--plan-id",
+                "PLAN-REVIEW",
             ]
         )
         for index in range(3):
@@ -504,7 +772,7 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_audit_agent_detects_plan_mismatch(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         packet = self.tmp / "strategy-packet.md"
-        packet.write_text("# Strategy Packet\n", encoding="utf-8")
+        write_valid_strategy_packet(packet, "PLAN-1")
         run_cmd(
             [
                 TOOL,
@@ -573,6 +841,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_audit_agent_detects_evidence_free_success_claim(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-AUDIT")
         run_cmd(
             [
                 TOOL,
@@ -589,6 +858,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement work",
                 "--scope",
                 "src/module",
+                "--plan-id",
+                "PLAN-AUDIT",
             ]
         )
         run_cmd(
@@ -675,6 +946,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_remediate_agent_creates_context_reinforcement_packet(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-REMEDIATE")
         run_cmd(
             [
                 TOOL,
@@ -691,6 +963,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement work",
                 "--scope",
                 "src/module",
+                "--plan-id",
+                "PLAN-REMEDIATE",
             ]
         )
         run_cmd(
@@ -738,7 +1012,7 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_remediate_agent_creates_successor_packet_for_attention_drift(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         packet = self.tmp / "strategy-packet.md"
-        packet.write_text("# Strategy Packet\n", encoding="utf-8")
+        write_valid_strategy_packet(packet, "PLAN-1")
         run_cmd(
             [
                 TOOL,
@@ -823,6 +1097,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_remediate_agent_stops_when_safety_envelope_blocks_action(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-REMEDIATE")
         run_cmd(
             [
                 TOOL,
@@ -839,6 +1114,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement work",
                 "--scope",
                 "src/module",
+                "--plan-id",
+                "PLAN-REMEDIATE",
             ]
         )
         blocked = run_cmd(
@@ -1017,6 +1294,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_watch_heartbeats_can_run_one_poll_cycle(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-WATCH")
         run_cmd(
             [
                 TOOL,
@@ -1033,6 +1311,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement a scoped work order",
                 "--scope",
                 "src/module",
+                "--plan-id",
+                "PLAN-WATCH",
                 "--at",
                 "2026-06-01T00:00:00+00:00",
             ]
@@ -1287,6 +1567,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_heartbeat_cap_is_checked_as_budget_control(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-REVIEW")
         run_cmd(
             [
                 TOOL,
@@ -1303,6 +1584,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Review evidence",
                 "--scope",
                 "docs/master-agent",
+                "--plan-id",
+                "PLAN-REVIEW",
                 "--max-heartbeats",
                 "1",
             ]
@@ -1882,7 +2165,7 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_validate_rejects_strategy_sync_plan_mismatch(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         packet = self.tmp / "strategy-packet.md"
-        packet.write_text("# Strategy Packet\n", encoding="utf-8")
+        write_valid_strategy_packet(packet, "PLAN-CURRENT")
         run_cmd(
             [
                 TOOL,
@@ -1978,6 +2261,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_supervise_runs_one_cycle_and_updates_runtime_status(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-SUPERVISE")
         run_cmd(
             [
                 TOOL,
@@ -1994,6 +2278,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Review evidence",
                 "--scope",
                 "docs/master-agent",
+                "--plan-id",
+                "PLAN-SUPERVISE",
             ]
         )
 
@@ -2025,6 +2311,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_supervise_stops_after_repeated_same_remediation_limit(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-LOOP")
         run_cmd(
             [
                 TOOL,
@@ -2041,6 +2328,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement work",
                 "--scope",
                 "docs/master-agent",
+                "--plan-id",
+                "PLAN-LOOP",
             ]
         )
         for index in range(3):
@@ -2092,6 +2381,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_supervise_respects_quiet_period_for_noncritical_work(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-QUIET")
         run_cmd(
             [
                 TOOL,
@@ -2108,6 +2398,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement work",
                 "--scope",
                 "docs/master-agent",
+                "--plan-id",
+                "PLAN-QUIET",
             ]
         )
         run_cmd(
@@ -2157,6 +2449,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_supervise_escalates_unrecoverable_safety_breach(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-BREACH")
         run_cmd(
             [
                 TOOL,
@@ -2173,6 +2466,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Implement work",
                 "--scope",
                 "docs/master-agent",
+                "--plan-id",
+                "PLAN-BREACH",
             ]
         )
         append_jsonl_locked(
@@ -2498,6 +2793,70 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(event["agent_id"], "strategy-1")
         self.assertTrue(Path(event["provider_session_path"]).exists())
 
+    def test_coding_session_create_requires_registered_validated_agent(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-SESSION")
+        context = self.tmp / "context-packet.md"
+        context.write_text("# Context Packet\n", encoding="utf-8")
+
+        unregistered = run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--context-packet",
+                context,
+                "--provider",
+                "file",
+            ],
+            check=False,
+        )
+        self.assertEqual(unregistered.returncode, 1)
+        self.assertIn("requires registered agent", unregistered.stderr)
+
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-SESSION",
+                "--objective",
+                "Launch only after registration",
+                "--scope",
+                "src/module",
+                "--plan-id",
+                "PLAN-SESSION",
+            ]
+        )
+        created = run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-1",
+                "--role",
+                "Coding",
+                "--context-packet",
+                context,
+                "--provider",
+                "file",
+            ]
+        )
+        self.assertIn("Created session file:coding-1", created.stdout)
+
     def test_session_create_live_provider_requires_provider_command(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         context = self.tmp / "context-packet.md"
@@ -2679,6 +3038,91 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertEqual(provider["status"], "archived")
 
+    def test_bundled_file_session_provider_supports_provider_command_flow(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        context = self.tmp / "context-packet.md"
+        context.write_text("# Context Packet\n", encoding="utf-8")
+        provider_state = self.state_dir / "state" / "provider-sessions.json"
+        provider_command = (
+            f"{PYTHON} {ROOT / 'scripts' / 'file_session_provider.py'} "
+            f"--state-file {provider_state}"
+        )
+
+        create = run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-live",
+                "--role",
+                "Strategy",
+                "--context-packet",
+                context,
+                "--provider",
+                "codex",
+                "--provider-command",
+                provider_command,
+            ]
+        )
+        self.assertIn("Created session", create.stdout)
+
+        run_cmd(
+            [
+                TOOL,
+                "session-send",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-live",
+                "--message",
+                "Return a strategy packet.",
+                "--provider-command",
+                provider_command,
+            ]
+        )
+        read = run_cmd(
+            [
+                TOOL,
+                "session-read",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-live",
+                "--provider-command",
+                provider_command,
+            ]
+        )
+        self.assertIn("ack:Return a strategy packet.", read.stdout)
+
+        reconcile = run_cmd(
+            [
+                TOOL,
+                "session-reconcile",
+                "--state-dir",
+                self.state_dir,
+                "--provider-command",
+                provider_command,
+            ]
+        )
+        self.assertIn("No stale sessions", reconcile.stdout)
+
+        run_cmd(
+            [
+                TOOL,
+                "session-archive",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-live",
+                "--provider-command",
+                provider_command,
+            ]
+        )
+        provider = json.loads(provider_state.read_text(encoding="utf-8"))
+        self.assertEqual(provider["sessions"]["strategy-live"]["status"], "archived")
+
     def test_live_provider_operations_fail_without_provider_command(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         context = self.tmp / "context-packet.md"
@@ -2799,8 +3243,29 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_successor_session_inherits_context_packet(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-SUCCESSOR")
         context = self.tmp / "successor-context.md"
         context.write_text("# Successor Context\n\nInherited state\n", encoding="utf-8")
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-2",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-SUCCESSOR",
+                "--objective",
+                "Continue inherited task",
+                "--scope",
+                "src/module",
+                "--plan-id",
+                "PLAN-SUCCESSOR",
+            ]
+        )
 
         run_cmd(
             [
@@ -2979,8 +3444,221 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(reconcile.returncode, 1)
         self.assertIn("stale", reconcile.stdout)
 
+    def test_codex_app_worktree_lifecycle_binds_session_and_reconciles(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        context = self.tmp / "context-packet.md"
+        context.write_text("# Context Packet\n", encoding="utf-8")
+
+        run_cmd(
+            [
+                TOOL,
+                "worktree-plan",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-strategy",
+                "--provider",
+                "codex-app",
+                "--base-branch",
+                "main",
+                "--purpose",
+                "Isolated strategy work",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "worktree-confirm-create",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-strategy",
+                "--thread-id",
+                "thread-wt-1",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-wt",
+                "--role",
+                "Strategy",
+                "--context-packet",
+                context,
+                "--provider",
+                "codex-app",
+                "--worktree-id",
+                "wt-strategy",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-wt",
+                "--thread-id",
+                "thread-wt-1",
+                "--worktree-id",
+                "wt-strategy",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "worktree-assign-session",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-strategy",
+                "--agent-id",
+                "strategy-wt",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-read",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-wt",
+                "--summary",
+                "Worktree-bound session read",
+                "--turn-count",
+                "3",
+            ]
+        )
+
+        reconcile = run_cmd([TOOL, "worktree-reconcile", "--state-dir", self.state_dir])
+        self.assertIn("No stale worktrees", reconcile.stdout)
+        run_cmd(
+            [
+                TOOL,
+                "worktree-close",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-strategy",
+                "--reason",
+                "task accepted",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "worktree-confirm-close",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-strategy",
+            ]
+        )
+
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "worktrees.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        event_names = [event["event"] for event in events]
+        self.assertIn("worktree-planned", event_names)
+        self.assertIn("worktree-created", event_names)
+        self.assertIn("worktree-session-bound", event_names)
+        self.assertIn("worktree-closed", event_names)
+
+    def test_worktree_reconcile_marks_bound_codex_app_without_read_stale(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        context = self.tmp / "context-packet.md"
+        context.write_text("# Context Packet\n", encoding="utf-8")
+        run_cmd(
+            [
+                TOOL,
+                "worktree-plan",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-stale",
+                "--base-branch",
+                "main",
+                "--purpose",
+                "Stale detection",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "worktree-confirm-create",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-stale",
+                "--thread-id",
+                "thread-stale",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-stale",
+                "--role",
+                "Strategy",
+                "--context-packet",
+                context,
+                "--provider",
+                "codex-app",
+                "--worktree-id",
+                "wt-stale",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "session-confirm-create",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "strategy-stale",
+                "--thread-id",
+                "thread-stale",
+                "--worktree-id",
+                "wt-stale",
+            ]
+        )
+        run_cmd(
+            [
+                TOOL,
+                "worktree-assign-session",
+                "--state-dir",
+                self.state_dir,
+                "--worktree-id",
+                "wt-stale",
+                "--agent-id",
+                "strategy-stale",
+            ]
+        )
+
+        reconcile = run_cmd(
+            [TOOL, "worktree-reconcile", "--state-dir", self.state_dir],
+            check=False,
+        )
+        self.assertEqual(reconcile.returncode, 1)
+        self.assertIn("stale worktrees", reconcile.stdout)
+
     def test_rotate_session_requires_predecessor_state_unless_emergency(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-ROTATE")
         run_cmd(
             [
                 TOOL,
@@ -2997,6 +3675,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Finish parser repair",
                 "--scope",
                 "src/parser",
+                "--plan-id",
+                "PLAN-ROTATE",
             ]
         )
         strict = run_cmd(
@@ -3047,7 +3727,7 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_rotate_session_freezes_predecessor_and_launches_successor(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         strategy_packet = self.tmp / "strategy-packet.md"
-        strategy_packet.write_text("# Strategy Packet\n", encoding="utf-8")
+        write_valid_strategy_packet(strategy_packet, "PLAN-ROTATE")
         run_cmd(
             [
                 TOOL,
@@ -3207,6 +3887,7 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_supervise_uses_successor_handoff_for_attention_drift_loop(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-LOOP")
         run_cmd(
             [
                 TOOL,
@@ -3223,6 +3904,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "Finish bounded work",
                 "--scope",
                 "src/module",
+                "--plan-id",
+                "PLAN-LOOP",
             ]
         )
         for index in range(3):
@@ -3555,6 +4238,7 @@ class MasterAgentToolTests(unittest.TestCase):
         path: Path,
         write_set: str,
         artifact_namespace: str,
+        worktree_id: str = "wt-default",
         merge_owner: str = "Master Agent",
         conflict_protocol: str = "stop and return to Master",
         token_budget: str = "4000",
@@ -3578,6 +4262,11 @@ class MasterAgentToolTests(unittest.TestCase):
                     "",
                     "- Exclusive Write Set: " + write_set,
                     "- Artifact Namespace: " + artifact_namespace,
+                    "- Worktree Mode: codex-app",
+                    "- Worktree Id: " + worktree_id,
+                    "- Base Branch: main",
+                    "- Local Mutation Policy: do not mutate local checkout",
+                    "- Remote Mutation Policy: do not push or create PR without release gate",
                     "- Merge Owner: " + merge_owner,
                     "- Conflict Protocol: " + conflict_protocol,
                     "",
@@ -3607,8 +4296,8 @@ class MasterAgentToolTests(unittest.TestCase):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         one = self.tmp / "one.md"
         two = self.tmp / "two.md"
-        self.write_work_order(one, "src/parser", "artifacts/parser")
-        self.write_work_order(two, "src/render", "artifacts/render")
+        self.write_work_order(one, "src/parser", "artifacts/parser", worktree_id="wt-parser")
+        self.write_work_order(two, "src/render", "artifacts/render", worktree_id="wt-render")
 
         result = run_cmd(
             [
@@ -3629,8 +4318,8 @@ class MasterAgentToolTests(unittest.TestCase):
         one = self.tmp / "one.md"
         two = self.tmp / "two.md"
         missing = self.tmp / "missing.md"
-        self.write_work_order(one, "src/parser", "artifacts/parser")
-        self.write_work_order(two, "src/parser/tokenizer.py", "artifacts/parser")
+        self.write_work_order(one, "src/parser", "artifacts/parser", worktree_id="wt-parser")
+        self.write_work_order(two, "src/parser/tokenizer.py", "artifacts/parser", worktree_id="wt-tokenizer")
         missing.write_text("# Work Order\n\n## Parallel Safety\n\n", encoding="utf-8")
 
         serial = run_cmd(
@@ -3681,6 +4370,90 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("broad parallel scope", result.stdout)
 
+    def test_assess_parallelism_blocks_shared_worktree_id(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        one = self.tmp / "one.md"
+        two = self.tmp / "two.md"
+        self.write_work_order(one, "src/parser", "artifacts/parser", worktree_id="wt-shared")
+        self.write_work_order(two, "src/render", "artifacts/render", worktree_id="wt-shared")
+
+        result = run_cmd(
+            [
+                TOOL,
+                "assess-parallelism",
+                "--state-dir",
+                self.state_dir,
+                "--work-order",
+                one,
+                "--work-order",
+                two,
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("shared Worktree Id", result.stdout)
+
+    def test_validate_worktreeinclude_allows_ignored_file_and_blocks_tracked_file(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        (self.tmp / ".gitignore").write_text(".env\n", encoding="utf-8")
+        (self.tmp / ".env").write_text("LOCAL_ONLY=1\n", encoding="utf-8")
+        (self.tmp / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", ".gitignore", "tracked.txt"],
+            cwd=self.tmp,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        (self.tmp / ".worktreeinclude").write_text(".env\n", encoding="utf-8")
+        allowed = run_cmd(
+            [
+                TOOL,
+                "validate-worktreeinclude",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+            ]
+        )
+        self.assertIn(".worktreeinclude validation passed", allowed.stdout)
+
+        (self.tmp / ".worktreeinclude").write_text("tracked.txt\n", encoding="utf-8")
+        blocked = run_cmd(
+            [
+                TOOL,
+                "validate-worktreeinclude",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+            ],
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("matches tracked files", blocked.stdout)
+
+    def test_validate_worktreeinclude_blocks_broad_entries(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        (self.tmp / ".worktreeinclude").write_text("**\n", encoding="utf-8")
+
+        blocked = run_cmd(
+            [
+                TOOL,
+                "validate-worktreeinclude",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+            ],
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("too broad or unsafe", blocked.stdout)
+
     def test_release_validator_runs_fake_quick_validate_under_test_hook(self):
         fake_quick = self.tmp / "quick_validate.py"
         fake_quick.write_text("import sys\nprint('Skill is valid!')\n", encoding="utf-8")
@@ -3698,6 +4471,50 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIn("PASS: root skill quick_validate", result.stdout)
         self.assertIn("PASS: personal path scan", result.stdout)
         self.assertIn("PASS: secret scan", result.stdout)
+
+    def test_release_validator_plugin_eval_is_optional_unless_required(self):
+        env = os.environ.copy()
+        env["MASTER_AGENT_RELEASE_VALIDATE_SKIP_CORE"] = "1"
+        missing_command = "definitely-missing-plugin-eval-command evaluate-skill {skill}"
+
+        optional = run_cmd(
+            [
+                ROOT / "scripts" / "release_validate.py",
+                "--plugin-eval-command",
+                missing_command,
+            ],
+            env=env,
+        )
+        self.assertIn("PASS: plugin-eval", optional.stdout)
+        self.assertIn("skipped", optional.stdout)
+
+        required = run_cmd(
+            [
+                ROOT / "scripts" / "release_validate.py",
+                "--plugin-eval-command",
+                missing_command,
+                "--require-plugin-eval",
+            ],
+            env=env,
+            check=False,
+        )
+        self.assertEqual(required.returncode, 1)
+        self.assertIn("FAIL: plugin-eval", required.stdout)
+
+    def test_soak_validator_runs_quick_profile(self):
+        result = run_cmd([ROOT / "scripts" / "soak_validate.py", "--quick"])
+        self.assertIn("Soak validation passed", result.stdout)
+
+    def test_operating_system_hardening_docs_and_examples_exist(self):
+        provider_reference = ROOT / "references" / "provider-command-adapter.md"
+        workflow = ROOT / ".github" / "workflows" / "release-validate.yml"
+        pre_commit = ROOT / "assets" / "examples" / "pre-commit-master-boundary.ps1"
+        worktree_control = ROOT / "assets" / "templates" / "worktree-control.md"
+
+        self.assertIn("Provider-Command Adapter Contract", provider_reference.read_text(encoding="utf-8"))
+        self.assertIn("release-validate", workflow.read_text(encoding="utf-8"))
+        self.assertIn("enforce-master-boundary", pre_commit.read_text(encoding="utf-8"))
+        self.assertIn("Worktree Control", worktree_control.read_text(encoding="utf-8"))
 
     def test_generated_scripts_do_not_use_non_atomic_write_text(self):
         for relative_path in [
@@ -3967,6 +4784,10 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertIn("Exclusive Write Set", work_order)
         self.assertIn("Artifact Namespace", work_order)
+        self.assertIn("Worktree Mode", work_order)
+        self.assertIn("Worktree Id", work_order)
+        self.assertIn("Local Mutation Policy", work_order)
+        self.assertIn("Remote Mutation Policy", work_order)
         self.assertIn("Merge Owner", work_order)
         self.assertIn("Conflict Protocol", work_order)
 

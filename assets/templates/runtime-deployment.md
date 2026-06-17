@@ -46,3 +46,11 @@
 - Maximum cycles:
 - Maximum repeated remediation:
 - Maximum restart attempts:
+
+## Preflight Validation
+
+- Quick soak command: python scripts/soak_validate.py --quick
+- Release gate command: python scripts/release_validate.py
+- Boundary preflight: python scripts/master_agent_tool.py enforce-master-boundary --project-root . --state-dir docs/master-agent
+- Worktree include preflight: python scripts/master_agent_tool.py validate-worktreeinclude --project-root . --state-dir docs/master-agent
+- Worktree reconcile preflight: python scripts/master_agent_tool.py worktree-reconcile --state-dir docs/master-agent

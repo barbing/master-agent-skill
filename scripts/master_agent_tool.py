@@ -73,6 +73,7 @@ LARGE_CONTINUATION_TOKENS = 5_000
 CURRENT_SCHEMA_VERSION = "1.0"
 ORDERED_MIGRATIONS = ["0001-base-state", "0002-runtime-session-observability"]
 DEFAULT_CODEX_APP_READ_MAX_MINUTES = 60.0
+DEFAULT_WORKTREE_EVIDENCE_MAX_MINUTES = 60.0
 
 PREDECESSOR_STATE_HEADINGS = [
     "# Predecessor State Packet",
@@ -97,6 +98,83 @@ PREDECESSOR_STATE_REQUIRED_SECTIONS = {
     "## Validation Evidence",
     "## Next Safe Step",
     "## Token Usage",
+}
+
+STRATEGY_PACKET_HEADINGS = [
+    "# Strategy Packet",
+    "## Question",
+    "## Authority",
+    "## Plan Sync",
+    "## Diagnosis",
+    "## Options Considered",
+    "## Recommendation",
+    "## Proposed Work Order",
+    "## Open Risks",
+    "## Token Impact",
+]
+
+STRATEGY_PACKET_REQUIRED_FIELDS = {
+    "## Question": [
+        "Strategy session id",
+        "Question being answered",
+        "User decision requested",
+    ],
+    "## Authority": [
+        "Authority docs consulted",
+        "Master ledger state used",
+        "Policy pack sections used",
+    ],
+    "## Plan Sync": [
+        "Proposed plan id",
+        "Current accepted plan id",
+        "Plan version change",
+        "Master ledger update required",
+        "Resync trigger",
+    ],
+    "## Diagnosis": [
+        "Current diagnosis",
+        "Current code path or process path",
+        "Intended code path or process path",
+        "First failing boundary",
+    ],
+    "## Recommendation": [
+        "Recommended decision",
+        "Reason",
+        "Rejected alternatives",
+        "Confidence",
+    ],
+    "## Proposed Work Order": [
+        "Proposed objective",
+        "Allowed scope",
+        "Worktree mode",
+        "Worktree id",
+        "Base branch",
+        "Local mutation policy",
+        "Remote mutation policy",
+        "Forbidden changes",
+        "Validation required",
+        "Expected artifacts",
+        "Stop conditions",
+    ],
+    "## Token Impact": [
+        "Estimated next-session token cost",
+        "Recommended sub-agent count",
+        "Recommended heartbeat cap",
+        "Recommended context tier",
+        "Recommended Master constraints",
+        "Recommended sub-agent autonomous strategy",
+        "Compression or narrowing trigger",
+        "Token risks",
+    ],
+}
+
+UNFILLED_PACKET_VALUES = {
+    "",
+    "-",
+    "TODO",
+    "TBD",
+    "yes | no",
+    "low | medium | high",
 }
 
 DEFAULT_ROLES = {
@@ -311,6 +389,42 @@ def validate_predecessor_state_packet(path: Path) -> list[str]:
     return errors
 
 
+def markdown_bullet_field(section_text: str, field_name: str) -> str | None:
+    pattern = re.compile(rf"^\s*[-*]\s+{re.escape(field_name)}:\s*(.*)$", re.MULTILINE)
+    match = pattern.search(section_text)
+    if not match:
+        return None
+    return " ".join(match.group(1).split()).strip()
+
+
+def field_is_filled(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = " ".join(value.split()).strip()
+    return normalized not in UNFILLED_PACKET_VALUES
+
+
+def validate_strategy_packet(path: Path) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"strategy packet does not exist: {path}"]
+    text = path.read_text(encoding="utf-8")
+    for heading in STRATEGY_PACKET_HEADINGS:
+        if heading not in text:
+            errors.append(f"missing heading: {heading}")
+    sections = parse_markdown_sections(text)
+    for heading, field_names in STRATEGY_PACKET_REQUIRED_FIELDS.items():
+        section_text = sections.get(heading, "")
+        if not section_has_content(section_text):
+            errors.append(f"empty required section: {heading}")
+            continue
+        for field_name in field_names:
+            value = markdown_bullet_field(section_text, field_name)
+            if not field_is_filled(value):
+                errors.append(f"unfilled field: {heading} / {field_name}")
+    return errors
+
+
 def yaml_quoted(value: object) -> str:
     return json.dumps(" ".join(str(value).split()))
 
@@ -369,6 +483,7 @@ def ensure_state_storage(state_dir: Path) -> None:
     roles_path = storage_dir / "roles.json"
     runtime_path = storage_dir / "runtime.json"
     session_control_path = storage_dir / "session-control.jsonl"
+    worktrees_path = storage_dir / "worktrees.jsonl"
     incidents_path = storage_dir / "incidents.jsonl"
     alerts_path = storage_dir / "alerts.jsonl"
     schema_path = storage_dir / "schema-version.json"
@@ -414,6 +529,8 @@ def ensure_state_storage(state_dir: Path) -> None:
         atomic_write_json(runtime_path, default_runtime_state())
     if not session_control_path.exists():
         atomic_write_text(session_control_path, "")
+    if not worktrees_path.exists():
+        atomic_write_text(worktrees_path, "")
     if not incidents_path.exists():
         atomic_write_text(incidents_path, "")
     if not alerts_path.exists():
@@ -666,11 +783,44 @@ def current_strategy_plan(state_dir: Path) -> dict | None:
     return history[-1]
 
 
+def role_requires_validated_strategy(role_name: str) -> bool:
+    return role_name in {"Coding", "Review", "Policy Review"}
+
+
+def strategy_packet_validation_errors_for_entry(entry: dict | None) -> list[str]:
+    if not entry:
+        return ["no current accepted strategy plan"]
+    if not entry.get("strategy_packet_validated"):
+        return ["current strategy packet has not been validated"]
+    packet = Path(str(entry.get("packet") or "")).resolve()
+    errors = validate_strategy_packet(packet)
+    if errors:
+        return [f"accepted strategy packet is no longer valid: {error}" for error in errors]
+    return []
+
+
+def require_validated_strategy_for_work(
+    state_dir: Path,
+    role_name: str,
+    plan_id: str | None,
+) -> list[str]:
+    if not role_requires_validated_strategy(role_name):
+        return []
+    entry = current_strategy_plan(state_dir)
+    if not entry:
+        return [f"{role_name} work requires a current validated strategy plan"]
+    current_plan_id = entry.get("plan_id")
+    if plan_id != current_plan_id:
+        return [f"{role_name} work requires current plan {current_plan_id}"]
+    return strategy_packet_validation_errors_for_entry(entry)
+
+
 def render_strategy_sync(state_dir: Path, entry: dict | None, status: str = "current") -> None:
     plan_id = entry.get("plan_id", "") if entry else ""
     summary = entry.get("summary", "") if entry else ""
     accepted_at = entry.get("accepted_at", "") if entry else ""
     packet = entry.get("packet", "") if entry else ""
+    validated = "yes" if entry and entry.get("strategy_packet_validated") else "no"
     lines = [
         "# Strategy Sync",
         "",
@@ -680,6 +830,7 @@ def render_strategy_sync(state_dir: Path, entry: dict | None, status: str = "cur
         f"- Summary: {summary}",
         f"- Accepted at: {accepted_at}",
         f"- Strategy packet: {packet}",
+        f"- Strategy packet validated: {validated}",
         f"- Status: {status if entry else 'none'}",
         "",
         "## Strategy Sessions",
@@ -1010,6 +1161,7 @@ def _state_file_paths(state_dir: Path) -> list[Path]:
         state_dir / "state" / "token-usage.jsonl",
         state_dir / "state" / "runtime.json",
         state_dir / "state" / "session-control.jsonl",
+        state_dir / "state" / "worktrees.jsonl",
         state_dir / "state" / "incidents.jsonl",
         state_dir / "state" / "alerts.jsonl",
         state_dir / "state" / "schema-version.json",
@@ -1115,6 +1267,15 @@ def command_register_agent(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+    strategy_errors = require_validated_strategy_for_work(
+        state_dir,
+        role_name,
+        args.plan_id,
+    )
+    if strategy_errors:
+        for error in strategy_errors:
+            print(error, file=sys.stderr)
+        return 1
     timestamp = format_time(parse_time(args.at))
     token_budget = (
         args.token_budget
@@ -1461,11 +1622,19 @@ def command_accept_strategy(args: argparse.Namespace) -> int:
         print(f"Strategy packet does not exist: {packet}", file=sys.stderr)
         return 2
     timestamp = format_time(parse_time(args.at))
+    packet_errors = validate_strategy_packet(packet)
+    if packet_errors:
+        for error in packet_errors:
+            print(error, file=sys.stderr)
+        return 1
     entry = {
         "accepted_at": timestamp,
         "packet": str(packet),
         "plan_id": args.plan_id,
         "summary": args.summary,
+        "strategy_packet_validated": True,
+        "strategy_packet_validated_at": timestamp,
+        "strategy_packet_validation": "strategy-packet-lint",
     }
     append_strategy_sync(state_dir, entry)
     render_strategy_sync(state_dir, entry)
@@ -1474,7 +1643,7 @@ def command_accept_strategy(args: argparse.Namespace) -> int:
         event_type="strategy-accepted",
         related_packet=str(packet),
         summary=f"{args.plan_id}: {args.summary}",
-        evidence=str(packet),
+        evidence=f"{packet}; strategy-packet-lint passed",
         ledger_update="strategy-sync.md updated",
         next_action="issue work order or register role agent with current plan id",
         at=timestamp,
@@ -1515,6 +1684,59 @@ def command_require_plan(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 1
+
+
+def command_strategy_packet_lint(args: argparse.Namespace) -> int:
+    packet = Path(args.packet).resolve()
+    errors = validate_strategy_packet(packet)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    print(f"Strategy packet is valid: {packet}")
+    return 0
+
+
+def command_require_strategy_packet_before_work(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    entry = current_strategy_plan(state_dir)
+    if not entry:
+        print("No current accepted strategy plan.", file=sys.stderr)
+        return 1
+    current_plan_id = entry.get("plan_id")
+    if current_plan_id != args.plan_id:
+        print(
+            f"Current plan mismatch: expected {current_plan_id or 'none'}, got {args.plan_id}",
+            file=sys.stderr,
+        )
+        return 1
+
+    accepted_packet = Path(str(entry.get("packet") or "")).resolve()
+    if not accepted_packet.exists():
+        print(
+            f"Accepted strategy packet is missing: {accepted_packet}",
+            file=sys.stderr,
+        )
+        return 1
+
+    supplied_packet = Path(args.packet).resolve() if args.packet else accepted_packet
+    if supplied_packet != accepted_packet:
+        print(
+            f"Strategy packet is not the current accepted packet: {supplied_packet}",
+            file=sys.stderr,
+        )
+        print(f"Current accepted packet: {accepted_packet}", file=sys.stderr)
+        return 1
+
+    errors = strategy_packet_validation_errors_for_entry(entry)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+
+    print(f"Strategy pre-work gate passed: {current_plan_id}")
+    print(f"Packet: {accepted_packet}")
+    return 0
 
 
 def broad_next_action(value: str) -> bool:
@@ -2409,6 +2631,199 @@ def codex_app_ref(thread_id: str) -> str:
     return f"codex-app:{thread_id}"
 
 
+def append_worktree_event(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "worktrees.jsonl", entry)
+
+
+def load_worktree_events(state_dir: Path) -> list[dict]:
+    ensure_state_storage(state_dir)
+    events: list[dict] = []
+    path = state_dir / "state" / "worktrees.jsonl"
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid worktree history: {path}: {exc}") from exc
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def worktree_event_is_terminal(event: dict) -> bool:
+    return event.get("event") in {"worktree-closed", "worktree-stale"}
+
+
+def latest_worktree_event(state_dir: Path, worktree_id: str) -> dict | None:
+    for event in reversed(load_worktree_events(state_dir)):
+        if event.get("worktree_id") != worktree_id:
+            continue
+        if worktree_event_is_terminal(event):
+            return None
+        if event.get("event") in {
+            "worktree-planned",
+            "worktree-created",
+            "worktree-session-bound",
+            "worktree-handoff-requested",
+        }:
+            return event
+    return None
+
+
+def latest_created_worktree_event(state_dir: Path, worktree_id: str) -> dict | None:
+    for event in reversed(load_worktree_events(state_dir)):
+        if event.get("worktree_id") != worktree_id:
+            continue
+        if worktree_event_is_terminal(event):
+            return None
+        if event.get("event") == "worktree-created":
+            return event
+    return None
+
+
+def latest_worktree_binding(state_dir: Path, worktree_id: str) -> dict | None:
+    for event in reversed(load_worktree_events(state_dir)):
+        if event.get("worktree_id") != worktree_id:
+            continue
+        if worktree_event_is_terminal(event):
+            return None
+        if event.get("event") == "worktree-session-bound":
+            return event
+    return None
+
+
+def worktree_ref(provider: str, worktree_id: str, provider_worktree_ref: str = "") -> str:
+    if provider_worktree_ref:
+        return provider_worktree_ref
+    return f"{provider}-worktree:{worktree_id}"
+
+
+def require_worktree_plan_or_active(state_dir: Path, worktree_id: str) -> dict | None:
+    if not worktree_id:
+        return None
+    event = latest_worktree_event(state_dir, worktree_id)
+    if not event:
+        print(f"No planned or active worktree found for {worktree_id}", file=sys.stderr)
+        return None
+    return event
+
+
+def require_created_worktree(state_dir: Path, worktree_id: str) -> dict | None:
+    event = latest_created_worktree_event(state_dir, worktree_id)
+    if not event:
+        print(f"No confirmed active worktree found for {worktree_id}", file=sys.stderr)
+        return None
+    return event
+
+
+def git_repo_root(project_root: Path) -> tuple[Path | None, str | None]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"git is unavailable ({exc})"
+    if result.returncode != 0:
+        return None, "project root is not inside a Git repository"
+    return Path(result.stdout.strip()).resolve(), None
+
+
+def normalize_git_output_path(value: str) -> str:
+    normalized = value.replace("\\", "/").strip()
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def git_tracked_paths(repo_root: Path) -> tuple[list[str], str | None]:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files"],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return [], f"git ls-files failed ({result.stderr.strip()})"
+    return [normalize_git_output_path(line) for line in result.stdout.splitlines() if line.strip()], None
+
+
+def git_path_is_ignored(repo_root: Path, relative_path: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "check-ignore", "--quiet", "--", relative_path],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    return result.returncode == 0
+
+
+def parse_worktreeinclude(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    patterns: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        patterns.append(stripped)
+    return patterns
+
+
+def normalize_worktreeinclude_pattern(value: str) -> str:
+    normalized = value.replace("\\", "/").strip()
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def pattern_matches_tracked(pattern: str, tracked_paths: list[str]) -> list[str]:
+    normalized = normalize_worktreeinclude_pattern(pattern)
+    if any(char in normalized for char in "*?["):
+        return [path for path in tracked_paths if fnmatch.fnmatch(path, normalized)]
+    return [path for path in tracked_paths if path == normalized or path.startswith(normalized.rstrip("/") + "/")]
+
+
+def validate_worktreeinclude(project_root: Path) -> tuple[list[str], list[str]]:
+    repo_root, repo_error = git_repo_root(project_root)
+    if repo_error:
+        return [], [f"cannot validate .worktreeinclude: {repo_error}"]
+    assert repo_root is not None
+    include_path = repo_root / ".worktreeinclude"
+    patterns = parse_worktreeinclude(include_path)
+    if not include_path.exists():
+        return [], []
+    tracked, tracked_error = git_tracked_paths(repo_root)
+    if tracked_error:
+        return patterns, [f"cannot validate .worktreeinclude: {tracked_error}"]
+    errors: list[str] = []
+    for pattern in patterns:
+        normalized = normalize_worktreeinclude_pattern(pattern)
+        if Path(pattern).is_absolute() or normalized.startswith("/") or normalized.startswith("../") or "/../" in normalized:
+            errors.append(f".worktreeinclude entry escapes repository: {pattern}")
+            continue
+        if is_broad_parallel_scope(normalized) or normalized in {".git", ".git/", ".git/**"}:
+            errors.append(f".worktreeinclude entry is too broad or unsafe: {pattern}")
+            continue
+        tracked_matches = pattern_matches_tracked(normalized, tracked)
+        if tracked_matches:
+            errors.append(
+                f".worktreeinclude entry matches tracked files: {pattern} -> {', '.join(tracked_matches[:3])}"
+            )
+        if any(char in normalized for char in "*?["):
+            continue
+        local_path = repo_root / normalized
+        if local_path.exists():
+            if local_path.is_symlink():
+                errors.append(f".worktreeinclude entry is a symlink: {pattern}")
+            if not git_path_is_ignored(repo_root, normalized):
+                errors.append(f".worktreeinclude entry is not ignored by Git: {pattern}")
+    return patterns, errors
+
+
 def run_session_provider_command(
     command: str,
     request: dict,
@@ -2488,9 +2903,317 @@ def run_live_session_operation(
     return provider_payload, 0
 
 
+def command_worktree_plan(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    timestamp = format_time(parse_time(args.at))
+    if args.project_root:
+        _repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+        if repo_error:
+            print(f"Worktree planning requires a Git repository: {repo_error}", file=sys.stderr)
+            return 2
+    event = {
+        "at": timestamp,
+        "event": "worktree-planned",
+        "worktree_id": args.worktree_id,
+        "provider": args.provider,
+        "base_branch": args.base_branch,
+        "purpose": args.purpose,
+        "status": "planned",
+        "local_mutation_policy": args.local_mutation_policy,
+        "remote_mutation_policy": args.remote_mutation_policy,
+        "copy_ignored_policy": args.copy_ignored_policy,
+        "provider_worktree_ref": "",
+        "worktree_path": "",
+        "provider_confirmed": False,
+    }
+    append_worktree_event(state_dir, event)
+    print(f"Planned worktree {args.worktree_id}")
+    return 0
+
+
+def command_worktree_confirm_create(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    plan = latest_worktree_event(state_dir, args.worktree_id)
+    if not plan:
+        print(f"No worktree plan found for {args.worktree_id}", file=sys.stderr)
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    provider = args.provider or str(plan.get("provider") or "codex-app")
+    provider_ref = worktree_ref(
+        provider,
+        args.worktree_id,
+        args.provider_worktree_ref or (codex_app_ref(args.thread_id) if args.thread_id else ""),
+    )
+    worktree_path = args.worktree_path or ""
+    if provider == "local-git" and not worktree_path:
+        print("local-git worktree confirmation requires --worktree-path", file=sys.stderr)
+        return 2
+    if worktree_path and not Path(worktree_path).exists():
+        print(f"Confirmed worktree path does not exist: {worktree_path}", file=sys.stderr)
+        return 2
+    event = {
+        "at": timestamp,
+        "event": "worktree-created",
+        "worktree_id": args.worktree_id,
+        "provider": provider,
+        "base_branch": args.base_branch or plan.get("base_branch", ""),
+        "purpose": plan.get("purpose", ""),
+        "status": "active",
+        "provider_worktree_ref": provider_ref,
+        "worktree_path": worktree_path,
+        "thread_id": args.thread_id or "",
+        "local_mutation_policy": plan.get("local_mutation_policy", ""),
+        "remote_mutation_policy": plan.get("remote_mutation_policy", ""),
+        "copy_ignored_policy": plan.get("copy_ignored_policy", ""),
+        "provider_confirmed": True,
+        "confirmation": args.note or "worktree create confirmed",
+    }
+    append_worktree_event(state_dir, event)
+    print(f"Confirmed worktree {args.worktree_id}")
+    return 0
+
+
+def command_worktree_assign_session(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    worktree = require_created_worktree(state_dir, args.worktree_id)
+    if not worktree:
+        return 1
+    session = latest_session_event(state_dir, args.agent_id)
+    if not session:
+        print(f"No active session found for {args.agent_id}", file=sys.stderr)
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    worktree_ref_value = str(worktree.get("provider_worktree_ref") or "")
+    append_worktree_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "worktree-session-bound",
+            "worktree_id": args.worktree_id,
+            "provider": worktree.get("provider", ""),
+            "base_branch": worktree.get("base_branch", ""),
+            "provider_worktree_ref": worktree_ref_value,
+            "worktree_path": worktree.get("worktree_path", ""),
+            "agent_id": args.agent_id,
+            "provider_session_id": session.get("provider_session_id", ""),
+            "provider_session_ref": session.get("provider_session_ref", ""),
+            "status": "active",
+            "provider_confirmed": True,
+            "confirmation": args.note or "session assigned to worktree",
+        },
+    )
+    append_session_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "session-worktree-bound",
+            "agent_id": args.agent_id,
+            "role": session.get("role", ""),
+            "provider": session.get("provider", ""),
+            "provider_session_id": session.get("provider_session_id", ""),
+            "provider_session_path": session.get("provider_session_path", ""),
+            "provider_session_ref": session.get("provider_session_ref", ""),
+            "worktree_id": args.worktree_id,
+            "provider_worktree_ref": worktree_ref_value,
+            "status": session.get("status", "active"),
+            "provider_confirmed": True,
+        },
+    )
+    print(f"Assigned session {args.agent_id} to worktree {args.worktree_id}")
+    return 0
+
+
+def command_worktree_reconcile(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    timestamp = format_time(parse_time(args.at))
+    active: dict[str, dict] = {}
+    for event in load_worktree_events(state_dir):
+        worktree_id = str(event.get("worktree_id") or "")
+        if not worktree_id:
+            continue
+        if event.get("event") == "worktree-created":
+            active[worktree_id] = event
+        elif event.get("event") == "worktree-session-bound" and worktree_id in active:
+            active[worktree_id] = {**active[worktree_id], **event}
+        elif worktree_event_is_terminal(event):
+            active.pop(worktree_id, None)
+    stale: list[str] = []
+    for worktree_id, event in sorted(active.items()):
+        provider = event.get("provider", "")
+        if provider == "local-git":
+            worktree_path = Path(str(event.get("worktree_path") or ""))
+            if not worktree_path.exists():
+                stale.append(worktree_id)
+                append_worktree_event(
+                    state_dir,
+                    {
+                        "at": timestamp,
+                        "event": "worktree-stale",
+                        "worktree_id": worktree_id,
+                        "provider": provider,
+                        "status": "stale",
+                        "reason": "local-git worktree path is missing",
+                    },
+                )
+            continue
+        if provider == "codex-app":
+            agent_id = str(event.get("agent_id") or "")
+            if not agent_id:
+                continue
+            read_event = latest_confirmed_read_event(state_dir, agent_id)
+            if not read_event:
+                stale.append(worktree_id)
+                append_worktree_event(
+                    state_dir,
+                    {
+                        "at": timestamp,
+                        "event": "worktree-stale",
+                        "worktree_id": worktree_id,
+                        "provider": provider,
+                        "agent_id": agent_id,
+                        "status": "stale",
+                        "reason": "missing recent session-confirm-read evidence for bound Codex app session",
+                    },
+                )
+                continue
+            max_age = timedelta(minutes=args.codex_app_read_max_minutes)
+            if parse_time(args.at) - parse_time(str(read_event.get("at") or timestamp)) > max_age:
+                stale.append(worktree_id)
+                append_worktree_event(
+                    state_dir,
+                    {
+                        "at": timestamp,
+                        "event": "worktree-stale",
+                        "worktree_id": worktree_id,
+                        "provider": provider,
+                        "agent_id": agent_id,
+                        "status": "stale",
+                        "reason": "bound Codex app session read evidence is stale",
+                    },
+                )
+    if stale:
+        print("stale worktrees:")
+        for worktree_id in stale:
+            print(f"- {worktree_id}")
+        return 1
+    print("No stale worktrees")
+    return 0
+
+
+def command_worktree_close(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    worktree = require_created_worktree(state_dir, args.worktree_id)
+    if not worktree:
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    append_worktree_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "worktree-close-requested",
+            "worktree_id": args.worktree_id,
+            "provider": worktree.get("provider", ""),
+            "provider_worktree_ref": worktree.get("provider_worktree_ref", ""),
+            "worktree_path": worktree.get("worktree_path", ""),
+            "status": "pending-close-confirmation",
+            "reason": args.reason,
+            "provider_confirmed": False,
+        },
+    )
+    print(f"Requested worktree close for {args.worktree_id}")
+    return 0
+
+
+def command_worktree_confirm_close(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    worktree = latest_created_worktree_event(state_dir, args.worktree_id)
+    if not worktree:
+        print(f"No active worktree found for {args.worktree_id}", file=sys.stderr)
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    append_worktree_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "worktree-closed",
+            "worktree_id": args.worktree_id,
+            "provider": worktree.get("provider", ""),
+            "provider_worktree_ref": worktree.get("provider_worktree_ref", ""),
+            "worktree_path": worktree.get("worktree_path", ""),
+            "status": "closed",
+            "provider_confirmed": True,
+            "confirmation": args.note or "worktree close confirmed",
+        },
+    )
+    print(f"Confirmed worktree closed: {args.worktree_id}")
+    return 0
+
+
+def command_validate_worktreeinclude(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    project_root = Path(args.project_root).resolve()
+    patterns, errors = validate_worktreeinclude(project_root)
+    timestamp = format_time(parse_time(args.at))
+    append_worktree_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "worktreeinclude-validated",
+            "project_root": str(project_root),
+            "patterns": patterns,
+            "status": "failed" if errors else "passed",
+            "errors": errors,
+        },
+    )
+    if errors:
+        print(".worktreeinclude validation failed:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+    if patterns:
+        print(".worktreeinclude validation passed")
+        for pattern in patterns:
+            print(f"- {pattern}")
+    else:
+        print("No .worktreeinclude entries; no ignored local files are planned for copy")
+    return 0
+
+
 def command_session_create(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir).resolve()
     role_name, _definition = require_active_role(state_dir, args.role)
+    worktree = None
+    worktree_id = getattr(args, "worktree_id", "") or ""
+    if worktree_id:
+        worktree = require_worktree_plan_or_active(state_dir, worktree_id)
+        if not worktree:
+            return 1
+    if role_requires_validated_strategy(role_name):
+        agents = load_agents(state_dir)
+        agent = agents.get(args.agent_id)
+        if not agent:
+            print(
+                f"Session launch for {role_name} requires registered agent {args.agent_id}",
+                file=sys.stderr,
+            )
+            return 1
+        if agent.get("role") != role_name:
+            print(
+                f"Session launch role mismatch for {args.agent_id}: registered {agent.get('role')}, requested {role_name}",
+                file=sys.stderr,
+            )
+            return 1
+        strategy_errors = require_validated_strategy_for_work(
+            state_dir,
+            role_name,
+            agent.get("plan_id", ""),
+        )
+        if strategy_errors:
+            for error in strategy_errors:
+                print(error, file=sys.stderr)
+            return 1
     context_packet = Path(args.context_packet).resolve()
     if not context_packet.exists():
         print(f"Context packet does not exist: {context_packet}", file=sys.stderr)
@@ -2515,6 +3238,7 @@ def command_session_create(args: argparse.Namespace) -> int:
         "context_packet": str(context_packet),
         "predecessor_agent_id": args.predecessor_agent_id or "",
         "inheritance_reason": args.reason or "",
+        "worktree_id": worktree_id,
         "messages": [
             {
                 "at": timestamp,
@@ -2538,6 +3262,7 @@ def command_session_create(args: argparse.Namespace) -> int:
             "context_packet": str(context_packet),
             "predecessor_agent_id": args.predecessor_agent_id or "",
             "inheritance_reason": args.reason or "",
+            "worktree_id": worktree_id,
             "requested_at": timestamp,
         }
         provider_payload, provider_error = run_session_provider_command(
@@ -2591,6 +3316,8 @@ def command_session_create(args: argparse.Namespace) -> int:
         "context_packet": str(context_packet),
         "predecessor_agent_id": args.predecessor_agent_id or "",
         "inheritance_reason": args.reason or "",
+        "worktree_id": worktree_id,
+        "provider_worktree_ref": (worktree or {}).get("provider_worktree_ref", ""),
         "status": session["status"],
         "provider_confirmed": provider_confirmed,
     }
@@ -2616,6 +3343,12 @@ def command_session_confirm_create(args: argparse.Namespace) -> int:
         print(f"Latest create request for {args.agent_id} is not codex-app", file=sys.stderr)
         return 2
     timestamp = format_time(parse_time(args.at))
+    worktree = None
+    worktree_id = args.worktree_id or request.get("worktree_id", "")
+    if worktree_id:
+        worktree = require_worktree_plan_or_active(state_dir, str(worktree_id))
+        if not worktree:
+            return 1
     event = {
         "at": timestamp,
         "event": "session-created",
@@ -2628,6 +3361,8 @@ def command_session_confirm_create(args: argparse.Namespace) -> int:
         "context_packet": request.get("context_packet", ""),
         "predecessor_agent_id": request.get("predecessor_agent_id", ""),
         "inheritance_reason": request.get("inheritance_reason", ""),
+        "worktree_id": worktree_id,
+        "provider_worktree_ref": (worktree or {}).get("provider_worktree_ref", ""),
         "status": "active",
         "provider_confirmed": True,
         "confirmation": args.note or "Codex app thread created",
@@ -3407,6 +4142,11 @@ def assess_work_orders_for_parallelism(work_orders: list[Path]) -> tuple[str, li
         validation = sections.get("## Required Validation", "")
         write_set = split_parallel_values(extract_labeled_value(parallel, "Exclusive Write Set"))
         artifact_namespace = split_parallel_values(extract_labeled_value(parallel, "Artifact Namespace"))
+        worktree_mode = extract_labeled_value(parallel, "Worktree Mode")
+        worktree_id = extract_labeled_value(parallel, "Worktree Id")
+        base_branch = extract_labeled_value(parallel, "Base Branch")
+        local_mutation_policy = extract_labeled_value(parallel, "Local Mutation Policy")
+        remote_mutation_policy = extract_labeled_value(parallel, "Remote Mutation Policy")
         merge_owner = extract_labeled_value(parallel, "Merge Owner")
         conflict_protocol = extract_labeled_value(parallel, "Conflict Protocol")
         token_budget = extract_labeled_value(token, "Token budget")
@@ -3416,6 +4156,16 @@ def assess_work_orders_for_parallelism(work_orders: list[Path]) -> tuple[str, li
             missing.append("Exclusive Write Set")
         if not artifact_namespace:
             missing.append("Artifact Namespace")
+        if not worktree_mode:
+            missing.append("Worktree Mode")
+        if not worktree_id:
+            missing.append("Worktree Id")
+        if not base_branch:
+            missing.append("Base Branch")
+        if not local_mutation_policy:
+            missing.append("Local Mutation Policy")
+        if not remote_mutation_policy:
+            missing.append("Remote Mutation Policy")
         if not merge_owner:
             missing.append("Merge Owner")
         if not conflict_protocol:
@@ -3432,6 +4182,18 @@ def assess_work_orders_for_parallelism(work_orders: list[Path]) -> tuple[str, li
         for item in write_set + artifact_namespace:
             if is_broad_parallel_scope(item):
                 serial_reasons.append(f"{path}: broad parallel scope {item}")
+        if worktree_mode not in {"codex-app", "local-git", "provider-command"}:
+            problems.append(f"{path}: unsupported Worktree Mode {worktree_mode!r}")
+        if is_broad_parallel_scope(worktree_id):
+            serial_reasons.append(f"{path}: broad Worktree Id {worktree_id}")
+        if "local" not in local_mutation_policy.lower() or "not" not in local_mutation_policy.lower():
+            serial_reasons.append(f"{path}: Local Mutation Policy does not protect the local checkout")
+        remote_policy_lower = remote_mutation_policy.lower()
+        if not (
+            ("not" in remote_policy_lower and ("push" in remote_policy_lower or "pr" in remote_policy_lower))
+            or "release gate" in remote_policy_lower
+        ):
+            serial_reasons.append(f"{path}: Remote Mutation Policy does not require a release gate")
         if re.search(r"\b(depends on|after other agent|same output|shared output)\b", parallel, re.IGNORECASE):
             serial_reasons.append(f"{path}: dependent parallel safety language")
         parsed.append(
@@ -3439,6 +4201,8 @@ def assess_work_orders_for_parallelism(work_orders: list[Path]) -> tuple[str, li
                 "path": path,
                 "write_set": write_set,
                 "artifact_namespace": artifact_namespace,
+                "worktree_id": normalize_repo_path(worktree_id),
+                "base_branch": base_branch,
             }
         )
     for index, left in enumerate(parsed):
@@ -3455,6 +4219,10 @@ def assess_work_orders_for_parallelism(work_orders: list[Path]) -> tuple[str, li
                         serial_reasons.append(
                             f"{left['path']} and {right['path']}: overlapping artifact namespace {left_path} / {right_path}"
                         )
+            if left["worktree_id"] == right["worktree_id"]:
+                serial_reasons.append(
+                    f"{left['path']} and {right['path']}: shared Worktree Id {left['worktree_id']}"
+                )
     if problems:
         return "invalid-work-order", problems + serial_reasons
     if serial_reasons:
@@ -4436,6 +5204,16 @@ def build_parser() -> argparse.ArgumentParser:
     require_plan.add_argument("--plan-id", required=True)
     require_plan.set_defaults(func=command_require_plan)
 
+    strategy_lint = subparsers.add_parser("strategy-packet-lint", help="Validate a Strategy packet before Master acceptance or work launch.")
+    strategy_lint.add_argument("--packet", required=True)
+    strategy_lint.set_defaults(func=command_strategy_packet_lint)
+
+    require_strategy = subparsers.add_parser("require-strategy-packet-before-work", help="Fail unless the current accepted Strategy packet is complete and matches the requested plan.")
+    require_strategy.add_argument("--state-dir", required=True)
+    require_strategy.add_argument("--plan-id", required=True)
+    require_strategy.add_argument("--packet")
+    require_strategy.set_defaults(func=command_require_strategy_packet_before_work)
+
     audit_agent = subparsers.add_parser("audit-agent", help="Detect loop, drift, reward-hacking, and token anomalies for an agent.")
     audit_agent.add_argument("--state-dir", required=True)
     audit_agent.add_argument("--agent-id", required=True)
@@ -4500,6 +5278,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_create.add_argument("--provider-timeout-seconds", type=float, default=60)
     session_create.add_argument("--predecessor-agent-id")
     session_create.add_argument("--reason")
+    session_create.add_argument("--worktree-id")
     session_create.add_argument("--at")
     session_create.set_defaults(func=command_session_create)
 
@@ -4507,6 +5286,7 @@ def build_parser() -> argparse.ArgumentParser:
     confirm_create.add_argument("--state-dir", required=True)
     confirm_create.add_argument("--agent-id", required=True)
     confirm_create.add_argument("--thread-id", required=True)
+    confirm_create.add_argument("--worktree-id")
     confirm_create.add_argument("--note")
     confirm_create.add_argument("--at")
     confirm_create.set_defaults(func=command_session_confirm_create)
@@ -4605,6 +5385,65 @@ def build_parser() -> argparse.ArgumentParser:
     session_reconcile.add_argument("--codex-app-read-max-minutes", type=float, default=DEFAULT_CODEX_APP_READ_MAX_MINUTES)
     session_reconcile.add_argument("--at")
     session_reconcile.set_defaults(func=command_session_reconcile)
+
+    worktree_plan = subparsers.add_parser("worktree-plan", help="Record an isolated Worktree plan before launching a sub-agent.")
+    worktree_plan.add_argument("--state-dir", required=True)
+    worktree_plan.add_argument("--worktree-id", required=True)
+    worktree_plan.add_argument("--provider", choices=["codex-app", "local-git", "provider-command"], default="codex-app")
+    worktree_plan.add_argument("--base-branch", required=True)
+    worktree_plan.add_argument("--purpose", required=True)
+    worktree_plan.add_argument("--project-root")
+    worktree_plan.add_argument("--local-mutation-policy", default="do not mutate local checkout")
+    worktree_plan.add_argument("--remote-mutation-policy", default="do not push or create PR without release gate")
+    worktree_plan.add_argument("--copy-ignored-policy", default="only .worktreeinclude-approved ignored files")
+    worktree_plan.add_argument("--at")
+    worktree_plan.set_defaults(func=command_worktree_plan)
+
+    worktree_confirm_create = subparsers.add_parser("worktree-confirm-create", help="Confirm provider evidence that a planned Worktree exists.")
+    worktree_confirm_create.add_argument("--state-dir", required=True)
+    worktree_confirm_create.add_argument("--worktree-id", required=True)
+    worktree_confirm_create.add_argument("--provider", choices=["codex-app", "local-git", "provider-command"])
+    worktree_confirm_create.add_argument("--provider-worktree-ref")
+    worktree_confirm_create.add_argument("--worktree-path")
+    worktree_confirm_create.add_argument("--thread-id")
+    worktree_confirm_create.add_argument("--base-branch")
+    worktree_confirm_create.add_argument("--note")
+    worktree_confirm_create.add_argument("--at")
+    worktree_confirm_create.set_defaults(func=command_worktree_confirm_create)
+
+    worktree_assign = subparsers.add_parser("worktree-assign-session", help="Bind an active session to a confirmed Worktree.")
+    worktree_assign.add_argument("--state-dir", required=True)
+    worktree_assign.add_argument("--worktree-id", required=True)
+    worktree_assign.add_argument("--agent-id", required=True)
+    worktree_assign.add_argument("--note")
+    worktree_assign.add_argument("--at")
+    worktree_assign.set_defaults(func=command_worktree_assign_session)
+
+    worktree_reconcile = subparsers.add_parser("worktree-reconcile", help="Reconcile active Worktrees with provider/session evidence.")
+    worktree_reconcile.add_argument("--state-dir", required=True)
+    worktree_reconcile.add_argument("--codex-app-read-max-minutes", type=float, default=DEFAULT_WORKTREE_EVIDENCE_MAX_MINUTES)
+    worktree_reconcile.add_argument("--at")
+    worktree_reconcile.set_defaults(func=command_worktree_reconcile)
+
+    worktree_close = subparsers.add_parser("worktree-close", help="Request Worktree close/archive without mutating local or remote branches.")
+    worktree_close.add_argument("--state-dir", required=True)
+    worktree_close.add_argument("--worktree-id", required=True)
+    worktree_close.add_argument("--reason", required=True)
+    worktree_close.add_argument("--at")
+    worktree_close.set_defaults(func=command_worktree_close)
+
+    worktree_confirm_close = subparsers.add_parser("worktree-confirm-close", help="Confirm provider evidence that a Worktree was closed or archived.")
+    worktree_confirm_close.add_argument("--state-dir", required=True)
+    worktree_confirm_close.add_argument("--worktree-id", required=True)
+    worktree_confirm_close.add_argument("--note")
+    worktree_confirm_close.add_argument("--at")
+    worktree_confirm_close.set_defaults(func=command_worktree_confirm_close)
+
+    validate_include = subparsers.add_parser("validate-worktreeinclude", help="Validate .worktreeinclude ignored-file copy policy.")
+    validate_include.add_argument("--state-dir", required=True)
+    validate_include.add_argument("--project-root", required=True)
+    validate_include.add_argument("--at")
+    validate_include.set_defaults(func=command_validate_worktreeinclude)
 
     enforce_boundary = subparsers.add_parser("enforce-master-boundary", help="Fail when Master changes exceed the allowed state/doc boundary.")
     enforce_boundary.add_argument("--project-root", required=True)

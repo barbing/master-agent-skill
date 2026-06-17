@@ -6,7 +6,10 @@
 - Confirmed provider state is authoritative over requested state.
 - File provider: local JSON session mock for tests and offline runs.
 - Codex provider: requires --provider-command or MASTER_AGENT_SESSION_PROVIDER for create, send, read, archive, reconcile, and rotation.
+- Codex provider reference adapter: scripts/file_session_provider.py --state-file docs/master-agent/state/provider-sessions.json.
+- Live provider adapter contract: references/provider-command-adapter.md.
 - Codex app provider: Master uses Codex thread tools, then records confirmation commands.
+- Codex app Worktree provider: Master records Worktree requests and confirmations; Codex app performs the actual Worktree or handoff action.
 - Codex app create confirmation: session-confirm-create after create_thread returns a thread id.
 - Codex app send confirmation: session-confirm-send after send_message_to_thread completes.
 - Codex app read confirmation: session-confirm-read after read_thread returns recent status.
@@ -14,6 +17,7 @@
 - Provider command execution: parsed as argv; not executed through a shell.
 - Provider command input: JSON request on stdin with event, agent id, role, provider session id, context packet, predecessor, message when relevant, and requested time.
 - Provider command output: JSON object with provider_session_id, status, provider_session_path evidence, and messages for read operations.
+- Provider command success requires durable evidence; missing evidence or stale reconcile status is a hard stop.
 - Manual provider: pending manual action until reconciled with external evidence.
 
 ## Session Lifecycle
@@ -27,6 +31,11 @@
 - Rotate:
 - Terminate:
 - Reconcile:
+- Plan Worktree:
+- Confirm Worktree create:
+- Assign session to Worktree:
+- Reconcile Worktree:
+- Close Worktree:
 
 ## Context Injection
 
@@ -34,6 +43,7 @@
 - Accepted plan id:
 - Predecessor agent:
 - Inheritance reason:
+- Worktree id:
 - Save-state request:
 - Predecessor state packet: required before normal successor launch.
 
@@ -44,12 +54,16 @@
 - Archived:
 - Missing provider session:
 - Missing Codex app read confirmation:
+- Missing Worktree confirmation:
+- Missing Worktree-bound session read evidence:
 
 ## Termination And Archive
 
 - Graceful stop:
 - Archive path:
 - Retention:
+- Worktree close request:
+- Worktree close confirmation:
 
 ## Failure Handling
 
@@ -58,7 +72,10 @@
 - Reconciliation failure:
 - Live provider without confirmed active state:
 - Strict rotation without predecessor state:
+- Worktree without provider evidence:
+- .worktreeinclude contains tracked, broad, escaping, or symlink entries:
 
 ## Audit Trail
 
 - Append state/session-control.jsonl for every requested and confirmed lifecycle event.
+- Append state/worktrees.jsonl for every planned, confirmed, bound, stale, closed, and .worktreeinclude validation event.

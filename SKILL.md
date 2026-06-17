@@ -15,9 +15,11 @@ The system keeps long project continuity outside conversation history by using l
 
 Read `references/master-agent-system.md` when setting up the system, designing a new project adapter, or resolving a coordination ambiguity.
 
-Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, accepts strategy plans, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
+Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, lints and accepts strategy plans, requires the current Strategy packet before work, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
 
-Copy templates from `assets/templates/` when a single artifact is needed without bootstrapping the full state pack.
+Use `scripts/soak_validate.py --quick` before release or after runtime-control changes. Use `scripts/file_session_provider.py` as the provider-command reference adapter when testing unattended `provider=codex` flows.
+
+Read `references/provider-command-adapter.md` before building a live provider-command adapter. Copy templates from `assets/templates/` when a single artifact is needed without bootstrapping the full state pack.
 
 Use active roles from `role-catalog.md` when launching short-lived sessions. Use role skills from `role-skills/` for the default Strategy, Coding, Review, and Policy Review roles, or scaffold a custom role skill when a project-defined role becomes reusable.
 
@@ -32,6 +34,7 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Roles are governed | Register agents only with active roles from `role-catalog.md`; undefined, proposed, or inactive roles are invalid. |
 | Heartbeats are required | Any running sub-agent must emit structured progress packets on checkpoint, before risky edits, after validation, and when blocked. |
 | Token strategy is required | Every project should set a project budget, per-agent budget when possible, heartbeat/session caps, and a token strategy before spawning sub-agents. |
+| Worktrees isolate implementation | Plan and confirm a Worktree before implementation sessions when isolation is needed; do not mutate the user's local checkout or remote branches without an explicit merge/release gate. |
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
 | Review is separate | Coding receipts are not accepted until reviewed, unless the user explicitly chooses to skip review. |
 | Rotation is strict | Launch a successor only from a validated predecessor-state packet, except explicit emergency recovery. |
@@ -56,13 +59,15 @@ Define custom roles only when a project has a recurring or specialized responsib
 2. Fill `master-ledger.md` and `project-policy-pack.md`, then run strict validation.
 3. Set token budgets and session caps with `set-budget`, per-agent registration fields, and `token-strategy.md`.
 4. Check `role-catalog.md` and decide whether the next step fits an active role, needs a role proposal, or should remain direct ledger maintenance.
-5. Create a context packet or work order with `new-packet`, then send it to the target role agent.
-6. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
-7. Register the running sub-agent and require heartbeats plus token usage reports.
-8. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, and `recommend-token-strategy` until the agent completes, blocks, or drifts.
-9. Accept, reject, or request clarification on the return packet.
-10. Update the master ledger and event log only after acceptance.
-11. Derive the next action from the updated ledger, not from conversational momentum.
+5. Accept only complete Strategy packets. `accept-strategy` runs Strategy packet validation and records validation evidence; `require-strategy-packet-before-work` verifies that evidence before Coding, Review, or Policy Review work.
+6. For implementation work, plan an isolated Worktree with `worktree-plan`, validate `.worktreeinclude` when ignored local files are needed, confirm provider evidence with `worktree-confirm-create`, and bind the session with `worktree-assign-session`.
+7. Create a context packet or work order with `new-packet`, then send it to the target role agent.
+8. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
+9. Register the running sub-agent and require heartbeats plus token usage reports.
+10. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, and `recommend-token-strategy` until the agent completes, blocks, or drifts.
+11. Accept, reject, or request clarification on the return packet.
+12. Update the master ledger and event log only after acceptance.
+13. Derive the next action from the updated ledger, not from conversational momentum.
 
 ## Agent Selection
 
@@ -132,10 +137,14 @@ python scripts/master_agent_tool.py install-role-skills --skills-dir <codex-skil
 Register and monitor agents:
 
 ```bash
+python scripts/master_agent_tool.py strategy-packet-lint --packet packets/strategy-packet.md
 python scripts/master_agent_tool.py accept-strategy --state-dir <state-dir> --packet packets/strategy-packet.md --plan-id PLAN-1 --summary "Approved bounded plan"
 python scripts/master_agent_tool.py strategy-sync-status --state-dir <state-dir>
 python scripts/master_agent_tool.py require-plan --state-dir <state-dir> --plan-id PLAN-1
-python scripts/master_agent_tool.py register-agent --state-dir <state-dir> --agent-id strategy-1 --role Strategy --task-id TASK-1 --objective "Resolve boundary" --scope docs/master-agent --plan-id PLAN-1
+python scripts/master_agent_tool.py require-strategy-packet-before-work --state-dir <state-dir> --plan-id PLAN-1 --packet packets/strategy-packet.md
+python scripts/master_agent_tool.py register-agent --state-dir <state-dir> --agent-id coding-1 --role Coding --task-id TASK-1 --objective "Execute approved work" --scope src/module --plan-id PLAN-1
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id coding-1 --role Coding --context-packet packets/context-packet.md --provider file
+python scripts/master_agent_tool.py register-agent --state-dir <state-dir> --agent-id strategy-1 --role Strategy --task-id TASK-2 --objective "Resolve next boundary" --scope docs/master-agent
 python scripts/master_agent_tool.py heartbeat --state-dir <state-dir> --agent-id strategy-1 --state active --current strategy-packet.md --last-action "Read authority" --next-action "Draft packet" --scope-status yes --confidence high
 python scripts/master_agent_tool.py audit-agent --state-dir <state-dir> --agent-id strategy-1
 python scripts/master_agent_tool.py remediate-agent --state-dir <state-dir> --agent-id strategy-1 --action reinforce-context
@@ -147,6 +156,7 @@ python scripts/master_agent_tool.py supervisor-stop --state-dir <state-dir>
 python scripts/master_agent_tool.py supervisor-recover --state-dir <state-dir>
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-1 --role Strategy --context-packet packets/context-packet.md --provider file
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-live --role Strategy --context-packet packets/context-packet.md --provider codex --provider-command "<provider command>"
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-live --role Strategy --context-packet packets/context-packet.md --provider codex --provider-command "python scripts/file_session_provider.py --state-file <state-dir>/state/provider-sessions.json"
 python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-app --role Strategy --context-packet packets/context-packet.md --provider codex-app
 python scripts/master_agent_tool.py session-confirm-create --state-dir <state-dir> --agent-id strategy-app --thread-id <codex-thread-id>
 python scripts/master_agent_tool.py session-send --state-dir <state-dir> --agent-id strategy-1 --message "Please return a strategy packet."
@@ -160,6 +170,15 @@ python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --ag
 python scripts/master_agent_tool.py session-confirm-archive --state-dir <state-dir> --agent-id strategy-app
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir> --provider-command "<provider command>"
+python scripts/master_agent_tool.py worktree-plan --state-dir <state-dir> --worktree-id wt-task-1 --provider codex-app --base-branch main --purpose "Isolated Coding Agent task"
+python scripts/master_agent_tool.py validate-worktreeinclude --state-dir <state-dir> --project-root <project-root>
+python scripts/master_agent_tool.py worktree-confirm-create --state-dir <state-dir> --worktree-id wt-task-1 --thread-id <codex-thread-id>
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id coding-wt-1 --role Coding --context-packet packets/context-packet.md --provider codex-app --worktree-id wt-task-1
+python scripts/master_agent_tool.py session-confirm-create --state-dir <state-dir> --agent-id coding-wt-1 --thread-id <codex-thread-id> --worktree-id wt-task-1
+python scripts/master_agent_tool.py worktree-assign-session --state-dir <state-dir> --worktree-id wt-task-1 --agent-id coding-wt-1
+python scripts/master_agent_tool.py worktree-reconcile --state-dir <state-dir>
+python scripts/master_agent_tool.py worktree-close --state-dir <state-dir> --worktree-id wt-task-1 --reason "task accepted"
+python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-dir> --worktree-id wt-task-1
 python scripts/master_agent_tool.py request-rotation --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift
 python scripts/master_agent_tool.py validate-predecessor-state --packet packets/coding-1-predecessor-state-packet.md
 python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file --predecessor-state-packet packets/coding-1-predecessor-state-packet.md
@@ -176,6 +195,14 @@ python scripts/master_agent_tool.py recover-state --state-dir <state-dir> --from
 python scripts/master_agent_tool.py recover-locks --state-dir <state-dir> --stale-seconds 600
 python scripts/master_agent_tool.py check-heartbeats --state-dir <state-dir> --stale-minutes 30
 python scripts/master_agent_tool.py watch-heartbeats --state-dir <state-dir> --stale-minutes 30 --poll-seconds 60
+```
+
+Production hardening checks:
+
+```bash
+python scripts/soak_validate.py --quick
+python scripts/release_validate.py --quick-validate <quick_validate.py> --installed-skill-dir <installed-master-agent-system>
+python scripts/release_validate.py --require-plugin-eval --plugin-eval-command "<plugin-eval command with {skill}>"
 ```
 
 Govern roles:
@@ -217,6 +244,7 @@ The state pack contains:
 - `runtime-status.md`
 - `runtime-deployment.md`
 - `session-control.md`
+- `worktree-control.md`
 - `incident-log.md`
 - `alert-queue.md`
 - `state-schema.md`
@@ -235,6 +263,7 @@ The state pack contains:
 - `state/token-usage.jsonl`
 - `state/runtime.json`
 - `state/session-control.jsonl`
+- `state/worktrees.jsonl`
 - `state/incidents.jsonl`
 - `state/alerts.jsonl`
 - `state/schema-version.json`

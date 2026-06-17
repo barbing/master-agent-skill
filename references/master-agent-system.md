@@ -19,6 +19,7 @@ The Master Agent is the control plane. It routes work, monitors heartbeats, enfo
 - Reduce attention loss by keeping long history out of the active conversation.
 - Prevent reward hacking by making acceptance depend on evidence and explicit gates.
 - Prevent runaway token usage by requiring budgets, usage records, heartbeat caps, escalation thresholds, and token-saving strategy recommendations.
+- Isolate sub-agent implementation in planned Worktrees so the user's local checkout and GitHub branches are not changed without an explicit gate.
 - Keep project-specific policy outside the reusable skill.
 - Allow the Master Agent to decide when parallel sub-agents are safe.
 - Allow project-specific roles only through a governed role catalog.
@@ -72,6 +73,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `runtime-status.md` | Current supervisor state, last checks, active interventions, next wakeup, and operator handoff. |
 | `runtime-deployment.md` | Windows startup, process identity, crash recovery, stop/status commands, and production limits. |
 | `session-control.md` | Provider-neutral session lifecycle contract and audit trail rules. |
+| `worktree-control.md` | Worktree planning, session binding, ignored-file copy policy, handoff, merge, cleanup, and reconciliation rules. |
 | `incident-log.md` | Open and resolved incident summaries, severity levels, remediation, and operator handoff. |
 | `alert-queue.md` | Pending alerts, severity, acknowledgement, suppression, and escalation status. |
 | `state-schema.md` | Current schema version, migration order, compatibility policy, recovery policy, and stale lock handling. |
@@ -87,6 +89,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `state/token-usage.jsonl` | Append-only token usage records. |
 | `state/runtime.json` | Supervisor loop state, recovery counts, breach counts, and next wakeup. |
 | `state/session-control.jsonl` | Append-only requested and confirmed provider session events. |
+| `state/worktrees.jsonl` | Append-only Worktree plan, confirmation, binding, stale, close, and `.worktreeinclude` validation events. |
 | `state/incidents.jsonl` | Append-only incident records. |
 | `state/alerts.jsonl` | Append-only alert-opened and acknowledgement records. |
 | `state/schema-version.json` | Current schema version, migration history, and compatible tool version. |
@@ -119,6 +122,12 @@ Run release validation before publishing the skill pack:
 python scripts/release_validate.py --quick-validate <quick_validate.py> --installed-skill-dir <installed-master-agent-system>
 ```
 
+Run the quick operating-system soak after runtime-control changes:
+
+```bash
+python scripts/soak_validate.py --quick
+```
+
 Install role skills into a Codex skills directory:
 
 ```bash
@@ -149,12 +158,14 @@ python scripts/master_agent_tool.py scaffold-role-skill --state-dir <state-dir> 
 Synchronize accepted strategy:
 
 ```bash
+python scripts/master_agent_tool.py strategy-packet-lint --packet packets/strategy-packet.md
 python scripts/master_agent_tool.py accept-strategy --state-dir <state-dir> --packet packets/strategy-packet.md --plan-id PLAN-1 --summary "Approved bounded plan"
 python scripts/master_agent_tool.py strategy-sync-status --state-dir <state-dir>
 python scripts/master_agent_tool.py require-plan --state-dir <state-dir> --plan-id PLAN-1
+python scripts/master_agent_tool.py require-strategy-packet-before-work --state-dir <state-dir> --plan-id PLAN-1 --packet packets/strategy-packet.md
 ```
 
-When a strategy plan is active, `register-agent` must include the current `--plan-id`. This prevents Coding, Review, Policy, or custom role sessions from continuing a stale or superseded plan.
+When a strategy plan is active, `register-agent` must include the current `--plan-id`. `accept-strategy` rejects incomplete Strategy packets and records validation evidence in `state/strategy-sync.jsonl`. Coding, Review, and Policy Review registration and session launch require that validated current-plan evidence. The hardened operating loop also runs `require-strategy-packet-before-work` before issuing work. This prevents a Coding Agent from inheriting raw discussion, an underfilled Strategy packet, or a stale packet from an older Strategy session.
 
 Register and monitor a sub-agent:
 
@@ -184,6 +195,15 @@ python scripts/master_agent_tool.py session-archive --state-dir <state-dir> --ag
 python scripts/master_agent_tool.py session-confirm-archive --state-dir <state-dir> --agent-id strategy-app
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py session-reconcile --state-dir <state-dir> --provider-command "<provider command>"
+python scripts/master_agent_tool.py worktree-plan --state-dir <state-dir> --worktree-id wt-task-1 --provider codex-app --base-branch main --purpose "Isolated Coding Agent task"
+python scripts/master_agent_tool.py validate-worktreeinclude --state-dir <state-dir> --project-root <project-root>
+python scripts/master_agent_tool.py worktree-confirm-create --state-dir <state-dir> --worktree-id wt-task-1 --thread-id <codex-thread-id>
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id coding-wt-1 --role Coding --context-packet packets/context-packet.md --provider codex-app --worktree-id wt-task-1
+python scripts/master_agent_tool.py session-confirm-create --state-dir <state-dir> --agent-id coding-wt-1 --thread-id <codex-thread-id> --worktree-id wt-task-1
+python scripts/master_agent_tool.py worktree-assign-session --state-dir <state-dir> --worktree-id wt-task-1 --agent-id coding-wt-1
+python scripts/master_agent_tool.py worktree-reconcile --state-dir <state-dir>
+python scripts/master_agent_tool.py worktree-close --state-dir <state-dir> --worktree-id wt-task-1 --reason "task accepted"
+python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-dir> --worktree-id wt-task-1
 python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
 python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
@@ -206,7 +226,45 @@ Use `supervisor-start --spawn`, `supervisor-status`, `supervisor-stop`, and `sup
 
 Use `session-create`, `session-send`, `session-read`, `session-archive`, `session-reconcile`, and `rotate-session` as a provider-neutral adapter. The file provider is a local mock for testing and offline use. The `codex` provider requires `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER` for every live operation; the command receives a JSON request on stdin and must return JSON with confirmed session state plus provider evidence. Provider commands are parsed as argv, not executed through a shell. Unsupported providers stay in `pending-manual-provider` rather than silently reporting success.
 
+Use `scripts/file_session_provider.py` as the reference provider-command adapter:
+
+```bash
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id strategy-live --role Strategy --context-packet packets/context-packet.md --provider codex --provider-command "python scripts/file_session_provider.py --state-file <state-dir>/state/provider-sessions.json"
+```
+
+Read `references/provider-command-adapter.md` before replacing the file adapter with a live unattended provider. The reference adapter proves the JSON stdin/stdout contract, durable provider evidence, reconcile behavior, and archive behavior; it does not run a model.
+
 Use `provider=codex-app` when the Master Agent is operating through Codex desktop thread tools. The CLI records requests and confirmations; the Master Agent performs the actual app tool calls. Create the session request, call `create_thread`, then record `session-confirm-create`. For messages, call `session-send`, use `send_message_to_thread`, then record `session-confirm-send`. For status reads, call `session-read`, use `read_thread`, then record `session-confirm-read`. For archive, call `session-archive`, use `set_thread_archived`, then record `session-confirm-archive`. `session-reconcile` treats a Codex app session as stale unless it has recent `session-confirm-read` evidence.
+
+## Worktree Control
+
+Use Worktree control when implementation should be isolated from the user's foreground checkout or when multiple sub-agents might run in parallel. The Master plans the Worktree, records provider evidence, binds sessions to it, reconciles it, and closes it. It does not push branches, create pull requests, or mutate GitHub from the Worktree layer.
+
+For `codex-app`, Worktree management is tool-mediated. The Master records `worktree-plan`, the Codex app creates or selects the Worktree/thread, and the Master records `worktree-confirm-create`. If ignored local setup files are required, add a repository-root `.worktreeinclude` and run `validate-worktreeinclude`; the validator rejects tracked files, broad patterns, repository escapes, symlinks, and entries that are not Git-ignored.
+
+Normal Codex app Worktree loop:
+
+```bash
+python scripts/master_agent_tool.py worktree-plan --state-dir <state-dir> --worktree-id wt-task-1 --provider codex-app --base-branch main --purpose "Run Coding Agent in isolation"
+python scripts/master_agent_tool.py validate-worktreeinclude --state-dir <state-dir> --project-root <project-root>
+# Use Codex app Worktree/thread controls here.
+python scripts/master_agent_tool.py worktree-confirm-create --state-dir <state-dir> --worktree-id wt-task-1 --thread-id <codex-thread-id>
+python scripts/master_agent_tool.py session-create --state-dir <state-dir> --agent-id coding-wt-1 --role Coding --context-packet packets/context-packet.md --provider codex-app --worktree-id wt-task-1
+python scripts/master_agent_tool.py session-confirm-create --state-dir <state-dir> --agent-id coding-wt-1 --thread-id <codex-thread-id> --worktree-id wt-task-1
+python scripts/master_agent_tool.py worktree-assign-session --state-dir <state-dir> --worktree-id wt-task-1 --agent-id coding-wt-1
+python scripts/master_agent_tool.py session-confirm-read --state-dir <state-dir> --agent-id coding-wt-1 --summary "Heartbeat or receipt checked" --turn-count 2
+python scripts/master_agent_tool.py worktree-reconcile --state-dir <state-dir>
+```
+
+Close Worktrees only after acceptance or explicit abandonment:
+
+```bash
+python scripts/master_agent_tool.py worktree-close --state-dir <state-dir> --worktree-id wt-task-1 --reason "receipt accepted"
+# Archive or close in the provider surface, then record evidence.
+python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-dir> --worktree-id wt-task-1
+```
+
+`assess-parallelism` requires each work order to name Worktree Mode, Worktree Id, Base Branch, Local Mutation Policy, and Remote Mutation Policy. Parallel work is blocked if Worktree IDs overlap, write sets overlap, artifact namespaces overlap, mutation policies do not protect the local checkout and remote branches, or the conflict protocol is missing.
 
 Use `request-rotation` when a sub-agent has accumulated too much context, loops on the same next action, reports attention drift, exceeds heartbeat caps, or needs a clean successor session. The predecessor must return a `predecessor-state-packet.md`. Validate it with `validate-predecessor-state`, then call `rotate-session`. Normal rotation requires `--predecessor-state-packet`; `--emergency-without-predecessor-state` is reserved for unrecoverable sessions and records degraded continuity.
 
@@ -273,15 +331,34 @@ Optional role skills:
 
 ## Strategy-Master Synchronization
 
-The Master records accepted Strategy packets in `strategy-sync.md` and `state/strategy-sync.jsonl`. Raw discussion with a Strategy Agent does not become the current plan. Only `accept-strategy` makes a plan current.
+The Master records accepted Strategy packets in `strategy-sync.md` and `state/strategy-sync.jsonl`. Raw discussion with a Strategy Agent does not become the current plan. Only `accept-strategy` can make a plan current, and it fails if the Strategy packet is incomplete.
 
 Use this gate:
 
 ```text
-strategy packet -> accept-strategy -> strategy-sync.md -> register-agent --plan-id <current>
+strategy packet -> accept-strategy validates packet -> require-strategy-packet-before-work -> register-agent --plan-id <current> -> session-create
 ```
 
 The Master must check strategy sync before issuing implementation or review work. If `strategy-sync-status` reports a stale plan, the Master should request a fresh Strategy packet, ask the user for confirmation, or issue only narrow maintenance work that does not depend on the stale plan.
+
+`strategy-packet-lint` verifies required headings and filled Strategy fields before acceptance. `accept-strategy` runs the same validation before recording current state. `require-strategy-packet-before-work` verifies that the supplied packet is the current accepted packet, that the plan id matches `strategy-sync.md`, and that validation evidence exists. Treat a nonzero exit as a hard stop before launching a Coding, Review, or Policy Review sub-agent.
+
+## Hardened Production Operating Loop
+
+Use this loop for long-running Codex projects:
+
+1. Bootstrap or migrate state with `init`, `upgrade-state`, `migrate-state`, and `validate --strict`.
+2. Accept only validated Strategy packets; run `require-strategy-packet-before-work` before issuing Coding, Review, or Policy Review work.
+3. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
+4. Run `assess-parallelism` before launching more than one sub-agent.
+5. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
+6. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
+7. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
+8. Run `enforce-master-boundary` before finalizing any Master turn.
+9. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
+10. Record incidents and alert acknowledgements instead of erasing failures.
+
+The operating loop is designed to fail closed. If the Master cannot prove current strategy, provider liveness, boundary compliance, packet completeness, or budget safety, it should stop work and create a remediation packet instead of continuing from chat memory.
 
 ## Anomaly Detection
 

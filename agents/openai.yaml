@@ -1,4 +1,4 @@
 interface:
   display_name: "Master Agent System"
-  short_description: "Master-agent runtime, strict rotation, boundary, parallelism, token, and release controls"
-  default_prompt: "Use $master-agent-system to set up a project-neutral Master Agent state pack with safety envelopes, governed roles, strategy sync, heartbeats, token telemetry, runtime supervision, hybrid session control, strict session rotation, Master-boundary enforcement, parallelism assessment, release validation, observability, and state recovery."
+  short_description: "Hardened master-agent runtime with strategy, session, Worktree, boundary, token, soak, and release gates"
+  default_prompt: "Use $master-agent-system to set up a project-neutral Master Agent state pack with safety envelopes, governed roles, linted strategy sync, heartbeats, token telemetry, runtime supervision, provider-command and Codex-app session control, Worktree isolation control, strict session rotation, Master-boundary enforcement, parallelism assessment, soak validation, release validation, observability, and state recovery."

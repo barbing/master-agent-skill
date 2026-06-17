@@ -20,6 +20,10 @@
 - Allowed files/modules/artifacts:
 - Out-of-scope files/modules/artifacts:
 - Ownership boundary:
+- Worktree id:
+- Worktree provider:
+- Local checkout policy:
+- Remote publication policy:
 - Forbidden shortcuts:
 
 ## Validation

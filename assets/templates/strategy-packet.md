@@ -44,6 +44,11 @@
 
 - Proposed objective:
 - Allowed scope:
+- Worktree mode:
+- Worktree id:
+- Base branch:
+- Local mutation policy:
+- Remote mutation policy:
 - Forbidden changes:
 - Validation required:
 - Expected artifacts:
