@@ -1,6 +1,6 @@
 ---
 name: master-agent-system
-description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, or standardizing strategy, coding, review, and policy handoffs.
+description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, distilling corrections into governed learning updates, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, or standardizing strategy, coding, review, policy, and learning handoffs.
 ---
 
 # Master Agent System
@@ -15,7 +15,7 @@ The system keeps long project continuity outside conversation history by using l
 
 Read `references/master-agent-system.md` when setting up the system, designing a new project adapter, or resolving a coordination ambiguity.
 
-Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, lints and accepts strategy plans, requires the current Strategy packet before work, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, detects stale or over-budget agents, creates packet files, and installs role skills.
+Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, lints and accepts strategy plans, requires the current Strategy packet before work, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, records learning corrections, lints and accepts learning proposals, detects stale or over-budget agents, creates packet files, and installs role skills.
 
 Use `scripts/soak_validate.py --quick` before release or after runtime-control changes. Use `scripts/file_session_provider.py` as the provider-command reference adapter when testing unattended `provider=codex` flows.
 
@@ -38,6 +38,7 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
 | Review is separate | Coding receipts are not accepted until reviewed, unless the user explicitly chooses to skip review. |
 | Rotation is strict | Launch a successor only from a validated predecessor-state packet, except explicit emergency recovery. |
+| Learning is governed | Corrections become durable behavior only through a correction record, learning cycle, linted learning proposal, acceptance event, and recurrence check. |
 
 ## Roles
 
@@ -50,6 +51,7 @@ Default active roles:
 | Coding Agent | One bounded implementation task with scoped files and validation | Changing architecture or scope without returning to Master |
 | Review Agent | Diff review, artifact review, validation evidence, verdict | Product direction or broad redesign |
 | Policy Review Agent | Check proposed work against authority docs and project policy | Implementation or final product decision |
+| Learning Distiller Agent | Mine corrections, incidents, failed reviews, and anomalies into learning proposals | Production implementation or unreviewed self-modification |
 
 Define custom roles only when a project has a recurring or specialized responsibility that does not fit the default roles. Capture the need in `role-proposal.md`, define it with positive token and heartbeat bounds, activate it with `--approval` evidence, and register agents only after it is active.
 
@@ -66,8 +68,10 @@ Define custom roles only when a project has a recurring or specialized responsib
 9. Register the running sub-agent and require heartbeats plus token usage reports.
 10. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, and `recommend-token-strategy` until the agent completes, blocks, or drifts.
 11. Accept, reject, or request clarification on the return packet.
-12. Update the master ledger and event log only after acceptance.
-13. Derive the next action from the updated ledger, not from conversational momentum.
+12. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
+13. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
+14. Update the master ledger and event log only after acceptance.
+15. Derive the next action from the updated ledger, not from conversational momentum.
 
 ## Agent Selection
 
@@ -77,6 +81,7 @@ Define custom roles only when a project has a recurring or specialized responsib
 | Need production code, test, or config changes | Coding Agent |
 | Need to check a diff, artifact, log, screenshot, or validation claim | Review Agent |
 | Need to check roadmap, policy, boundaries, or acceptance criteria | Policy Review Agent |
+| Need to convert repeated corrections or agent mistakes into durable behavior updates | Learning Distiller Agent |
 | Need a recurring specialized responsibility not covered by active roles | Draft `role-proposal.md`, then define and activate a custom role |
 | Need to reconcile accepted packets, update next action, or stop drift | Master Agent only |
 | Need to replace an overloaded or looping sub-agent without losing continuity | `rotate-session` |
@@ -189,6 +194,12 @@ python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --se
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"
 python scripts/master_agent_tool.py telemetry-summary --state-dir <state-dir>
+python scripts/master_agent_tool.py record-learning-correction --state-dir <state-dir> --project <project> --source <session-or-artifact> --task <task> --agent-behavior <behavior> --user-correction <correction> --evidence <evidence> --failure-mode <mode> --confidence high
+python scripts/master_agent_tool.py learning-cycle-start --state-dir <state-dir> --window "last 7 days" --project <project>
+python scripts/master_agent_tool.py learning-proposal-lint --proposal packets/learning-proposal.md
+python scripts/master_agent_tool.py accept-learning-proposal --state-dir <state-dir> --proposal packets/learning-proposal.md --summary "Accepted correction distillation"
+python scripts/master_agent_tool.py record-learning-effectiveness --state-dir <state-dir> --proposal-id <proposal-id> --status recurrence-prevented --evidence <evidence> --next-action "keep rule"
+python scripts/master_agent_tool.py learning-summary --state-dir <state-dir>
 python scripts/master_agent_tool.py schema-status --state-dir <state-dir>
 python scripts/master_agent_tool.py migrate-state --state-dir <state-dir>
 python scripts/master_agent_tool.py recover-state --state-dir <state-dir> --from-logs
@@ -248,6 +259,10 @@ The state pack contains:
 - `incident-log.md`
 - `alert-queue.md`
 - `state-schema.md`
+- `correction-ledger.md`
+- `learning-cycle.md`
+- `learning-proposal.md`
+- `learning-effectiveness.md`
 - `strategy-packet.md`
 - `work-order.md`
 - `token-strategy.md`
@@ -266,6 +281,10 @@ The state pack contains:
 - `state/worktrees.jsonl`
 - `state/incidents.jsonl`
 - `state/alerts.jsonl`
+- `state/learning-corrections.jsonl`
+- `state/learning-cycles.jsonl`
+- `state/learning-updates.jsonl`
+- `state/learning-effectiveness.jsonl`
 - `state/schema-version.json`
 
 ## Acceptance Rule

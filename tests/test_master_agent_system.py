@@ -214,6 +214,61 @@ def write_valid_strategy_packet(path: Path, plan_id: str = "PLAN-VALID") -> None
     )
 
 
+def write_valid_learning_proposal(path: Path, proposal_id: str = "LP-1") -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "# Learning Proposal",
+                "",
+                "## Trigger",
+                "",
+                f"- Proposal id: {proposal_id}",
+                "- Source corrections: corr-1",
+                "- Failure mode: evidence-free-success-claim",
+                "- Evidence: review verdict rejected unsupported completion",
+                "",
+                "## Distilled Lesson",
+                "",
+                "- Lesson: completion claims must include direct evidence",
+                "- Applies when: an agent reports complete status",
+                "- Does not apply when: the user asks only for a brainstorming note",
+                "- Evidence trigger: receipt lacks commands, artifacts, or changed files",
+                "- Escape condition: direct validation evidence is supplied",
+                "- Counterexample checked: small read-only answers need no artifacts",
+                "",
+                "## Target",
+                "",
+                "- Target type: template",
+                "- Target path: assets/templates/coding-receipt.md",
+                "- Change summary: require evidence-backed completion field",
+                "- Implementation owner: Master Agent",
+                "- Requires production code change: no",
+                "",
+                "## Safety Review",
+                "",
+                "- Anti-narrowing risk: could over-require evidence for casual answers; limited to receipts",
+                "- Privacy or secret risk: none",
+                "- Licensing risk: none",
+                "- Policy review required: no",
+                "",
+                "## Validation",
+                "",
+                "- Required validation: learning-proposal-lint and state validate",
+                "- Success metric: future receipts include evidence",
+                "- Recurrence check: inspect next three completion receipts",
+                "",
+                "## Decision",
+                "",
+                "- Proposed decision: extend",
+                "- Confidence: high",
+                "- Open questions: none",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def accept_valid_strategy(state_dir: Path, tmp: Path, plan_id: str = "PLAN-1") -> Path:
     packet = tmp / f"strategy-packet-{plan_id}.md"
     write_valid_strategy_packet(packet, plan_id)
@@ -320,6 +375,201 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIn("# Worktree Control", worktree_control)
         self.assertIn("## Worktree Policy", worktree_control)
         self.assertTrue((self.state_dir / "state" / "worktrees.jsonl").exists())
+
+    def test_init_creates_learning_layer_state(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        correction_ledger = (self.state_dir / "correction-ledger.md").read_text(
+            encoding="utf-8"
+        )
+        proposal = (self.state_dir / "learning-proposal.md").read_text(
+            encoding="utf-8"
+        )
+        effectiveness = (self.state_dir / "learning-effectiveness.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("# Correction Ledger", correction_ledger)
+        self.assertIn("# Learning Proposal", proposal)
+        self.assertIn("# Learning Effectiveness", effectiveness)
+        self.assertTrue((self.state_dir / "state" / "learning-corrections.jsonl").exists())
+        self.assertTrue((self.state_dir / "state" / "learning-cycles.jsonl").exists())
+        self.assertTrue((self.state_dir / "state" / "learning-updates.jsonl").exists())
+        self.assertTrue((self.state_dir / "state" / "learning-effectiveness.jsonl").exists())
+        roles = json.loads((self.state_dir / "state" / "roles.json").read_text(encoding="utf-8"))
+        self.assertEqual(roles["Learning Distiller"]["status"], "active")
+
+    def test_learning_correction_creates_cycle_and_summary(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        result = run_cmd(
+            [
+                TOOL,
+                "record-learning-correction",
+                "--state-dir",
+                self.state_dir,
+                "--project",
+                "sample-project",
+                "--source",
+                "review-verdict.md",
+                "--task",
+                "verify completion claim",
+                "--agent-behavior",
+                "claimed ready without direct validation evidence",
+                "--user-correction",
+                "completion must be evidence-backed",
+                "--evidence",
+                "review found missing validation artifacts",
+                "--failure-mode",
+                "evidence-free-success-claim",
+                "--confidence",
+                "high",
+                "--at",
+                "2026-06-01T00:00:00+00:00",
+            ]
+        )
+        self.assertIn("Recorded learning correction", result.stdout)
+
+        corrections = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "learning-corrections.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(
+            corrections[0]["failure_mode"], "evidence-free-success-claim"
+        )
+        ledger = (self.state_dir / "correction-ledger.md").read_text(encoding="utf-8")
+        self.assertIn("evidence-free-success-claim", ledger)
+        self.assertIn("review found missing validation artifacts", ledger)
+
+        cycle = run_cmd(
+            [
+                TOOL,
+                "learning-cycle-start",
+                "--state-dir",
+                self.state_dir,
+                "--window",
+                "last 7 days",
+                "--project",
+                "sample-project",
+                "--cycle-id",
+                "LC-1",
+                "--at",
+                "2026-06-01T01:00:00+00:00",
+            ]
+        )
+        self.assertIn("Created learning cycle", cycle.stdout)
+        cycle_packet = (
+            self.state_dir / "packets" / "learning" / "LC-1" / "learning-cycle.md"
+        )
+        self.assertTrue(cycle_packet.exists())
+        cycle_text = cycle_packet.read_text(encoding="utf-8")
+        self.assertIn(corrections[0]["correction_id"], cycle_text)
+        self.assertIn("needs triage", cycle_text)
+
+        cycles = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "learning-cycles.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(cycles[-1]["corrections_considered"], 1)
+
+        summary = run_cmd([TOOL, "learning-summary", "--state-dir", self.state_dir])
+        self.assertIn("Corrections: 1", summary.stdout)
+        self.assertIn("Learning cycles: 1", summary.stdout)
+        self.assertIn("- evidence-free-success-claim: 1", summary.stdout)
+
+    def test_learning_proposal_lint_accept_and_effectiveness(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        proposal = self.tmp / "learning-proposal.md"
+        write_valid_learning_proposal(proposal, "LP-READY")
+
+        lint = run_cmd([TOOL, "learning-proposal-lint", "--proposal", proposal])
+        self.assertIn("Learning proposal is valid", lint.stdout)
+
+        accepted = run_cmd(
+            [
+                TOOL,
+                "accept-learning-proposal",
+                "--state-dir",
+                self.state_dir,
+                "--proposal",
+                proposal,
+                "--summary",
+                "Accepted evidence-backed completion learning",
+                "--validation-evidence",
+                "proposal lint passed",
+                "--at",
+                "2026-06-01T02:00:00+00:00",
+            ]
+        )
+        self.assertIn("Accepted learning proposal LP-READY", accepted.stdout)
+
+        updates = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "learning-updates.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        checks = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "learning-effectiveness.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(updates[-1]["proposal_id"], "LP-READY")
+        self.assertEqual(checks[-1]["status"], "not-yet-measured")
+
+        measured = run_cmd(
+            [
+                TOOL,
+                "record-learning-effectiveness",
+                "--state-dir",
+                self.state_dir,
+                "--proposal-id",
+                "LP-READY",
+                "--status",
+                "recurrence-prevented",
+                "--evidence",
+                "next three receipts included validation evidence",
+                "--next-action",
+                "keep rule",
+                "--at",
+                "2026-06-02T00:00:00+00:00",
+            ]
+        )
+        self.assertIn("Recorded learning effectiveness", measured.stdout)
+
+        effectiveness = (self.state_dir / "learning-effectiveness.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("LP-READY", effectiveness)
+        self.assertIn("recurrence-prevented", effectiveness)
+        summary = run_cmd([TOOL, "learning-summary", "--state-dir", self.state_dir])
+        self.assertIn("Accepted learning updates: 1", summary.stdout)
+        self.assertIn("Recurrence detected: 0", summary.stdout)
+
+    def test_learning_proposal_lint_blocks_production_code_changes(self):
+        proposal = self.tmp / "bad-learning-proposal.md"
+        write_valid_learning_proposal(proposal, "LP-BLOCKED")
+        proposal.write_text(
+            proposal.read_text(encoding="utf-8").replace(
+                "- Requires production code change: no",
+                "- Requires production code change: yes",
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_cmd(
+            [TOOL, "learning-proposal-lint", "--proposal", proposal],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "learning proposal cannot require production code change", result.stderr
+        )
 
     def test_validate_rejects_missing_safety_envelope(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -4072,7 +4322,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(schema["schema_version"], "1.0")
+        self.assertEqual(schema["schema_version"], "1.1")
         self.assertIn("migration_history", schema)
 
     def test_migration_runs_in_order(self):
@@ -4086,7 +4336,11 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry["migration_id"] for entry in schema["migration_history"]],
-            ["0001-base-state", "0002-runtime-session-observability"],
+            [
+                "0001-base-state",
+                "0002-runtime-session-observability",
+                "0003-learning-layer",
+            ],
         )
         second = run_cmd([TOOL, "migrate-state", "--state-dir", self.state_dir])
         self.assertIn("No migrations pending", second.stdout)
@@ -4731,6 +4985,7 @@ class MasterAgentToolTests(unittest.TestCase):
             "master-coding-agent": "Coding Agent",
             "master-review-agent": "Review Agent",
             "master-policy-review-agent": "Policy Review Agent",
+            "master-learning-distiller-agent": "Learning Distiller Agent",
         }
 
         for folder, role_name in expected.items():
@@ -4759,6 +5014,7 @@ class MasterAgentToolTests(unittest.TestCase):
             "master-coding-agent",
             "master-review-agent",
             "master-policy-review-agent",
+            "master-learning-distiller-agent",
         ]
         for folder in expected:
             self.assertTrue((skills_dir / folder / "SKILL.md").exists())

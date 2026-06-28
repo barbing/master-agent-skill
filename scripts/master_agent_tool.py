@@ -42,6 +42,13 @@ SAFETY_AUTONOMOUS_ACTIONS = {
     "monitor-heartbeats",
     "monitor-budget",
     "recommend-token-strategy",
+    "record-learning-correction",
+    "start-learning-cycle",
+    "learning-cycle-start",
+    "lint-learning-proposal",
+    "learning-proposal-lint",
+    "accept-learning-proposal",
+    "record-learning-effectiveness",
 }
 SAFETY_REMEDIATION_ACTIONS = {
     "reinforce-context",
@@ -70,8 +77,12 @@ SAFETY_HARD_BUDGET_IMPACT = 20_000
 USAGE_SOURCES = ("measured", "estimated", "self-reported")
 USAGE_CONFIDENCES = ("low", "medium", "high")
 LARGE_CONTINUATION_TOKENS = 5_000
-CURRENT_SCHEMA_VERSION = "1.0"
-ORDERED_MIGRATIONS = ["0001-base-state", "0002-runtime-session-observability"]
+CURRENT_SCHEMA_VERSION = "1.1"
+ORDERED_MIGRATIONS = [
+    "0001-base-state",
+    "0002-runtime-session-observability",
+    "0003-learning-layer",
+]
 DEFAULT_CODEX_APP_READ_MAX_MINUTES = 60.0
 DEFAULT_WORKTREE_EVIDENCE_MAX_MINUTES = 60.0
 
@@ -168,6 +179,81 @@ STRATEGY_PACKET_REQUIRED_FIELDS = {
     ],
 }
 
+LEARNING_PROPOSAL_HEADINGS = [
+    "# Learning Proposal",
+    "## Trigger",
+    "## Distilled Lesson",
+    "## Target",
+    "## Safety Review",
+    "## Validation",
+    "## Decision",
+]
+
+LEARNING_PROPOSAL_REQUIRED_FIELDS = {
+    "## Trigger": [
+        "Proposal id",
+        "Source corrections",
+        "Failure mode",
+        "Evidence",
+    ],
+    "## Distilled Lesson": [
+        "Lesson",
+        "Applies when",
+        "Does not apply when",
+        "Evidence trigger",
+        "Escape condition",
+        "Counterexample checked",
+    ],
+    "## Target": [
+        "Target type",
+        "Target path",
+        "Change summary",
+        "Implementation owner",
+        "Requires production code change",
+    ],
+    "## Safety Review": [
+        "Anti-narrowing risk",
+        "Privacy or secret risk",
+        "Licensing risk",
+        "Policy review required",
+    ],
+    "## Validation": [
+        "Required validation",
+        "Success metric",
+        "Recurrence check",
+    ],
+    "## Decision": [
+        "Proposed decision",
+        "Confidence",
+        "Open questions",
+    ],
+}
+
+LEARNING_TARGET_TYPES = {
+    "project-policy-pack",
+    "agents-md",
+    "skill",
+    "plugin-validator",
+    "template",
+    "memory-note",
+    "skip",
+}
+
+LEARNING_DECISIONS = {
+    "create",
+    "extend",
+    "validator",
+    "skip",
+    "needs-more-evidence",
+}
+
+LEARNING_EFFECTIVENESS_STATUSES = {
+    "not-yet-measured",
+    "recurrence-prevented",
+    "recurrence-detected",
+    "needs-more-evidence",
+}
+
 UNFILLED_PACKET_VALUES = {
     "",
     "-",
@@ -175,6 +261,9 @@ UNFILLED_PACKET_VALUES = {
     "TBD",
     "yes | no",
     "low | medium | high",
+    "create | extend | validator | skip | needs-more-evidence",
+    "project-policy-pack | agents-md | skill | plugin-validator | template | memory-note | skip",
+    "not-yet-measured | recurrence-prevented | recurrence-detected | needs-more-evidence",
 }
 
 DEFAULT_ROLES = {
@@ -242,6 +331,19 @@ DEFAULT_ROLES = {
         "token_budget": None,
         "max_heartbeats": None,
         "activation_reason": "Default role.",
+    },
+    "Learning Distiller": {
+        "status": "active",
+        "role_type": "default",
+        "purpose": "Distill corrections, incidents, failed reviews, and repeated agent mistakes into governed learning proposals.",
+        "allowed_work": "Mine accepted state, correction records, incidents, anomalies, and review verdicts; produce learning cycles and learning proposals.",
+        "forbidden_work": "Production implementation, unreviewed self-modification, broad memory-store behavior, or applying learning updates without Master acceptance.",
+        "return_packet": "learning-proposal.md",
+        "scope": "docs/master-agent and approved behavior assets",
+        "role_skill": "master-learning-distiller-agent",
+        "token_budget": None,
+        "max_heartbeats": None,
+        "activation_reason": "Default learning-layer role.",
     },
 }
 
@@ -425,6 +527,55 @@ def validate_strategy_packet(path: Path) -> list[str]:
     return errors
 
 
+def validate_learning_proposal(path: Path) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"learning proposal does not exist: {path}"]
+    text = path.read_text(encoding="utf-8")
+    for heading in LEARNING_PROPOSAL_HEADINGS:
+        if heading not in text:
+            errors.append(f"missing heading: {heading}")
+    sections = parse_markdown_sections(text)
+    for heading, field_names in LEARNING_PROPOSAL_REQUIRED_FIELDS.items():
+        section_text = sections.get(heading, "")
+        if not section_has_content(section_text):
+            errors.append(f"empty required section: {heading}")
+            continue
+        for field_name in field_names:
+            value = markdown_bullet_field(section_text, field_name)
+            if not field_is_filled(value):
+                errors.append(f"unfilled field: {heading} / {field_name}")
+
+    target_type = markdown_bullet_field(sections.get("## Target", ""), "Target type")
+    if target_type and target_type not in LEARNING_TARGET_TYPES:
+        errors.append(
+            "invalid field: ## Target / Target type "
+            f"must be one of {', '.join(sorted(LEARNING_TARGET_TYPES))}"
+        )
+    production_code = (
+        markdown_bullet_field(
+            sections.get("## Target", ""), "Requires production code change"
+        )
+        or ""
+    ).lower()
+    if production_code not in {"yes", "no"}:
+        errors.append("invalid field: ## Target / Requires production code change must be yes or no")
+    elif production_code == "yes":
+        errors.append("learning proposal cannot require production code change; create a normal work order instead")
+    proposed_decision = markdown_bullet_field(
+        sections.get("## Decision", ""), "Proposed decision"
+    )
+    if proposed_decision and proposed_decision not in LEARNING_DECISIONS:
+        errors.append(
+            "invalid field: ## Decision / Proposed decision "
+            f"must be one of {', '.join(sorted(LEARNING_DECISIONS))}"
+        )
+    confidence = markdown_bullet_field(sections.get("## Decision", ""), "Confidence")
+    if confidence and confidence not in {"low", "medium", "high"}:
+        errors.append("invalid field: ## Decision / Confidence must be low, medium, or high")
+    return errors
+
+
 def yaml_quoted(value: object) -> str:
     return json.dumps(" ".join(str(value).split()))
 
@@ -486,6 +637,10 @@ def ensure_state_storage(state_dir: Path) -> None:
     worktrees_path = storage_dir / "worktrees.jsonl"
     incidents_path = storage_dir / "incidents.jsonl"
     alerts_path = storage_dir / "alerts.jsonl"
+    learning_corrections_path = storage_dir / "learning-corrections.jsonl"
+    learning_cycles_path = storage_dir / "learning-cycles.jsonl"
+    learning_updates_path = storage_dir / "learning-updates.jsonl"
+    learning_effectiveness_path = storage_dir / "learning-effectiveness.jsonl"
     schema_path = storage_dir / "schema-version.json"
     if not agents_path.exists():
         atomic_write_text(agents_path, "{}\n")
@@ -535,6 +690,14 @@ def ensure_state_storage(state_dir: Path) -> None:
         atomic_write_text(incidents_path, "")
     if not alerts_path.exists():
         atomic_write_text(alerts_path, "")
+    if not learning_corrections_path.exists():
+        atomic_write_text(learning_corrections_path, "")
+    if not learning_cycles_path.exists():
+        atomic_write_text(learning_cycles_path, "")
+    if not learning_updates_path.exists():
+        atomic_write_text(learning_updates_path, "")
+    if not learning_effectiveness_path.exists():
+        atomic_write_text(learning_effectiveness_path, "")
     if not schema_path.exists():
         atomic_write_json(schema_path, default_schema_version())
 
@@ -1164,6 +1327,10 @@ def _state_file_paths(state_dir: Path) -> list[Path]:
         state_dir / "state" / "worktrees.jsonl",
         state_dir / "state" / "incidents.jsonl",
         state_dir / "state" / "alerts.jsonl",
+        state_dir / "state" / "learning-corrections.jsonl",
+        state_dir / "state" / "learning-cycles.jsonl",
+        state_dir / "state" / "learning-updates.jsonl",
+        state_dir / "state" / "learning-effectiveness.jsonl",
         state_dir / "state" / "schema-version.json",
     ]
 
@@ -4269,6 +4436,403 @@ def load_jsonl_entries(path: Path) -> list[dict]:
     return entries
 
 
+def proposal_field(path: Path, heading: str, field_name: str) -> str:
+    sections = parse_markdown_sections(path.read_text(encoding="utf-8"))
+    return markdown_bullet_field(sections.get(heading, ""), field_name) or ""
+
+
+def append_learning_correction(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "learning-corrections.jsonl", entry)
+
+
+def append_learning_cycle(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "learning-cycles.jsonl", entry)
+
+
+def append_learning_update(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "learning-updates.jsonl", entry)
+
+
+def append_learning_effectiveness(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "learning-effectiveness.jsonl", entry)
+
+
+def render_correction_ledger(state_dir: Path) -> None:
+    corrections = load_jsonl_entries(state_dir / "state" / "learning-corrections.jsonl")
+    failure_counts: dict[str, int] = {}
+    for entry in corrections:
+        failure_mode = str(entry.get("failure_mode") or "unspecified")
+        failure_counts[failure_mode] = failure_counts.get(failure_mode, 0) + 1
+    lines = [
+        "# Correction Ledger",
+        "",
+        "## Learning Objective",
+        "",
+        "- Convert material user corrections, failed reviews, incidents, and repeated agent mistakes into reviewed behavior updates.",
+        "- Keep learning outside production code; route implementation needs through normal work orders.",
+        "",
+        "## Recorded Corrections",
+        "",
+        "| Time | Correction Id | Project | Failure Mode | Confidence | Evidence |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    if corrections:
+        for entry in corrections[-30:]:
+            lines.append(
+                "| {time} | {correction_id} | {project} | {failure_mode} | {confidence} | {evidence} |".format(
+                    time=table_value(entry.get("at")),
+                    correction_id=table_value(entry.get("correction_id")),
+                    project=table_value(entry.get("project")),
+                    failure_mode=table_value(entry.get("failure_mode")),
+                    confidence=table_value(entry.get("confidence")),
+                    evidence=table_value(entry.get("evidence")),
+                )
+            )
+    else:
+        lines.append("|  |  |  |  |  |  |")
+    lines.extend(["", "## Failure Mode Summary", ""])
+    if failure_counts:
+        for failure_mode, count in sorted(failure_counts.items()):
+            lines.append(f"- {failure_mode}: {count}")
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "## Promotion Candidates",
+            "",
+            "- Use learning-cycle-start to create a shortlist before edits.",
+            "",
+            "## Skip Or Defer Reasons",
+            "",
+            "- One-off, low-confidence, sensitive, already covered, or likely to overfit.",
+        ]
+    )
+    atomic_write_text(state_dir / "correction-ledger.md", "\n".join(lines) + "\n")
+
+
+def render_learning_effectiveness(state_dir: Path) -> None:
+    updates = load_jsonl_entries(state_dir / "state" / "learning-updates.jsonl")
+    checks = load_jsonl_entries(state_dir / "state" / "learning-effectiveness.jsonl")
+    latest_by_proposal: dict[str, dict] = {}
+    for check in checks:
+        proposal_id = str(check.get("proposal_id") or "")
+        if proposal_id:
+            latest_by_proposal[proposal_id] = check
+    status_counts: dict[str, int] = {}
+    for update in updates:
+        proposal_id = str(update.get("proposal_id") or "")
+        latest = latest_by_proposal.get(proposal_id, {})
+        status = str(latest.get("status") or "not-yet-measured")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    lines = [
+        "# Learning Effectiveness",
+        "",
+        "## Accepted Learning Updates",
+        "",
+        "| Time | Proposal Id | Decision | Target | Summary | Latest Status |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    if updates:
+        for update in updates[-30:]:
+            proposal_id = str(update.get("proposal_id") or "")
+            latest = latest_by_proposal.get(proposal_id, {})
+            lines.append(
+                "| {time} | {proposal_id} | {decision} | {target} | {summary} | {status} |".format(
+                    time=table_value(update.get("at")),
+                    proposal_id=table_value(proposal_id),
+                    decision=table_value(update.get("decision")),
+                    target=table_value(update.get("target_type")),
+                    summary=table_value(update.get("summary")),
+                    status=table_value(latest.get("status") or "not-yet-measured"),
+                )
+            )
+    else:
+        lines.append("|  |  |  |  |  |  |")
+    lines.extend(["", "## Recurrence Checks", ""])
+    if checks:
+        for check in checks[-30:]:
+            lines.append(
+                f"- {check.get('at', '')}: {check.get('proposal_id', '')} "
+                f"{check.get('status', '')} - {check.get('evidence', '')}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Effectiveness Summary", ""])
+    if status_counts:
+        for status, count in sorted(status_counts.items()):
+            lines.append(f"- {status}: {count}")
+    else:
+        lines.append("- no accepted updates yet")
+    recurrence = [
+        check for check in checks if check.get("status") == "recurrence-detected"
+    ]
+    lines.extend(["", "## Rework Queue", ""])
+    if recurrence:
+        for check in recurrence[-20:]:
+            lines.append(
+                f"- {check.get('proposal_id', '')}: {check.get('next_action', '')}"
+            )
+    else:
+        lines.append("- none")
+    atomic_write_text(state_dir / "learning-effectiveness.md", "\n".join(lines) + "\n")
+
+
+def command_record_learning_correction(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    timestamp = format_time(parse_time(args.at))
+    correction_id = f"corr-{time.time_ns()}"
+    entry = {
+        "at": timestamp,
+        "correction_id": correction_id,
+        "project": args.project,
+        "source": args.source,
+        "task": args.task,
+        "agent_behavior": args.agent_behavior,
+        "user_correction": args.user_correction,
+        "evidence": args.evidence,
+        "failure_mode": args.failure_mode,
+        "confidence": args.confidence,
+        "severity": args.severity,
+    }
+    append_learning_correction(state_dir, entry)
+    render_correction_ledger(state_dir)
+    append_event_log(
+        state_dir=state_dir,
+        event_type="learning-correction",
+        related_packet="correction-ledger.md",
+        summary=f"{args.failure_mode}: {args.user_correction}",
+        evidence=args.evidence,
+        ledger_update="correction ledger updated",
+        next_action="include in next learning cycle",
+        at=timestamp,
+    )
+    print(f"Recorded learning correction {correction_id}")
+    return 0
+
+
+def command_learning_cycle_start(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    timestamp = format_time(parse_time(args.at))
+    cycle_id = args.cycle_id or f"learning-cycle-{time.time_ns()}"
+    cycle_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", cycle_id).strip("-") or "learning-cycle"
+    cycle_dir = state_dir / "packets" / "learning" / cycle_slug
+    cycle_dir.mkdir(parents=True, exist_ok=True)
+    output = cycle_dir / "learning-cycle.md"
+    corrections = load_jsonl_entries(state_dir / "state" / "learning-corrections.jsonl")
+    recent = corrections[-20:]
+    lines = [
+        "# Learning Cycle",
+        "",
+        "## Cycle Scope",
+        "",
+        f"- Cycle id: {cycle_id}",
+        f"- Window: {args.window}",
+        f"- Project: {args.project}",
+        f"- Focus: {args.focus or 'all material corrections'}",
+        f"- Created at: {timestamp}",
+        "",
+        "## Evidence Sources",
+        "",
+    ]
+    if args.source:
+        lines.extend(f"- {source}" for source in args.source)
+    else:
+        lines.extend(
+            [
+                "- correction-ledger.md",
+                "- anomaly-log.md",
+                "- incident-log.md",
+                "- review-verdict.md",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Correction Shortlist",
+            "",
+            "| Correction Id | Failure Mode | Evidence | Candidate Target | Decision |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    if recent:
+        for correction in recent:
+            lines.append(
+                "| {correction_id} | {failure_mode} | {evidence} |  | needs triage |".format(
+                    correction_id=table_value(correction.get("correction_id")),
+                    failure_mode=table_value(correction.get("failure_mode")),
+                    evidence=table_value(correction.get("evidence")),
+                )
+            )
+    else:
+        lines.append("|  |  |  |  | no corrections recorded |")
+    lines.extend(
+        [
+            "",
+            "## Decisions",
+            "",
+            "- Create, extend, validator, skip, or needs-more-evidence for each candidate.",
+            "",
+            "## Applied Updates",
+            "",
+            "- none yet",
+            "",
+            "## Validation",
+            "",
+            "- Run learning-proposal-lint on each proposal before acceptance.",
+            "- Run validate after accepted state changes.",
+            "",
+            "## Effectiveness Follow Up",
+            "",
+            "- Define recurrence check for every accepted learning proposal.",
+        ]
+    )
+    atomic_write_text(output, "\n".join(lines) + "\n")
+    append_learning_cycle(
+        state_dir,
+        {
+            "at": timestamp,
+            "cycle_id": cycle_id,
+            "window": args.window,
+            "project": args.project,
+            "focus": args.focus or "",
+            "path": str(output),
+            "corrections_considered": len(recent),
+        },
+    )
+    append_event_log(
+        state_dir=state_dir,
+        event_type="learning-cycle-started",
+        related_packet=str(output),
+        summary=f"learning cycle {cycle_id}",
+        evidence=str(output),
+        ledger_update="learning cycle recorded",
+        next_action="distill shortlist into learning proposals",
+        at=timestamp,
+    )
+    print(f"Created learning cycle: {output}")
+    return 0
+
+
+def command_learning_proposal_lint(args: argparse.Namespace) -> int:
+    proposal = Path(args.proposal).resolve()
+    errors = validate_learning_proposal(proposal)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    print(f"Learning proposal is valid: {proposal}")
+    return 0
+
+
+def command_accept_learning_proposal(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    proposal = Path(args.proposal).resolve()
+    errors = validate_learning_proposal(proposal)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    timestamp = format_time(parse_time(args.at))
+    proposal_id = args.proposal_id or proposal_field(proposal, "## Trigger", "Proposal id")
+    if not proposal_id:
+        print("Learning proposal id is required", file=sys.stderr)
+        return 1
+    entry = {
+        "at": timestamp,
+        "proposal_id": proposal_id,
+        "proposal": str(proposal),
+        "summary": args.summary,
+        "target_type": proposal_field(proposal, "## Target", "Target type"),
+        "target_path": proposal_field(proposal, "## Target", "Target path"),
+        "decision": proposal_field(proposal, "## Decision", "Proposed decision"),
+        "confidence": proposal_field(proposal, "## Decision", "Confidence"),
+        "policy_review": args.policy_review or "",
+        "validation_evidence": args.validation_evidence or "",
+    }
+    append_learning_update(state_dir, entry)
+    append_learning_effectiveness(
+        state_dir,
+        {
+            "at": timestamp,
+            "proposal_id": proposal_id,
+            "status": "not-yet-measured",
+            "evidence": "accepted learning update; recurrence not measured yet",
+            "next_action": proposal_field(proposal, "## Validation", "Recurrence check"),
+        },
+    )
+    render_learning_effectiveness(state_dir)
+    append_event_log(
+        state_dir=state_dir,
+        event_type="learning-proposal-accepted",
+        related_packet=str(proposal),
+        summary=args.summary,
+        evidence=args.validation_evidence or str(proposal),
+        ledger_update="learning update accepted",
+        next_action="run recurrence check",
+        at=timestamp,
+    )
+    print(f"Accepted learning proposal {proposal_id}")
+    return 0
+
+
+def command_record_learning_effectiveness(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    timestamp = format_time(parse_time(args.at))
+    entry = {
+        "at": timestamp,
+        "proposal_id": args.proposal_id,
+        "status": args.status,
+        "evidence": args.evidence,
+        "next_action": args.next_action,
+    }
+    append_learning_effectiveness(state_dir, entry)
+    render_learning_effectiveness(state_dir)
+    append_event_log(
+        state_dir=state_dir,
+        event_type="learning-effectiveness-recorded",
+        related_packet="learning-effectiveness.md",
+        summary=f"{args.proposal_id}: {args.status}",
+        evidence=args.evidence,
+        ledger_update="learning effectiveness updated",
+        next_action=args.next_action,
+        at=timestamp,
+    )
+    print(f"Recorded learning effectiveness for {args.proposal_id}")
+    return 0
+
+
+def command_learning_summary(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    corrections = load_jsonl_entries(state_dir / "state" / "learning-corrections.jsonl")
+    cycles = load_jsonl_entries(state_dir / "state" / "learning-cycles.jsonl")
+    updates = load_jsonl_entries(state_dir / "state" / "learning-updates.jsonl")
+    checks = load_jsonl_entries(state_dir / "state" / "learning-effectiveness.jsonl")
+    failure_counts: dict[str, int] = {}
+    for correction in corrections:
+        failure_mode = str(correction.get("failure_mode") or "unspecified")
+        failure_counts[failure_mode] = failure_counts.get(failure_mode, 0) + 1
+    recurrence_count = sum(
+        1 for check in checks if check.get("status") == "recurrence-detected"
+    )
+    print(f"Corrections: {len(corrections)}")
+    print(f"Learning cycles: {len(cycles)}")
+    print(f"Accepted learning updates: {len(updates)}")
+    print(f"Recurrence detected: {recurrence_count}")
+    print("Failure modes:")
+    if failure_counts:
+        for failure_mode, count in sorted(failure_counts.items()):
+            print(f"- {failure_mode}: {count}")
+    else:
+        print("- none")
+    return 1 if recurrence_count else 0
+
+
 def append_incident(
     state_dir: Path,
     severity: str,
@@ -4461,11 +5025,20 @@ def command_telemetry_summary(args: argparse.Namespace) -> int:
     agents = load_agents(state_dir)
     strategy = current_strategy_plan(state_dir)
     budget = load_budget(state_dir)
+    corrections = load_jsonl_entries(state_dir / "state" / "learning-corrections.jsonl")
+    learning_updates = load_jsonl_entries(state_dir / "state" / "learning-updates.jsonl")
+    learning_checks = load_jsonl_entries(state_dir / "state" / "learning-effectiveness.jsonl")
+    recurrence_count = sum(
+        1 for check in learning_checks if check.get("status") == "recurrence-detected"
+    )
     print(f"Active plan: {strategy.get('plan_id') if strategy else 'none'}")
     print(f"Active agents: {', '.join(sorted(agents)) if agents else 'none'}")
     print(f"Project tokens: {budget.get('project_used', 0)} / {budget.get('project_budget') or 'unbounded'}")
     print(f"Open anomalies: {len(anomalies)}")
     print(f"Open alerts: {len(alerts)}")
+    print(f"Learning corrections: {len(corrections)}")
+    print(f"Accepted learning updates: {len(learning_updates)}")
+    print(f"Learning recurrences: {recurrence_count}")
     print(f"Runtime state: {runtime.get('supervisor_state')}")
     print(f"Last supervisor check: {runtime.get('last_check_at', '')}")
     return 1 if alerts else 0
@@ -5456,6 +6029,57 @@ def build_parser() -> argparse.ArgumentParser:
     assess_parallel.add_argument("--work-order", action="append", required=True)
     assess_parallel.add_argument("--output")
     assess_parallel.set_defaults(func=command_assess_parallelism)
+
+    learning_correction = subparsers.add_parser("record-learning-correction", help="Record a correction or failure pattern for later distillation.")
+    learning_correction.add_argument("--state-dir", required=True)
+    learning_correction.add_argument("--project", required=True)
+    learning_correction.add_argument("--source", required=True)
+    learning_correction.add_argument("--task", required=True)
+    learning_correction.add_argument("--agent-behavior", required=True)
+    learning_correction.add_argument("--user-correction", required=True)
+    learning_correction.add_argument("--evidence", required=True)
+    learning_correction.add_argument("--failure-mode", required=True)
+    learning_correction.add_argument("--confidence", choices=["low", "medium", "high"], required=True)
+    learning_correction.add_argument("--severity", choices=["info", "warning", "critical"], default="warning")
+    learning_correction.add_argument("--at")
+    learning_correction.set_defaults(func=command_record_learning_correction)
+
+    learning_cycle = subparsers.add_parser("learning-cycle-start", help="Create a governed learning-cycle packet from recorded corrections.")
+    learning_cycle.add_argument("--state-dir", required=True)
+    learning_cycle.add_argument("--window", required=True)
+    learning_cycle.add_argument("--project", required=True)
+    learning_cycle.add_argument("--focus")
+    learning_cycle.add_argument("--source", action="append")
+    learning_cycle.add_argument("--cycle-id")
+    learning_cycle.add_argument("--at")
+    learning_cycle.set_defaults(func=command_learning_cycle_start)
+
+    learning_lint = subparsers.add_parser("learning-proposal-lint", help="Validate a learning proposal before Master acceptance.")
+    learning_lint.add_argument("--proposal", required=True)
+    learning_lint.set_defaults(func=command_learning_proposal_lint)
+
+    accept_learning = subparsers.add_parser("accept-learning-proposal", help="Accept a reviewed learning proposal into Master learning state.")
+    accept_learning.add_argument("--state-dir", required=True)
+    accept_learning.add_argument("--proposal", required=True)
+    accept_learning.add_argument("--proposal-id")
+    accept_learning.add_argument("--summary", required=True)
+    accept_learning.add_argument("--policy-review")
+    accept_learning.add_argument("--validation-evidence")
+    accept_learning.add_argument("--at")
+    accept_learning.set_defaults(func=command_accept_learning_proposal)
+
+    learning_effectiveness = subparsers.add_parser("record-learning-effectiveness", help="Record whether an accepted learning update prevented recurrence.")
+    learning_effectiveness.add_argument("--state-dir", required=True)
+    learning_effectiveness.add_argument("--proposal-id", required=True)
+    learning_effectiveness.add_argument("--status", choices=sorted(LEARNING_EFFECTIVENESS_STATUSES), required=True)
+    learning_effectiveness.add_argument("--evidence", required=True)
+    learning_effectiveness.add_argument("--next-action", required=True)
+    learning_effectiveness.add_argument("--at")
+    learning_effectiveness.set_defaults(func=command_record_learning_effectiveness)
+
+    learning_summary = subparsers.add_parser("learning-summary", help="Summarize corrections, learning updates, and recurrence checks.")
+    learning_summary.add_argument("--state-dir", required=True)
+    learning_summary.set_defaults(func=command_learning_summary)
 
     incident = subparsers.add_parser("record-incident", help="Record a production incident and open alerts for critical severity.")
     incident.add_argument("--state-dir", required=True)

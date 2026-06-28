@@ -119,8 +119,8 @@ def with_lock(
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, f"pid={os.getpid()} time={time.time()}\n".encode("utf-8"))
             break
-        except FileExistsError as exc:
-            if lock_is_recoverable(lock_path, stale_seconds):
+        except (FileExistsError, PermissionError) as exc:
+            if lock_path.exists() and lock_is_recoverable(lock_path, stale_seconds):
                 try:
                     unlink_with_retry(lock_path)
                     continue

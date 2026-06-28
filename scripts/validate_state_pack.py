@@ -259,6 +259,40 @@ REQUIRED_HEADINGS = {
         "## Replay Sources",
         "## Stale Lock Handling",
     ],
+    "correction-ledger.md": [
+        "# Correction Ledger",
+        "## Learning Objective",
+        "## Recorded Corrections",
+        "## Failure Mode Summary",
+        "## Promotion Candidates",
+        "## Skip Or Defer Reasons",
+    ],
+    "learning-cycle.md": [
+        "# Learning Cycle",
+        "## Cycle Scope",
+        "## Evidence Sources",
+        "## Correction Shortlist",
+        "## Decisions",
+        "## Applied Updates",
+        "## Validation",
+        "## Effectiveness Follow Up",
+    ],
+    "learning-proposal.md": [
+        "# Learning Proposal",
+        "## Trigger",
+        "## Distilled Lesson",
+        "## Target",
+        "## Safety Review",
+        "## Validation",
+        "## Decision",
+    ],
+    "learning-effectiveness.md": [
+        "# Learning Effectiveness",
+        "## Accepted Learning Updates",
+        "## Recurrence Checks",
+        "## Effectiveness Summary",
+        "## Rework Queue",
+    ],
 }
 
 STRICT_FIELD_REQUIREMENTS = {
@@ -294,6 +328,10 @@ STRICT_STATE_FILES = [
     Path("state") / "worktrees.jsonl",
     Path("state") / "incidents.jsonl",
     Path("state") / "alerts.jsonl",
+    Path("state") / "learning-corrections.jsonl",
+    Path("state") / "learning-cycles.jsonl",
+    Path("state") / "learning-updates.jsonl",
+    Path("state") / "learning-effectiveness.jsonl",
     Path("state") / "schema-version.json",
 ]
 

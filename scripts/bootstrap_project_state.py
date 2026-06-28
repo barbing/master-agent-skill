@@ -69,6 +69,10 @@ def ensure_state_storage(target_dir: Path) -> None:
     worktrees_path = storage_dir / "worktrees.jsonl"
     incidents_path = storage_dir / "incidents.jsonl"
     alerts_path = storage_dir / "alerts.jsonl"
+    learning_corrections_path = storage_dir / "learning-corrections.jsonl"
+    learning_cycles_path = storage_dir / "learning-cycles.jsonl"
+    learning_updates_path = storage_dir / "learning-updates.jsonl"
+    learning_effectiveness_path = storage_dir / "learning-effectiveness.jsonl"
     schema_path = storage_dir / "schema-version.json"
     if not agents_path.exists():
         atomic_write_json(agents_path, {})
@@ -120,11 +124,19 @@ def ensure_state_storage(target_dir: Path) -> None:
         atomic_write_text(incidents_path, "")
     if not alerts_path.exists():
         atomic_write_text(alerts_path, "")
+    if not learning_corrections_path.exists():
+        atomic_write_text(learning_corrections_path, "")
+    if not learning_cycles_path.exists():
+        atomic_write_text(learning_cycles_path, "")
+    if not learning_updates_path.exists():
+        atomic_write_text(learning_updates_path, "")
+    if not learning_effectiveness_path.exists():
+        atomic_write_text(learning_effectiveness_path, "")
     if not schema_path.exists():
         atomic_write_json(
             schema_path,
             {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "compatible_tool": "master_agent_tool.py",
                 "migration_history": [],
             },

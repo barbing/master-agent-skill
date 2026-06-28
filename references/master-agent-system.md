@@ -19,6 +19,7 @@ The Master Agent is the control plane. It routes work, monitors heartbeats, enfo
 - Reduce attention loss by keeping long history out of the active conversation.
 - Prevent reward hacking by making acceptance depend on evidence and explicit gates.
 - Prevent runaway token usage by requiring budgets, usage records, heartbeat caps, escalation thresholds, and token-saving strategy recommendations.
+- Convert repeated corrections and agent mistakes into governed learning proposals instead of relying on raw conversation memory.
 - Isolate sub-agent implementation in planned Worktrees so the user's local checkout and GitHub branches are not changed without an explicit gate.
 - Keep project-specific policy outside the reusable skill.
 - Allow the Master Agent to decide when parallel sub-agents are safe.
@@ -77,6 +78,10 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `incident-log.md` | Open and resolved incident summaries, severity levels, remediation, and operator handoff. |
 | `alert-queue.md` | Pending alerts, severity, acknowledgement, suppression, and escalation status. |
 | `state-schema.md` | Current schema version, migration order, compatibility policy, recovery policy, and stale lock handling. |
+| `correction-ledger.md` | Material user corrections, failed reviews, repeated agent mistakes, evidence, and failure modes. |
+| `learning-cycle.md` | Bounded correction-distillation pass with evidence sources, shortlist, decisions, validation, and follow-up. |
+| `learning-proposal.md` | Governed proposal to update policy, AGENTS.md, a skill, template, validator, memory note, or skip. |
+| `learning-effectiveness.md` | Accepted learning updates and recurrence checks. |
 | `coding-receipt.md` | Implementation result and validation evidence. |
 | `review-verdict.md` | Independent review result. |
 | `policy-verdict.md` | Authority and policy compliance verdict. |
@@ -92,6 +97,10 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `state/worktrees.jsonl` | Append-only Worktree plan, confirmation, binding, stale, close, and `.worktreeinclude` validation events. |
 | `state/incidents.jsonl` | Append-only incident records. |
 | `state/alerts.jsonl` | Append-only alert-opened and acknowledgement records. |
+| `state/learning-corrections.jsonl` | Append-only correction records for learning cycles. |
+| `state/learning-cycles.jsonl` | Append-only learning cycle records. |
+| `state/learning-updates.jsonl` | Append-only accepted learning proposal records. |
+| `state/learning-effectiveness.jsonl` | Append-only recurrence and effectiveness records. |
 | `state/schema-version.json` | Current schema version, migration history, and compatible tool version. |
 
 ## Operational CLI
@@ -210,6 +219,12 @@ python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --se
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"
 python scripts/master_agent_tool.py telemetry-summary --state-dir <state-dir>
+python scripts/master_agent_tool.py record-learning-correction --state-dir <state-dir> --project <project> --source <session-or-artifact> --task <task> --agent-behavior <behavior> --user-correction <correction> --evidence <evidence> --failure-mode <mode> --confidence high
+python scripts/master_agent_tool.py learning-cycle-start --state-dir <state-dir> --window "last 7 days" --project <project>
+python scripts/master_agent_tool.py learning-proposal-lint --proposal packets/learning-proposal.md
+python scripts/master_agent_tool.py accept-learning-proposal --state-dir <state-dir> --proposal packets/learning-proposal.md --summary "Accepted correction distillation"
+python scripts/master_agent_tool.py record-learning-effectiveness --state-dir <state-dir> --proposal-id <proposal-id> --status recurrence-prevented --evidence <evidence> --next-action "keep rule"
+python scripts/master_agent_tool.py learning-summary --state-dir <state-dir>
 python scripts/master_agent_tool.py schema-status --state-dir <state-dir>
 python scripts/master_agent_tool.py migrate-state --state-dir <state-dir>
 python scripts/master_agent_tool.py recover-state --state-dir <state-dir> --from-logs
@@ -386,6 +401,38 @@ Supported actions:
 
 If safety returns a hard block, no remediation packet is created. If safety returns an internal-review condition, the packet is created but should be reviewed before spawning more work. For actual session replacement, use `rotate-session` after the successor handoff is accepted or when the Master has enough state to safely rotate without another review.
 
+## Learning Layer
+
+The learning layer converts material corrections into durable behavior updates without allowing uncontrolled self-modification.
+
+Use this loop:
+
+```text
+user correction / failed review / incident / repeated anomaly
+-> record-learning-correction
+-> learning-cycle-start
+-> Learning Distiller returns learning-proposal.md
+-> learning-proposal-lint
+-> Policy Review when authority, scope, privacy, or licensing is affected
+-> accept-learning-proposal
+-> record-learning-effectiveness after recurrence checks
+```
+
+Learning records are evidence, not permission to edit arbitrary files. A learning proposal must name scope, non-scope, evidence trigger, escape condition, counterexample, target, validation, and recurrence check. If the proposal requires production code changes, reject it as a learning update and create a normal work order instead.
+
+Choose the smallest durable target:
+
+- Project policy pack or `AGENTS.md` for project-specific hard constraints.
+- Role skill or reusable skill for cross-project judgment workflows.
+- Template update when the gap is a missing field or receipt requirement.
+- Plugin or validator when the failure is mechanically checkable.
+- Memory note only as a continuity cue, not enforcement.
+- Skip when evidence is thin, one-off, already covered, sensitive, or likely to overfit.
+
+The Learning Distiller Agent is short-lived. It may mine accepted state, corrections, incidents, anomalies, and review verdicts, but it must not become project memory or modify production behavior.
+
+Effectiveness is mandatory. Each accepted learning update starts as `not-yet-measured`; the Master later records `recurrence-prevented`, `recurrence-detected`, or `needs-more-evidence`. A recurrence moves the proposal into the rework queue and indicates that prose should be tightened, moved to a validator, or scoped differently.
+
 ## Token Optimization Strategy
 
 Token control has two layers:
@@ -428,6 +475,7 @@ The Master Agent may:
 - Define, activate, deactivate, and scaffold project-specific roles through role governance.
 - Impose token constraints and context tiers on each sub-agent.
 - Require sub-agents to use autonomous token-saving strategies.
+- Record corrections, start learning cycles, accept reviewed learning proposals, and track recurrence.
 - Ask the user for approval when authority is ambiguous.
 - Pause or stop a sub-agent when drift is detected.
 - Pause or stop a sub-agent when token budget, heartbeat cap, or session cap is exceeded.
@@ -443,6 +491,7 @@ The Master Agent must not:
 - Continue execution when authority docs and user direction conflict.
 - Continue a sub-agent past hard token limits without explicit budget approval.
 - Register an agent with an undefined, proposed, or inactive role.
+- Treat a correction record as permission to self-modify or change production behavior.
 
 ## Strategy Agent Contract
 
@@ -518,6 +567,24 @@ The Policy Review Agent returns a `policy-verdict.md` with one verdict:
 - `blocked`
 
 The Policy Review Agent does not own product direction. It only checks whether a proposal is consistent with the named authority.
+
+## Learning Distiller Agent Contract
+
+Use a Learning Distiller Agent when corrections, incidents, failed reviews, or repeated anomalies should become durable behavior updates.
+
+The Learning Distiller Agent returns a `learning-proposal.md` with:
+
+- Trigger and source corrections.
+- Distilled lesson.
+- Applies-when and does-not-apply-when boundaries.
+- Evidence trigger and escape condition.
+- Counterexample check to avoid over-narrowing.
+- Target type and target path.
+- Safety review.
+- Required validation and recurrence check.
+- Proposed decision and confidence.
+
+A learning proposal is not project state until the Master accepts it. The Master must lint it with `learning-proposal-lint`; use Policy Review before accepting proposals that affect authority, privacy, licensing, global skills, validators, or project policy.
 
 ## Heartbeat Monitoring
 
@@ -648,6 +715,7 @@ Use the role skills under `role-skills/` for short-lived role sessions:
 - `master-coding-agent`
 - `master-review-agent`
 - `master-policy-review-agent`
+- `master-learning-distiller-agent`
 
 For custom roles, provide the context packet plus the role catalog entry. Use a scaffolded role skill only when one exists.
 
@@ -740,6 +808,8 @@ For example, one project may have ingestion, processing, review, and publishing 
 | No token budget | Sessions multiply without a stop signal. | Set project and per-agent budgets before spawning. |
 | No token strategy | Agents stay under budget by luck or manual supervision. | Assign Master constraints plus sub-agent self-optimization rules. |
 | Success from metrics alone | Misses unrecorded failures. | Require the validation evidence named by project policy. |
+| Raw transcript as learning | Imports noise, private context, and overfit rules. | Record evidence-backed correction entries and distill them through proposals. |
+| Self-modifying learning | Bypasses review and can encode bad rules. | Accept only linted learning proposals with recurrence checks. |
 
 ## Minimal Operating Loop
 

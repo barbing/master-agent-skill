@@ -32,6 +32,10 @@
 - state/worktrees.jsonl
 - state/incidents.jsonl
 - state/alerts.jsonl
+- state/learning-corrections.jsonl
+- state/learning-cycles.jsonl
+- state/learning-updates.jsonl
+- state/learning-effectiveness.jsonl
 
 ## Stale Lock Handling
 

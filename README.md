@@ -2,14 +2,14 @@
 
 Project-neutral Codex skill pack for coordinating long-running, multi-agent project work through a non-implementing Master Agent control plane.
 
-The system is designed to keep project continuity outside chat history by using structured ledgers, packets, heartbeats, role contracts, token budgets, runtime supervision, and review gates.
+The system is designed to keep project continuity outside chat history by using structured ledgers, packets, heartbeats, role contracts, token budgets, runtime supervision, review gates, and a governed correction-learning layer.
 
 ## What This Provides
 
 - A main `master-agent-system` Codex skill.
-- Role skills for Strategy, Coding, Review, and Policy Review agents.
+- Role skills for Strategy, Coding, Review, Policy Review, and Learning Distiller agents.
 - State-pack templates under `assets/templates/`.
-- CLI helpers under `scripts/` for bootstrapping, validation, Strategy-packet gating, session control, Worktree control, strict session rotation, role governance, heartbeat monitoring, token tracking, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, soak validation, release validation, and recovery.
+- CLI helpers under `scripts/` for bootstrapping, validation, Strategy-packet gating, session control, Worktree control, strict session rotation, role governance, heartbeat monitoring, token tracking, correction distillation, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, soak validation, release validation, and recovery.
 - A provider-command reference adapter at `scripts/file_session_provider.py`.
 - CI and pre-commit examples for release and Master-boundary enforcement.
 - Regression tests for safety-critical behavior.
@@ -19,7 +19,7 @@ The system is designed to keep project continuity outside chat history by using 
 
 The Master Agent is a control-plane role. It may update project ledgers, packets, plans, state documents, and policy packs, but it must not edit production code.
 
-Implementation work is delegated to bounded sub-agents through explicit work orders. Strategy, coding, review, policy, and custom-role agents return structured packets that the Master Agent accepts, rejects, or escalates.
+Implementation work is delegated to bounded sub-agents through explicit work orders. Strategy, coding, review, policy, learning, and custom-role agents return structured packets that the Master Agent accepts, rejects, or escalates.
 
 Conversation is not treated as durable state. Accepted decisions and current project status must be written into the project state pack.
 
@@ -39,6 +39,7 @@ Conversation is not treated as durable state. Accepted decisions and current pro
 │   ├── master-coding-agent/
 │   ├── master-policy-review-agent/
 │   ├── master-review-agent/
+│   ├── master-learning-distiller-agent/
 │   └── master-strategy-agent/
 ├── scripts/
 │   ├── bootstrap_project_state.py
@@ -72,6 +73,7 @@ role-skills/master-strategy-agent
 role-skills/master-coding-agent
 role-skills/master-review-agent
 role-skills/master-policy-review-agent
+role-skills/master-learning-distiller-agent
 ```
 
 Restart Codex after installing or updating skills.
@@ -105,6 +107,7 @@ Read `references/master-agent-system.md` before deploying the workflow on a real
 - Use `strategy-packet-lint` for preflight diagnostics and `require-strategy-packet-before-work` as an explicit gate before issuing sub-agent work from an accepted Strategy packet.
 - Use `request-rotation`, `validate-predecessor-state`, and `rotate-session` to replace overloaded agents. Normal rotation requires a validated predecessor-state packet; emergency rotation requires `--emergency-without-predecessor-state`.
 - Use `enforce-master-boundary` before completing Master-led work, and `assess-parallelism` before running multiple sub-agents.
+- Use `record-learning-correction`, `learning-cycle-start`, `learning-proposal-lint`, `accept-learning-proposal`, and `record-learning-effectiveness` to convert repeated corrections into reviewed behavior updates.
 - Long-running supervision should be launched through the operating system scheduler or service wrapper appropriate for the deployment environment.
 - Custom roles must have explicit approval evidence, scope, positive token budget, heartbeat cap, and deactivation conditions before activation.
 
