@@ -182,13 +182,21 @@ def write_valid_strategy_packet(path: Path, plan_id: str = "PLAN-VALID") -> None
                 "## Proposed Work Order",
                 "",
                 "- Proposed objective: execute bounded implementation",
+                "- Root authorization source: current-user-request",
+                "- Root authorization grant id: grant-test-1",
                 "- Allowed scope: docs/master-agent",
+                "- Approved material behavior domains: none",
+                "- Declared material behavior domains: none",
                 "- Worktree mode: codex-app",
                 "- Worktree id: wt-plan",
                 "- Base branch: main",
                 "- Local mutation policy: do not mutate local checkout",
                 "- Remote mutation policy: do not push or create PR without release gate",
                 "- Forbidden changes: production implementation",
+                "- Acceptance maturity required: diagnostic",
+                "- Representative workflow required: no",
+                "- Heuristic admission required: no",
+                "- Task record required: yes",
                 "- Validation required: release gate",
                 "- Expected artifacts: receipt and verdict",
                 "- Stop conditions: scope drift or missing validation",
@@ -397,6 +405,26 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertTrue((self.state_dir / "state" / "learning-effectiveness.jsonl").exists())
         roles = json.loads((self.state_dir / "state" / "roles.json").read_text(encoding="utf-8"))
         self.assertEqual(roles["Learning Distiller"]["status"], "active")
+
+    def test_init_creates_governance_optimization_state(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        for filename in [
+            "authority-envelope.md",
+            "obstacle-recovery-packet.md",
+            "acceptance-gate.md",
+            "task-record.md",
+            "implementation-guard-adapter.md",
+        ]:
+            self.assertTrue((self.state_dir / filename).exists(), filename)
+        self.assertTrue((self.state_dir / "state" / "governance-events.jsonl").exists())
+        self.assertTrue((self.state_dir / "state" / "acceptance-gates.jsonl").exists())
+        schema = json.loads(
+            (self.state_dir / "state" / "schema-version.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(schema["schema_version"], "1.2")
 
     def test_learning_correction_creates_cycle_and_summary(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -4322,7 +4350,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(schema["schema_version"], "1.1")
+        self.assertEqual(schema["schema_version"], "1.2")
         self.assertIn("migration_history", schema)
 
     def test_migration_runs_in_order(self):
@@ -4340,6 +4368,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 "0001-base-state",
                 "0002-runtime-session-observability",
                 "0003-learning-layer",
+                "0004-governance-optimization",
             ],
         )
         second = run_cmd([TOOL, "migrate-state", "--state-dir", self.state_dir])
@@ -4508,9 +4537,24 @@ class MasterAgentToolTests(unittest.TestCase):
                     "- Task id: TASK",
                     "- Coding Agent objective: bounded task",
                     "",
+                    "## Root Authorization",
+                    "",
+                    "- Source kind: current-user-request",
+                    "- Source ref: test",
+                    "- Grant id: grant-test",
+                    "- Approved owners: Coding",
+                    "- Approved file scopes: " + write_set,
+                    "- Approved material behavior domains: none",
+                    "- Forbidden behavior domains: pipeline-order",
+                    "",
                     "## Allowed Scope",
                     "",
                     "- Files/modules/artifacts allowed: " + write_set,
+                    "",
+                    "## Material Behavior Domains",
+                    "",
+                    "- Declared material behavior domains: none",
+                    "- No material behavior change: yes",
                     "",
                     "## Parallel Safety",
                     "",
@@ -4524,6 +4568,28 @@ class MasterAgentToolTests(unittest.TestCase):
                     "- Merge Owner: " + merge_owner,
                     "- Conflict Protocol: " + conflict_protocol,
                     "",
+                    "## Heuristic Admission",
+                    "",
+                    "- Heuristic used: no",
+                    "",
+                    "## Representative Workflow",
+                    "",
+                    "- Claim scope: diagnostic",
+                    "- Workspace: test workspace",
+                    "- Bootstrap path: test bootstrap",
+                    "- Mode: test mode",
+                    "- Provider or model path: test provider",
+                    "- Key settings: defaults",
+                    "- Representative parity: yes",
+                    "- Diagnostic-only if mismatch: no",
+                    "",
+                    "## Acceptance Gates",
+                    "",
+                    "- Required maturity gates: diagnostic",
+                    "- Current maturity: diagnostic",
+                    "- Lower gates satisfied: yes",
+                    "- Evidence artifact: test evidence",
+                    "",
                     "## Token Budget",
                     "",
                     "- Token budget: " + token_budget,
@@ -4536,6 +4602,11 @@ class MasterAgentToolTests(unittest.TestCase):
                     "## Required Validation",
                     "",
                     "- python -m unittest",
+                    "",
+                    "## Task Record",
+                    "",
+                    "- Task record required: yes",
+                    "- Record path or reason: docs/master-agent/task-record.md",
                     "",
                     "## Receipt Requirements",
                     "",
@@ -4646,6 +4717,177 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("shared Worktree Id", result.stdout)
+
+    def test_governance_lint_accepts_valid_work_order(self):
+        order = self.tmp / "governed.md"
+        self.write_work_order(order, "src/parser", "artifacts/parser")
+
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                order,
+                "--packet-type",
+                "work-order",
+            ]
+        )
+        self.assertIn("Governance packet is valid", result.stdout)
+
+    def test_governance_lint_rejects_unadmitted_heuristic(self):
+        order = self.tmp / "bad-heuristic.md"
+        self.write_work_order(order, "src/parser", "artifacts/parser")
+        order.write_text(
+            order.read_text(encoding="utf-8").replace(
+                "- Heuristic used: no",
+                "- Heuristic used: yes",
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                order,
+                "--packet-type",
+                "work-order",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Representative evidence", result.stderr)
+        self.assertIn("Target-independent invariant", result.stderr)
+
+    def test_governance_lint_requires_nonrepresentative_claims_to_be_diagnostic(self):
+        order = self.tmp / "bad-representative.md"
+        self.write_work_order(order, "src/parser", "artifacts/parser")
+        order.write_text(
+            order.read_text(encoding="utf-8").replace(
+                "- Representative parity: yes", "- Representative parity: no"
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                order,
+                "--packet-type",
+                "work-order",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must be marked diagnostic-only", result.stderr)
+
+    def test_record_authority_required_marks_agent_and_event(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-AUTH")
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-auth",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-AUTH",
+                "--objective",
+                "Implement bounded work",
+                "--scope",
+                "src/parser",
+                "--plan-id",
+                "PLAN-AUTH",
+            ]
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "record-authority-required",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-auth",
+                "--reason",
+                "requested change crosses owner boundary",
+                "--evidence",
+                "work order approved src/parser only",
+                "--required-user-decision",
+                "approve renderer owner or narrow task",
+            ]
+        )
+        self.assertIn("authority_required", result.stdout)
+        agents = json.loads((self.state_dir / "state" / "agents.json").read_text(encoding="utf-8"))
+        self.assertEqual(agents["coding-auth"]["status"], "authority_required")
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "governance-events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(events[-1]["event_type"], "authority-required")
+
+    def test_acceptance_gate_requires_lower_gate_order(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        too_high = run_cmd(
+            [
+                TOOL,
+                "record-acceptance-gate",
+                "--state-dir",
+                self.state_dir,
+                "--scope-id",
+                "scope-1",
+                "--maturity",
+                "live_seam_green",
+                "--status",
+                "passed",
+                "--evidence",
+                "live seam passed",
+            ],
+            check=False,
+        )
+        self.assertEqual(too_high.returncode, 1)
+        self.assertIn("diagnostic", too_high.stderr)
+        self.assertIn("focused_green", too_high.stderr)
+
+        for maturity in ["diagnostic", "focused_green", "live_seam_green"]:
+            result = run_cmd(
+                [
+                    TOOL,
+                    "record-acceptance-gate",
+                    "--state-dir",
+                    self.state_dir,
+                    "--scope-id",
+                    "scope-1",
+                    "--maturity",
+                    maturity,
+                    "--status",
+                    "passed",
+                    "--evidence",
+                    f"{maturity} evidence",
+                ]
+            )
+            self.assertIn(maturity, result.stdout)
+        gates = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "acceptance-gates.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual([gate["maturity"] for gate in gates], [
+            "diagnostic",
+            "focused_green",
+            "live_seam_green",
+        ])
 
     def test_validate_worktreeinclude_allows_ignored_file_and_blocks_tracked_file(self):
         subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)

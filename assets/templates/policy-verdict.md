@@ -19,6 +19,14 @@
 | --- | --- | --- | --- |
 |  |  |  |  |
 
+## Governance Review
+
+- Root authorization checked: yes | no
+- Material behavior domains checked: yes | no
+- Heuristic admission checked: yes | no
+- Representative workflow checked: yes | no
+- Authority status: inside-envelope | needs-user-decision | authority_required
+
 ## Conditions Or Blockers
 
 - Conditions:

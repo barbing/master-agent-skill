@@ -59,6 +59,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `running-agents.md` | Current sub-agent registry and heartbeat status. |
 | `role-catalog.md` | Active, proposed, and inactive roles governed by the Master Agent. |
 | `role-proposal.md` | Proposal template for creating or changing project-specific roles. |
+| `authority-envelope.md` | Root authorization grant, material behavior domains, representative workflow parity, and acceptance gate baseline. |
 | `master-boundary.md` | Allowed Master write paths and non-implementation enforcement policy. |
 | `strategy-sync.md` | Current accepted strategy plan and Master awareness state. |
 | `anomaly-log.md` | Detected loops, plan drift, scope drift, reward-hacking, and token-risk anomalies. |
@@ -67,6 +68,10 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `heartbeat-packet.md` | Structured progress update from a running sub-agent. |
 | `remediation-packet.md` | Safety-checked context reinforcement, successor handoff, split-task, or stop packet. |
 | `predecessor-state-packet.md` | Required compact state packet for strict session rotation. |
+| `obstacle-recovery-packet.md` | Evidence required before an agent can claim blocked, reassessment required, or authority required. |
+| `acceptance-gate.md` | Scope-level maturity gate record for diagnostic through production acceptance. |
+| `task-record.md` | Durable one-off task scope, work, evidence, decision, and future-agent notes. |
+| `implementation-guard-adapter.md` | Optional mapping from Master governance state into external loop-guard tooling. |
 | `strategy-packet.md` | Strategy recommendation and proposed work order. |
 | `work-order.md` | Bounded implementation assignment. |
 | `token-strategy.md` | Master constraints and sub-agent self-optimization rules for token use. |
@@ -101,6 +106,8 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `state/learning-cycles.jsonl` | Append-only learning cycle records. |
 | `state/learning-updates.jsonl` | Append-only accepted learning proposal records. |
 | `state/learning-effectiveness.jsonl` | Append-only recurrence and effectiveness records. |
+| `state/governance-events.jsonl` | Append-only authority-required, acceptance-gate, and governance control events. |
+| `state/acceptance-gates.jsonl` | Append-only acceptance maturity gate state by scope. |
 | `state/schema-version.json` | Current schema version, migration history, and compatible tool version. |
 
 ## Operational CLI
@@ -215,6 +222,9 @@ python scripts/master_agent_tool.py worktree-close --state-dir <state-dir> --wor
 python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-dir> --worktree-id wt-task-1
 python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
 python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
+python scripts/master_agent_tool.py governance-lint --packet packets/work-order-a.md --packet-type work-order
+python scripts/master_agent_tool.py record-acceptance-gate --state-dir <state-dir> --scope-id TASK-1 --maturity diagnostic --status passed --evidence packets/task-record.md
+python scripts/master_agent_tool.py record-authority-required --state-dir <state-dir> --agent-id coding-1 --reason "owner boundary exceeded" --evidence packets/obstacle-recovery-packet.md --required-user-decision "approve wider owner or narrow task"
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"
@@ -358,20 +368,49 @@ The Master must check strategy sync before issuing implementation or review work
 
 `strategy-packet-lint` verifies required headings and filled Strategy fields before acceptance. `accept-strategy` runs the same validation before recording current state. `require-strategy-packet-before-work` verifies that the supplied packet is the current accepted packet, that the plan id matches `strategy-sync.md`, and that validation evidence exists. Treat a nonzero exit as a hard stop before launching a Coding, Review, or Policy Review sub-agent.
 
+## Governance Optimization Layer
+
+The governance layer converts the local-agent lessons into mechanical Master Agent controls. It is project-neutral and applies before sub-agent launch, before acceptance claims, and before blocked or authority-required states.
+
+Root authorization is non-escalating. A current user request, current goal, or user-approved plan may create the root grant. Strategy packets, repair records, task records, and learning records may narrow or sequence that grant, but they cannot add owners, file scopes, material behavior domains, autonomous-loop authority, or acceptance criteria. When the next required step exceeds the grant, use `record-authority-required` and stop the sub-agent until the missing decision exists.
+
+Material behavior domains must be declared in context packets, work orders, and receipts. The built-in domain names are `none`, `owner-internal-behavior`, `pipeline-order`, `batching-or-barrier-placement`, `persistence-or-checkpoint-timing`, `gui-event-timing`, `cancellation-or-failure-semantics`, and `default-or-fallback-behavior`. A packet that says no material behavior changed must declare `none`.
+
+Obstacle recovery is required before `blocked` or `authority_required`. The agent must name the first failing boundary, safe diagnostics attempted, in-scope alternatives attempted, remaining safe in-scope actions, external or authority condition, and smallest unblocking action. This prevents ordinary difficulty, timeouts, or a first failed attempt from being mislabeled as a terminal blocker.
+
+Heuristic admission is fail-closed. A work order that uses a heuristic must name the authorization, target-independent invariant, owning boundary, representative evidence, non-regression coverage, and failure or escape behavior. If any of those fields are missing, `governance-lint` fails.
+
+Representative workflow parity is required for readiness claims. Runtime, provider, performance, or production-readiness evidence must match the workspace, bootstrap path, mode, provider/model path, and key settings of the claim. If parity is missing, the packet must mark the result diagnostic-only.
+
+Acceptance maturity is monotonic by scope. Use `record-acceptance-gate` to record `diagnostic`, `focused_green`, `live_seam_green`, `representative_runtime_green`, `visual_accepted`, and `production_accepted`. A higher gate cannot pass until every lower gate has already passed for the same `scope-id`.
+
+Minimum governance loop:
+
+```bash
+python scripts/master_agent_tool.py governance-lint --packet packets/work-order.md --packet-type work-order
+python scripts/master_agent_tool.py record-acceptance-gate --state-dir <state-dir> --scope-id TASK-1 --maturity diagnostic --status passed --evidence packets/task-record.md
+python scripts/master_agent_tool.py record-authority-required --state-dir <state-dir> --agent-id coding-1 --reason "approved owner boundary exceeded" --evidence packets/obstacle-recovery-packet.md --required-user-decision "approve wider owner or narrow task"
+```
+
+Treat `state/governance-events.jsonl` and `state/acceptance-gates.jsonl` as replay sources. The Markdown packets explain the decision; the JSONL logs are the mechanical state.
+
 ## Hardened Production Operating Loop
 
 Use this loop for long-running Codex projects:
 
 1. Bootstrap or migrate state with `init`, `upgrade-state`, `migrate-state`, and `validate --strict`.
 2. Accept only validated Strategy packets; run `require-strategy-packet-before-work` before issuing Coding, Review, or Policy Review work.
-3. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
-4. Run `assess-parallelism` before launching more than one sub-agent.
-5. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
-6. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
-7. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
-8. Run `enforce-master-boundary` before finalizing any Master turn.
-9. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
-10. Record incidents and alert acknowledgements instead of erasing failures.
+3. Run `governance-lint` on context packets and work orders before launch.
+4. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
+5. Run `assess-parallelism` before launching more than one sub-agent.
+6. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
+7. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
+8. Record acceptance maturity with `record-acceptance-gate`; do not claim readiness above the highest passed gate.
+9. Use `record-authority-required` when the next needed action exceeds the root authorization envelope.
+10. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
+11. Run `enforce-master-boundary` before finalizing any Master turn.
+12. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
+13. Record incidents and alert acknowledgements instead of erasing failures.
 
 The operating loop is designed to fail closed. If the Master cannot prove current strategy, provider liveness, boundary compliance, packet completeness, or budget safety, it should stop work and create a remediation packet instead of continuing from chat memory.
 

@@ -32,6 +32,15 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_DIR = SKILL_ROOT / "assets" / "templates"
 DEFAULT_STATE_DIR = Path("docs") / "master-agent"
 MONITORED_STATES = {"starting", "active", "validating"}
+AGENT_STATES = [
+    "starting",
+    "active",
+    "validating",
+    "blocked",
+    "authority_required",
+    "complete",
+    "stopping",
+]
 SAFETY_AUTONOMOUS_ACTIONS = {
     "read-state",
     "validate-state",
@@ -49,6 +58,10 @@ SAFETY_AUTONOMOUS_ACTIONS = {
     "learning-proposal-lint",
     "accept-learning-proposal",
     "record-learning-effectiveness",
+    "lint-governance-packet",
+    "governance-lint",
+    "record-authority-required",
+    "record-acceptance-gate",
 }
 SAFETY_REMEDIATION_ACTIONS = {
     "reinforce-context",
@@ -77,14 +90,49 @@ SAFETY_HARD_BUDGET_IMPACT = 20_000
 USAGE_SOURCES = ("measured", "estimated", "self-reported")
 USAGE_CONFIDENCES = ("low", "medium", "high")
 LARGE_CONTINUATION_TOKENS = 5_000
-CURRENT_SCHEMA_VERSION = "1.1"
+CURRENT_SCHEMA_VERSION = "1.2"
 ORDERED_MIGRATIONS = [
     "0001-base-state",
     "0002-runtime-session-observability",
     "0003-learning-layer",
+    "0004-governance-optimization",
 ]
 DEFAULT_CODEX_APP_READ_MAX_MINUTES = 60.0
 DEFAULT_WORKTREE_EVIDENCE_MAX_MINUTES = 60.0
+
+ROOT_AUTHORITY_SOURCE_KINDS = {
+    "current-user-request",
+    "current-goal",
+    "user-approved-plan",
+}
+
+AUTHORITY_REQUIRED_STATUS = "authority_required"
+
+MATERIAL_BEHAVIOR_DOMAINS = {
+    "none",
+    "owner-internal-behavior",
+    "pipeline-order",
+    "batching-or-barrier-placement",
+    "persistence-or-checkpoint-timing",
+    "gui-event-timing",
+    "cancellation-or-failure-semantics",
+    "default-or-fallback-behavior",
+}
+
+ACCEPTANCE_MATURITY_ORDER = [
+    "diagnostic",
+    "focused_green",
+    "live_seam_green",
+    "representative_runtime_green",
+    "visual_accepted",
+    "production_accepted",
+]
+ACCEPTANCE_GATE_STATUSES = {
+    "pending",
+    "passed",
+    "failed",
+    "inconclusive",
+}
 
 PREDECESSOR_STATE_HEADINGS = [
     "# Predecessor State Packet",
@@ -156,13 +204,21 @@ STRATEGY_PACKET_REQUIRED_FIELDS = {
     ],
     "## Proposed Work Order": [
         "Proposed objective",
+        "Root authorization source",
+        "Root authorization grant id",
         "Allowed scope",
+        "Approved material behavior domains",
+        "Declared material behavior domains",
         "Worktree mode",
         "Worktree id",
         "Base branch",
         "Local mutation policy",
         "Remote mutation policy",
         "Forbidden changes",
+        "Acceptance maturity required",
+        "Representative workflow required",
+        "Heuristic admission required",
+        "Task record required",
         "Validation required",
         "Expected artifacts",
         "Stop conditions",
@@ -177,6 +233,127 @@ STRATEGY_PACKET_REQUIRED_FIELDS = {
         "Compression or narrowing trigger",
         "Token risks",
     ],
+}
+
+GOVERNANCE_PACKET_REQUIRED_FIELDS = {
+    "context-packet": {
+        "## Root Authorization": [
+            "Source kind",
+            "Source ref",
+            "Grant id",
+            "Objective",
+            "Approved owners",
+            "Approved file scopes",
+            "Approved material behavior domains",
+            "Explicit exclusions",
+        ],
+        "## Material Behavior Domains": [
+            "Declared material behavior domains",
+            "No material behavior change",
+        ],
+        "## Acceptance Gates": [
+            "Required maturity gates",
+            "Current maturity",
+            "Lower gates satisfied",
+            "Evidence artifact",
+        ],
+    },
+    "work-order": {
+        "## Root Authorization": [
+            "Source kind",
+            "Source ref",
+            "Grant id",
+            "Approved owners",
+            "Approved file scopes",
+            "Approved material behavior domains",
+            "Forbidden behavior domains",
+        ],
+        "## Material Behavior Domains": [
+            "Declared material behavior domains",
+            "No material behavior change",
+        ],
+        "## Heuristic Admission": [
+            "Heuristic used",
+        ],
+        "## Representative Workflow": [
+            "Claim scope",
+            "Workspace",
+            "Bootstrap path",
+            "Mode",
+            "Provider or model path",
+            "Key settings",
+            "Representative parity",
+            "Diagnostic-only if mismatch",
+        ],
+        "## Acceptance Gates": [
+            "Required maturity gates",
+            "Current maturity",
+            "Lower gates satisfied",
+            "Evidence artifact",
+        ],
+        "## Task Record": [
+            "Task record required",
+            "Record path or reason",
+        ],
+    },
+    "coding-receipt": {
+        "## Authority And Behavior": [
+            "Grant id",
+            "Observed owner",
+            "Observed files inside envelope",
+            "Observed material behavior domains",
+            "No material behavior change",
+            "Authority status",
+        ],
+        "## Acceptance Gates": [
+            "Current maturity",
+            "Lower gates satisfied",
+            "Evidence artifact",
+        ],
+        "## Representative Workflow": [
+            "Claim scope",
+            "Representative parity",
+            "Diagnostic-only if mismatch",
+        ],
+    },
+    "review-verdict": {
+        "## Acceptance Gate Review": [
+            "Claimed maturity",
+            "Highest supported maturity",
+            "Lower gates satisfied",
+            "Representative workflow parity checked",
+            "Evidence artifact",
+        ],
+    },
+    "policy-verdict": {
+        "## Governance Review": [
+            "Root authorization checked",
+            "Material behavior domains checked",
+            "Heuristic admission checked",
+            "Representative workflow checked",
+            "Authority status",
+        ],
+    },
+    "obstacle-recovery-packet": {
+        "## Obstacle Recovery": [
+            "Status requested",
+            "First failing boundary",
+            "Safe diagnostics attempted",
+            "In-scope alternatives attempted",
+            "Remaining safe in-scope actions",
+            "External or authority condition",
+            "Smallest unblocking action",
+        ],
+    },
+    "acceptance-gate": {
+        "## Gate State": [
+            "Scope id",
+            "Maturity",
+            "Status",
+            "Evidence artifact",
+            "Lower gates satisfied",
+        ],
+    },
 }
 
 LEARNING_PROPOSAL_HEADINGS = [
@@ -264,6 +441,10 @@ UNFILLED_PACKET_VALUES = {
     "create | extend | validator | skip | needs-more-evidence",
     "project-policy-pack | agents-md | skill | plugin-validator | template | memory-note | skip",
     "not-yet-measured | recurrence-prevented | recurrence-detected | needs-more-evidence",
+    "current-user-request | current-goal | user-approved-plan",
+    "diagnostic | focused_green | live_seam_green | representative_runtime_green | visual_accepted | production_accepted",
+    "pending | passed | failed | inconclusive",
+    "owner-internal-behavior | pipeline-order | batching-or-barrier-placement | persistence-or-checkpoint-timing | gui-event-timing | cancellation-or-failure-semantics | default-or-fallback-behavior",
 }
 
 DEFAULT_ROLES = {
@@ -576,6 +757,257 @@ def validate_learning_proposal(path: Path) -> list[str]:
     return errors
 
 
+def split_list_field(value: str | None) -> list[str]:
+    if not value:
+        return []
+    normalized = value.strip()
+    if normalized.lower() in {"none", "n/a"}:
+        return ["none"]
+    parts = re.split(r"[,;]", normalized)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def field_value(
+    sections: dict[str, str],
+    heading: str,
+    field_name: str,
+) -> str:
+    return markdown_bullet_field(sections.get(heading, ""), field_name) or ""
+
+
+def validate_yes_no(
+    errors: list[str],
+    value: str,
+    label: str,
+) -> str:
+    normalized = value.lower()
+    if normalized not in {"yes", "no"}:
+        errors.append(f"invalid field: {label} must be yes or no")
+    return normalized
+
+
+def validate_material_domains(
+    errors: list[str],
+    value: str,
+    label: str,
+) -> list[str]:
+    domains = split_list_field(value)
+    unknown = [domain for domain in domains if domain not in MATERIAL_BEHAVIOR_DOMAINS]
+    if unknown:
+        errors.append(
+            f"invalid field: {label} contains unknown material behavior domains: "
+            + ", ".join(unknown)
+        )
+    if "none" in domains and len(domains) > 1:
+        errors.append(f"invalid field: {label} cannot combine none with other domains")
+    return domains
+
+
+def validate_maturity(
+    errors: list[str],
+    value: str,
+    label: str,
+) -> str:
+    if value not in ACCEPTANCE_MATURITY_ORDER:
+        errors.append(
+            f"invalid field: {label} must be one of "
+            + ", ".join(ACCEPTANCE_MATURITY_ORDER)
+        )
+    return value
+
+
+def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
+    errors: list[str] = []
+    if packet_type not in GOVERNANCE_PACKET_REQUIRED_FIELDS:
+        return [f"unknown governance packet type: {packet_type}"]
+    if not path.exists():
+        return [f"governance packet does not exist: {path}"]
+    text = path.read_text(encoding="utf-8")
+    sections = parse_markdown_sections(text)
+    requirements = GOVERNANCE_PACKET_REQUIRED_FIELDS[packet_type]
+    for heading, field_names in requirements.items():
+        section_text = sections.get(heading, "")
+        if not section_text:
+            errors.append(f"missing heading: {heading}")
+            continue
+        if not section_has_content(section_text):
+            errors.append(f"empty required section: {heading}")
+            continue
+        for field_name in field_names:
+            value = markdown_bullet_field(section_text, field_name)
+            if not field_is_filled(value):
+                errors.append(f"unfilled field: {heading} / {field_name}")
+
+    for heading in ["## Root Authorization"]:
+        if heading in sections:
+            source_kind = field_value(sections, heading, "Source kind")
+            if source_kind and source_kind not in ROOT_AUTHORITY_SOURCE_KINDS:
+                errors.append(
+                    "invalid field: ## Root Authorization / Source kind must be one of "
+                    + ", ".join(sorted(ROOT_AUTHORITY_SOURCE_KINDS))
+                )
+            for label, field_name in [
+                ("Approved material behavior domains", "Approved material behavior domains"),
+                ("Forbidden behavior domains", "Forbidden behavior domains"),
+            ]:
+                value = field_value(sections, heading, field_name)
+                if value:
+                    validate_material_domains(errors, value, f"{heading} / {label}")
+
+    material_heading = "## Material Behavior Domains"
+    if material_heading in sections:
+        domains = validate_material_domains(
+            errors,
+            field_value(sections, material_heading, "Declared material behavior domains"),
+            f"{material_heading} / Declared material behavior domains",
+        )
+        no_material = validate_yes_no(
+            errors,
+            field_value(sections, material_heading, "No material behavior change"),
+            f"{material_heading} / No material behavior change",
+        )
+        if no_material == "yes" and domains != ["none"]:
+            errors.append(
+                "invalid field: ## Material Behavior Domains / No material behavior change "
+                "requires declared domains to be none"
+            )
+        if no_material == "no" and domains == ["none"]:
+            errors.append(
+                "invalid field: ## Material Behavior Domains / No material behavior change "
+                "is no but declared domains are none"
+            )
+
+    authority_behavior_heading = "## Authority And Behavior"
+    if authority_behavior_heading in sections:
+        domains = validate_material_domains(
+            errors,
+            field_value(sections, authority_behavior_heading, "Observed material behavior domains"),
+            f"{authority_behavior_heading} / Observed material behavior domains",
+        )
+        no_material = validate_yes_no(
+            errors,
+            field_value(sections, authority_behavior_heading, "No material behavior change"),
+            f"{authority_behavior_heading} / No material behavior change",
+        )
+        if no_material == "yes" and domains != ["none"]:
+            errors.append(
+                "invalid field: ## Authority And Behavior / No material behavior change "
+                "requires observed domains to be none"
+            )
+        authority_status = field_value(sections, authority_behavior_heading, "Authority status")
+        if authority_status and authority_status not in {"inside-envelope", AUTHORITY_REQUIRED_STATUS}:
+            errors.append(
+                "invalid field: ## Authority And Behavior / Authority status "
+                "must be inside-envelope or authority_required"
+            )
+
+    heuristic_heading = "## Heuristic Admission"
+    if heuristic_heading in sections:
+        heuristic_used = validate_yes_no(
+            errors,
+            field_value(sections, heuristic_heading, "Heuristic used"),
+            f"{heuristic_heading} / Heuristic used",
+        )
+        if heuristic_used == "yes":
+            for field_name in [
+                "Authorized by",
+                "Target-independent invariant",
+                "Owning boundary",
+                "Representative evidence",
+                "Non-regression coverage",
+                "Failure or escape behavior",
+            ]:
+                value = markdown_bullet_field(sections[heuristic_heading], field_name)
+                if not field_is_filled(value):
+                    errors.append(f"unfilled field: {heuristic_heading} / {field_name}")
+
+    representative_heading = "## Representative Workflow"
+    if representative_heading in sections:
+        parity = validate_yes_no(
+            errors,
+            field_value(sections, representative_heading, "Representative parity"),
+            f"{representative_heading} / Representative parity",
+        )
+        diagnostic = validate_yes_no(
+            errors,
+            field_value(sections, representative_heading, "Diagnostic-only if mismatch"),
+            f"{representative_heading} / Diagnostic-only if mismatch",
+        )
+        if parity == "no" and diagnostic != "yes":
+            errors.append(
+                "invalid field: ## Representative Workflow / non-representative evidence "
+                "must be marked diagnostic-only"
+            )
+
+    for heading, maturity_field in [
+        ("## Acceptance Gates", "Current maturity"),
+        ("## Acceptance Gate Review", "Highest supported maturity"),
+        ("## Gate State", "Maturity"),
+    ]:
+        if heading in sections:
+            maturity = validate_maturity(
+                errors,
+                field_value(sections, heading, maturity_field),
+                f"{heading} / {maturity_field}",
+            )
+            lower = field_value(sections, heading, "Lower gates satisfied")
+            if lower:
+                lower_value = validate_yes_no(
+                    errors,
+                    lower,
+                    f"{heading} / Lower gates satisfied",
+                )
+                if maturity in ACCEPTANCE_MATURITY_ORDER[1:] and lower_value != "yes":
+                    errors.append(
+                        f"invalid field: {heading} / higher maturity requires lower gates satisfied"
+                    )
+            status = field_value(sections, heading, "Status")
+            if status and status not in ACCEPTANCE_GATE_STATUSES:
+                errors.append(
+                    f"invalid field: {heading} / Status must be one of "
+                    + ", ".join(sorted(ACCEPTANCE_GATE_STATUSES))
+                )
+
+    policy_heading = "## Governance Review"
+    if policy_heading in sections:
+        authority_status = field_value(sections, policy_heading, "Authority status")
+        if authority_status and authority_status not in {
+            "inside-envelope",
+            "needs-user-decision",
+            AUTHORITY_REQUIRED_STATUS,
+        }:
+            errors.append(
+                "invalid field: ## Governance Review / Authority status must be "
+                "inside-envelope, needs-user-decision, or authority_required"
+            )
+
+    obstacle_heading = "## Obstacle Recovery"
+    if obstacle_heading in sections:
+        status_requested = field_value(sections, obstacle_heading, "Status requested")
+        if status_requested and status_requested not in {
+            "continue",
+            "reassessment_required",
+            "blocked",
+            AUTHORITY_REQUIRED_STATUS,
+        }:
+            errors.append(
+                "invalid field: ## Obstacle Recovery / Status requested must be "
+                "continue, reassessment_required, blocked, or authority_required"
+            )
+        if status_requested in {"blocked", AUTHORITY_REQUIRED_STATUS}:
+            for field_name in [
+                "Safe diagnostics attempted",
+                "In-scope alternatives attempted",
+                "Remaining safe in-scope actions",
+                "External or authority condition",
+                "Smallest unblocking action",
+            ]:
+                value = markdown_bullet_field(sections[obstacle_heading], field_name)
+                if not field_is_filled(value):
+                    errors.append(f"unfilled field: {obstacle_heading} / {field_name}")
+    return errors
+
+
 def yaml_quoted(value: object) -> str:
     return json.dumps(" ".join(str(value).split()))
 
@@ -641,6 +1073,8 @@ def ensure_state_storage(state_dir: Path) -> None:
     learning_cycles_path = storage_dir / "learning-cycles.jsonl"
     learning_updates_path = storage_dir / "learning-updates.jsonl"
     learning_effectiveness_path = storage_dir / "learning-effectiveness.jsonl"
+    governance_events_path = storage_dir / "governance-events.jsonl"
+    acceptance_gates_path = storage_dir / "acceptance-gates.jsonl"
     schema_path = storage_dir / "schema-version.json"
     if not agents_path.exists():
         atomic_write_text(agents_path, "{}\n")
@@ -698,6 +1132,10 @@ def ensure_state_storage(state_dir: Path) -> None:
         atomic_write_text(learning_updates_path, "")
     if not learning_effectiveness_path.exists():
         atomic_write_text(learning_effectiveness_path, "")
+    if not governance_events_path.exists():
+        atomic_write_text(governance_events_path, "")
+    if not acceptance_gates_path.exists():
+        atomic_write_text(acceptance_gates_path, "")
     if not schema_path.exists():
         atomic_write_json(schema_path, default_schema_version())
 
@@ -1331,6 +1769,8 @@ def _state_file_paths(state_dir: Path) -> list[Path]:
         state_dir / "state" / "learning-cycles.jsonl",
         state_dir / "state" / "learning-updates.jsonl",
         state_dir / "state" / "learning-effectiveness.jsonl",
+        state_dir / "state" / "governance-events.jsonl",
+        state_dir / "state" / "acceptance-gates.jsonl",
         state_dir / "state" / "schema-version.json",
     ]
 
@@ -4457,6 +4897,125 @@ def append_learning_effectiveness(state_dir: Path, entry: dict) -> None:
     append_jsonl_locked(state_dir / "state" / "learning-effectiveness.jsonl", entry)
 
 
+def append_governance_event(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "governance-events.jsonl", entry)
+
+
+def append_acceptance_gate(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "acceptance-gates.jsonl", entry)
+
+
+def latest_acceptance_status_by_scope(state_dir: Path, scope_id: str) -> dict[str, str]:
+    latest: dict[str, str] = {}
+    for entry in load_jsonl_entries(state_dir / "state" / "acceptance-gates.jsonl"):
+        if str(entry.get("scope_id") or "") != scope_id:
+            continue
+        maturity = str(entry.get("maturity") or "")
+        status = str(entry.get("status") or "")
+        if maturity:
+            latest[maturity] = status
+    return latest
+
+
+def command_governance_lint(args: argparse.Namespace) -> int:
+    packet = Path(args.packet).resolve()
+    errors = validate_governance_packet(packet, args.packet_type)
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    print(f"Governance packet is valid: {packet}")
+    return 0
+
+
+def command_record_authority_required(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    timestamp = format_time(parse_time(args.at))
+    agents = load_agents(state_dir)
+    if args.agent_id not in agents:
+        print(f"Unknown agent id: {args.agent_id}", file=sys.stderr)
+        return 1
+    agents[args.agent_id]["status"] = AUTHORITY_REQUIRED_STATUS
+    agents[args.agent_id]["last_action"] = "authority boundary reached"
+    agents[args.agent_id]["next_action"] = args.required_user_decision
+    agents[args.agent_id]["risk"] = args.reason
+    save_agents(state_dir, agents)
+    render_running_agents(state_dir, agents)
+    event = {
+        "at": timestamp,
+        "event_type": "authority-required",
+        "agent_id": args.agent_id,
+        "reason": args.reason,
+        "evidence": args.evidence,
+        "required_user_decision": args.required_user_decision,
+    }
+    append_governance_event(state_dir, event)
+    append_event_log(
+        state_dir=state_dir,
+        event_type="authority-required",
+        related_packet="governance-events.jsonl",
+        summary=f"{args.agent_id}: {args.reason}",
+        evidence=args.evidence,
+        ledger_update=f"{args.agent_id} marked authority_required",
+        next_action=args.required_user_decision,
+        at=timestamp,
+    )
+    print(f"Marked {args.agent_id} authority_required")
+    return 0
+
+
+def command_record_acceptance_gate(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    if args.status == "passed":
+        maturity_index = ACCEPTANCE_MATURITY_ORDER.index(args.maturity)
+        lower_gates = ACCEPTANCE_MATURITY_ORDER[:maturity_index]
+        latest = latest_acceptance_status_by_scope(state_dir, args.scope_id)
+        missing_or_unpassed = [
+            gate for gate in lower_gates if latest.get(gate) != "passed"
+        ]
+        if missing_or_unpassed:
+            print(
+                "Cannot pass acceptance gate before lower gates pass: "
+                + ", ".join(missing_or_unpassed),
+                file=sys.stderr,
+            )
+            return 1
+    timestamp = format_time(parse_time(args.at))
+    entry = {
+        "at": timestamp,
+        "scope_id": args.scope_id,
+        "maturity": args.maturity,
+        "status": args.status,
+        "evidence": args.evidence,
+    }
+    append_acceptance_gate(state_dir, entry)
+    append_governance_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event_type": "acceptance-gate",
+            "scope_id": args.scope_id,
+            "maturity": args.maturity,
+            "status": args.status,
+            "evidence": args.evidence,
+        },
+    )
+    append_event_log(
+        state_dir=state_dir,
+        event_type="acceptance-gate",
+        related_packet="acceptance-gates.jsonl",
+        summary=f"{args.scope_id}: {args.maturity} {args.status}",
+        evidence=args.evidence,
+        ledger_update="acceptance gate state recorded",
+        next_action="continue only within supported maturity",
+        at=timestamp,
+    )
+    print(f"Recorded acceptance gate {args.scope_id} {args.maturity}={args.status}")
+    return 0
+
+
 def render_correction_ledger(state_dir: Path) -> None:
     corrections = load_jsonl_entries(state_dir / "state" / "learning-corrections.jsonl")
     failure_counts: dict[str, int] = {}
@@ -5028,6 +5587,8 @@ def command_telemetry_summary(args: argparse.Namespace) -> int:
     corrections = load_jsonl_entries(state_dir / "state" / "learning-corrections.jsonl")
     learning_updates = load_jsonl_entries(state_dir / "state" / "learning-updates.jsonl")
     learning_checks = load_jsonl_entries(state_dir / "state" / "learning-effectiveness.jsonl")
+    governance_events = load_jsonl_entries(state_dir / "state" / "governance-events.jsonl")
+    acceptance_gates = load_jsonl_entries(state_dir / "state" / "acceptance-gates.jsonl")
     recurrence_count = sum(
         1 for check in learning_checks if check.get("status") == "recurrence-detected"
     )
@@ -5039,6 +5600,8 @@ def command_telemetry_summary(args: argparse.Namespace) -> int:
     print(f"Learning corrections: {len(corrections)}")
     print(f"Accepted learning updates: {len(learning_updates)}")
     print(f"Learning recurrences: {recurrence_count}")
+    print(f"Governance events: {len(governance_events)}")
+    print(f"Acceptance gates: {len(acceptance_gates)}")
     print(f"Runtime state: {runtime.get('supervisor_state')}")
     print(f"Last supervisor check: {runtime.get('last_check_at', '')}")
     return 1 if alerts else 0
@@ -5693,7 +6256,7 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--task-id", required=True)
     register.add_argument("--objective", required=True)
     register.add_argument("--scope", required=True)
-    register.add_argument("--status", default="active", choices=["starting", "active", "validating", "blocked", "complete", "stopping"])
+    register.add_argument("--status", default="active", choices=AGENT_STATES)
     register.add_argument("--token-budget", type=int)
     register.add_argument("--max-heartbeats", type=int)
     register.add_argument("--plan-id")
@@ -5703,7 +6266,7 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat = subparsers.add_parser("heartbeat", help="Record a sub-agent heartbeat.")
     heartbeat.add_argument("--state-dir", required=True)
     heartbeat.add_argument("--agent-id", required=True)
-    heartbeat.add_argument("--state", required=True, choices=["starting", "active", "validating", "blocked", "complete", "stopping"])
+    heartbeat.add_argument("--state", required=True, choices=AGENT_STATES)
     heartbeat.add_argument("--current", required=True)
     heartbeat.add_argument("--last-action", required=True)
     heartbeat.add_argument("--next-action", required=True)
@@ -6029,6 +6592,33 @@ def build_parser() -> argparse.ArgumentParser:
     assess_parallel.add_argument("--work-order", action="append", required=True)
     assess_parallel.add_argument("--output")
     assess_parallel.set_defaults(func=command_assess_parallelism)
+
+    governance_lint = subparsers.add_parser("governance-lint", help="Validate authority, behavior-domain, heuristic, and maturity fields in a packet.")
+    governance_lint.add_argument("--packet", required=True)
+    governance_lint.add_argument(
+        "--packet-type",
+        required=True,
+        choices=sorted(GOVERNANCE_PACKET_REQUIRED_FIELDS),
+    )
+    governance_lint.set_defaults(func=command_governance_lint)
+
+    authority_required = subparsers.add_parser("record-authority-required", help="Freeze an agent at an authority boundary and record the required decision.")
+    authority_required.add_argument("--state-dir", required=True)
+    authority_required.add_argument("--agent-id", required=True)
+    authority_required.add_argument("--reason", required=True)
+    authority_required.add_argument("--evidence", required=True)
+    authority_required.add_argument("--required-user-decision", required=True)
+    authority_required.add_argument("--at")
+    authority_required.set_defaults(func=command_record_authority_required)
+
+    acceptance_gate = subparsers.add_parser("record-acceptance-gate", help="Record monotonic acceptance maturity for a scope.")
+    acceptance_gate.add_argument("--state-dir", required=True)
+    acceptance_gate.add_argument("--scope-id", required=True)
+    acceptance_gate.add_argument("--maturity", required=True, choices=ACCEPTANCE_MATURITY_ORDER)
+    acceptance_gate.add_argument("--status", required=True, choices=sorted(ACCEPTANCE_GATE_STATUSES))
+    acceptance_gate.add_argument("--evidence", required=True)
+    acceptance_gate.add_argument("--at")
+    acceptance_gate.set_defaults(func=command_record_acceptance_gate)
 
     learning_correction = subparsers.add_parser("record-learning-correction", help="Record a correction or failure pattern for later distillation.")
     learning_correction.add_argument("--state-dir", required=True)

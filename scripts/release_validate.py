@@ -157,6 +157,38 @@ def worktree_control_step() -> tuple[str, int, str]:
     return "worktree control surface", 0, ""
 
 
+def governance_control_step() -> tuple[str, int, str]:
+    required_files = [
+        ROOT / "assets" / "templates" / "authority-envelope.md",
+        ROOT / "assets" / "templates" / "obstacle-recovery-packet.md",
+        ROOT / "assets" / "templates" / "acceptance-gate.md",
+        ROOT / "assets" / "templates" / "implementation-guard-adapter.md",
+        ROOT / "scripts" / "master_agent_tool.py",
+        ROOT / "references" / "master-agent-system.md",
+        ROOT / "README.md",
+        ROOT / "SKILL.md",
+    ]
+    missing = [str(path.relative_to(ROOT)) for path in required_files if not path.exists()]
+    if missing:
+        return "governance control surface", 1, "missing files: " + ", ".join(missing)
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in required_files)
+    required_terms = [
+        "governance-lint",
+        "record-authority-required",
+        "record-acceptance-gate",
+        "state/governance-events.jsonl",
+        "state/acceptance-gates.jsonl",
+        "authority_required",
+        "diagnostic",
+        "live_seam_green",
+        "production_accepted",
+    ]
+    missing_terms = [term for term in required_terms if term not in combined]
+    if missing_terms:
+        return "governance control surface", 1, "missing terms: " + ", ".join(missing_terms)
+    return "governance control surface", 0, ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate Master Agent System release readiness.")
     parser.add_argument("--quick-validate", help="Path to Codex skill quick_validate.py")
@@ -189,6 +221,7 @@ def main() -> int:
         checks.append(run_step("template state pack", [sys.executable, "scripts/validate_state_pack.py", "assets/templates"]))
         checks.append(run_step("operating-system soak", [sys.executable, "scripts/soak_validate.py", "--quick"]))
         checks.append(worktree_control_step())
+        checks.append(governance_control_step())
 
         with tempfile.TemporaryDirectory(prefix="master-agent-release-") as tmp:
             tmp_path = Path(tmp)

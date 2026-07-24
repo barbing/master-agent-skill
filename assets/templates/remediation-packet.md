@@ -46,3 +46,10 @@
 - Stop reason:
 - Required review:
 - Next safe action:
+
+## Authority Required
+
+- Trigger:
+- First failing authority boundary:
+- Safe diagnostics attempted:
+- Smallest unblocking action:

@@ -43,13 +43,21 @@
 ## Proposed Work Order
 
 - Proposed objective:
+- Root authorization source:
+- Root authorization grant id:
 - Allowed scope:
+- Approved material behavior domains:
+- Declared material behavior domains:
 - Worktree mode:
 - Worktree id:
 - Base branch:
 - Local mutation policy:
 - Remote mutation policy:
 - Forbidden changes:
+- Acceptance maturity required:
+- Representative workflow required: yes | no
+- Heuristic admission required: yes | no
+- Task record required: yes | no
 - Validation required:
 - Expected artifacts:
 - Stop conditions:

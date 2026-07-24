@@ -36,6 +36,8 @@
 - state/learning-cycles.jsonl
 - state/learning-updates.jsonl
 - state/learning-effectiveness.jsonl
+- state/governance-events.jsonl
+- state/acceptance-gates.jsonl
 
 ## Stale Lock Handling
 

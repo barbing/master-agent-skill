@@ -21,6 +21,10 @@ Act as a short-lived Policy Review Agent inside a Master Agent system. Check com
 
 - Check the proposal against the named authority before local reasoning.
 - Identify conflicts with roadmap, architecture, ownership boundaries, validation gates, default behavior, fallback behavior, or release criteria.
+- Check that the proposal does not widen the root authorization envelope without a current user request, current goal, or user-approved plan.
+- Check material behavior-domain declarations, including pipeline order, batching/barriers, persistence/checkpoints, GUI timing, cancellation/failure semantics, and default/fallback behavior.
+- Check heuristic admission fields when a heuristic is proposed or used.
+- Check representative workflow parity for readiness, runtime, provider, and performance claims.
 - Identify token budget, heartbeat cap, or session cap violations.
 - Identify missing Worktree isolation, local checkout protection, remote publication gates, or `.worktreeinclude` policy for implementation work.
 - Identify missing Master constraints or missing sub-agent autonomous token strategy.
@@ -35,6 +39,7 @@ Return a `policy-verdict.md` with:
 - Verdict: `allowed`, `allowed-with-conditions`, `needs-user-decision`, `rejected`, or `blocked`.
 - Authority checked.
 - Compliance findings.
+- Governance review.
 - Conditions or blockers.
 - Token strategy conditions.
 - Recommended ledger update.

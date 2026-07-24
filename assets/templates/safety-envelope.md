@@ -11,6 +11,9 @@
 - monitor-heartbeats
 - monitor-budget
 - recommend-token-strategy
+- governance-lint
+- record-authority-required
+- record-acceptance-gate
 
 ## Requires Human Decision
 

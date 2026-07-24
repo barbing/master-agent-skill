@@ -13,11 +13,32 @@
 | --- | --- | --- |
 |  |  |  |
 
+## Authority And Behavior
+
+- Grant id:
+- Observed owner:
+- Observed files inside envelope: yes | no
+- Observed material behavior domains: none
+- No material behavior change: yes
+- Authority status: inside-envelope | authority_required
+
 ## Validation
 
 | Command Or Inspection | Result | Evidence |
 | --- | --- | --- |
 |  |  |  |
+
+## Acceptance Gates
+
+- Current maturity: diagnostic
+- Lower gates satisfied: yes
+- Evidence artifact:
+
+## Representative Workflow
+
+- Claim scope:
+- Representative parity: yes | no
+- Diagnostic-only if mismatch: yes | no
 
 ## Artifacts
 

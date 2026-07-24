@@ -15,6 +15,23 @@
 - Authority docs:
 - Accepted decisions:
 
+## Root Authorization
+
+- Source kind: current-user-request | current-goal | user-approved-plan
+- Source ref:
+- Grant id:
+- Objective:
+- Approved owners:
+- Approved file scopes:
+- Approved material behavior domains: none
+- Explicit exclusions:
+
+## Material Behavior Domains
+
+- Declared material behavior domains: none
+- No material behavior change: yes
+- Domain rationale:
+
 ## Scope
 
 - Allowed files/modules/artifacts:
@@ -32,6 +49,13 @@
 - Required artifacts:
 - Required inspection:
 - Performance or quality threshold:
+
+## Acceptance Gates
+
+- Required maturity gates: diagnostic
+- Current maturity: diagnostic
+- Lower gates satisfied: yes
+- Evidence artifact:
 
 ## Token Budget
 

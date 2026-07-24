@@ -36,6 +36,11 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Token strategy is required | Every project should set a project budget, per-agent budget when possible, heartbeat/session caps, and a token strategy before spawning sub-agents. |
 | Worktrees isolate implementation | Plan and confirm a Worktree before implementation sessions when isolation is needed; do not mutate the user's local checkout or remote branches without an explicit merge/release gate. |
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
+| Root authority is non-escalating | A plan or repair record may narrow or sequence work, but it cannot widen the original user grant, approved owners, file scopes, or material behavior domains. |
+| Material behavior is declared | Every context packet, work order, and receipt declares whether it touches pipeline order, batching/barriers, persistence/checkpoints, GUI timing, cancellation/failure semantics, or default/fallback behavior. |
+| Heuristics require admission | A heuristic is allowed only when the packet names authorization, target-independent invariant, owning boundary, representative evidence, non-regression coverage, and failure behavior. |
+| Acceptance maturity is monotonic | Do not claim a higher maturity gate until all lower gates are recorded as passed for the same scope. |
+| Authority stops are explicit | When the next action needs a wider grant or user decision, mark the agent `authority_required` and record a governance event. |
 | Review is separate | Coding receipts are not accepted until reviewed, unless the user explicitly chooses to skip review. |
 | Rotation is strict | Launch a successor only from a validated predecessor-state packet, except explicit emergency recovery. |
 | Learning is governed | Corrections become durable behavior only through a correction record, learning cycle, linted learning proposal, acceptance event, and recurrence check. |
@@ -63,15 +68,17 @@ Define custom roles only when a project has a recurring or specialized responsib
 4. Check `role-catalog.md` and decide whether the next step fits an active role, needs a role proposal, or should remain direct ledger maintenance.
 5. Accept only complete Strategy packets. `accept-strategy` runs Strategy packet validation and records validation evidence; `require-strategy-packet-before-work` verifies that evidence before Coding, Review, or Policy Review work.
 6. For implementation work, plan an isolated Worktree with `worktree-plan`, validate `.worktreeinclude` when ignored local files are needed, confirm provider evidence with `worktree-confirm-create`, and bind the session with `worktree-assign-session`.
-7. Create a context packet or work order with `new-packet`, then send it to the target role agent.
-8. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
-9. Register the running sub-agent and require heartbeats plus token usage reports.
-10. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, and `recommend-token-strategy` until the agent completes, blocks, or drifts.
-11. Accept, reject, or request clarification on the return packet.
-12. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
-13. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
-14. Update the master ledger and event log only after acceptance.
-15. Derive the next action from the updated ledger, not from conversational momentum.
+7. Create a context packet or work order with `new-packet`, fill the root authorization envelope, material behavior domains, representative workflow fields, acceptance gates, and heuristic admission fields, then run `governance-lint`.
+8. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
+9. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
+10. Register the running sub-agent and require heartbeats plus token usage reports.
+11. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, and `recommend-token-strategy` until the agent completes, blocks, drifts, or needs authority.
+12. Use `record-authority-required` when the next necessary action exceeds the root authorization envelope.
+13. Accept, reject, or request clarification on the return packet.
+14. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
+15. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
+16. Update the master ledger and event log only after acceptance.
+17. Derive the next action from the updated ledger, not from conversational momentum.
 
 ## Agent Selection
 
@@ -190,6 +197,9 @@ python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --age
 python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-app-1 --successor-agent-id coding-app-2 --reason attention-drift --provider codex-app --predecessor-state-packet packets/coding-app-1-predecessor-state-packet.md
 python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
 python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
+python scripts/master_agent_tool.py governance-lint --packet packets/work-order-a.md --packet-type work-order
+python scripts/master_agent_tool.py record-acceptance-gate --state-dir <state-dir> --scope-id TASK-1 --maturity diagnostic --status passed --evidence packets/task-record.md
+python scripts/master_agent_tool.py record-authority-required --state-dir <state-dir> --agent-id coding-1 --reason "owner boundary exceeded" --evidence packets/obstacle-recovery-packet.md --required-user-decision "approve wider owner or narrow task"
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
 python scripts/master_agent_tool.py acknowledge-alert --state-dir <state-dir> --alert-id <alert-id> --note "operator reviewed"
@@ -243,6 +253,7 @@ The state pack contains:
 - `running-agents.md`
 - `role-catalog.md`
 - `role-proposal.md`
+- `authority-envelope.md`
 - `master-boundary.md`
 - `strategy-sync.md`
 - `anomaly-log.md`
@@ -251,6 +262,10 @@ The state pack contains:
 - `heartbeat-packet.md`
 - `remediation-packet.md`
 - `predecessor-state-packet.md`
+- `obstacle-recovery-packet.md`
+- `acceptance-gate.md`
+- `task-record.md`
+- `implementation-guard-adapter.md`
 - `runtime-supervisor.md`
 - `runtime-status.md`
 - `runtime-deployment.md`
@@ -285,6 +300,8 @@ The state pack contains:
 - `state/learning-cycles.jsonl`
 - `state/learning-updates.jsonl`
 - `state/learning-effectiveness.jsonl`
+- `state/governance-events.jsonl`
+- `state/acceptance-gates.jsonl`
 - `state/schema-version.json`
 
 ## Acceptance Rule

@@ -5,7 +5,7 @@
 - Agent id:
 - Role:
 - Task id:
-- State: starting | active | validating | blocked | complete | stopping
+- State: starting | active | validating | blocked | authority_required | complete | stopping
 - Confidence: low | medium | high
 
 ## Progress
@@ -37,6 +37,8 @@
 - Planned next action:
 - Validation remaining:
 - Blocker or risk:
+- Obstacle recovery packet:
+- Authority required:
 - Help needed:
 - Token budget risk:
 - Token strategy change requested:

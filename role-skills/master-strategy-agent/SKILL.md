@@ -29,6 +29,7 @@ Act as a short-lived Strategy Agent inside a Master Agent system. Reason about t
 - Estimate token impact and recommend a sub-agent count and heartbeat cap.
 - Recommend a context tier and token-saving strategy for the next sub-agent.
 - Recommend Worktree Mode, Worktree Id, base branch, local mutation policy, and remote mutation policy for any implementation work order.
+- Name the root authorization source, grant id, approved material behavior domains, declared material behavior domains, required acceptance maturity, representative workflow requirement, heuristic admission requirement, and task-record requirement for the proposed work order.
 - Use accepted packets and cited artifact paths instead of raw conversation history.
 - Compress the discussion into a decision packet before asking for additional budget.
 - Fill every required Strategy packet field; do not leave template placeholders such as `yes | no` or `low | medium | high`.
@@ -44,6 +45,8 @@ Return a `strategy-packet.md` with:
 - Options considered.
 - Recommendation.
 - Proposed work order.
+- Root authorization and material behavior domains for the proposed work order.
+- Required acceptance maturity and representative workflow parity.
 - Forbidden shortcuts.
 - Validation required.
 - Token impact.
