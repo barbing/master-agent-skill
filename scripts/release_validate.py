@@ -162,6 +162,7 @@ def governance_control_step() -> tuple[str, int, str]:
         ROOT / "assets" / "templates" / "authority-envelope.md",
         ROOT / "assets" / "templates" / "obstacle-recovery-packet.md",
         ROOT / "assets" / "templates" / "acceptance-gate.md",
+        ROOT / "assets" / "templates" / "guard-obligation.md",
         ROOT / "assets" / "templates" / "implementation-guard-adapter.md",
         ROOT / "scripts" / "master_agent_tool.py",
         ROOT / "references" / "master-agent-system.md",
@@ -175,10 +176,16 @@ def governance_control_step() -> tuple[str, int, str]:
     required_terms = [
         "governance-lint",
         "record-authority-required",
+        "record-governance-status",
         "record-acceptance-gate",
         "state/governance-events.jsonl",
         "state/acceptance-gates.jsonl",
         "authority_required",
+        "authorization_invalid",
+        "in_root_transition_required",
+        "external_mutation_domain_identified",
+        "validation_support_required",
+        "loop_type",
         "diagnostic",
         "live_seam_green",
         "production_accepted",
@@ -187,6 +194,38 @@ def governance_control_step() -> tuple[str, int, str]:
     if missing_terms:
         return "governance control surface", 1, "missing terms: " + ", ".join(missing_terms)
     return "governance control surface", 0, ""
+
+
+def round_log_control_step() -> tuple[str, int, str]:
+    required_files = [
+        ROOT / "assets" / "templates" / "round-log-control.md",
+        ROOT / "assets" / "templates" / "coding-receipt.md",
+        ROOT / "assets" / "templates" / "work-order.md",
+        ROOT / "scripts" / "master_agent_tool.py",
+        ROOT / "references" / "master-agent-system.md",
+        ROOT / "README.md",
+        ROOT / "SKILL.md",
+    ]
+    missing = [str(path.relative_to(ROOT)) for path in required_files if not path.exists()]
+    if missing:
+        return "round-log control surface", 1, "missing files: " + ", ".join(missing)
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in required_files)
+    required_terms = [
+        "round-log-status",
+        "record-round-log-evidence",
+        "require-round-log-evidence",
+        "round-log-export",
+        "state/round-log-events.jsonl",
+        "round-log-control.md",
+        "Round Log Evidence",
+        ".codex-round-log",
+        "Snapshot id",
+        "Manifest path",
+    ]
+    missing_terms = [term for term in required_terms if term not in combined]
+    if missing_terms:
+        return "round-log control surface", 1, "missing terms: " + ", ".join(missing_terms)
+    return "round-log control surface", 0, ""
 
 
 def main() -> int:
@@ -222,6 +261,7 @@ def main() -> int:
         checks.append(run_step("operating-system soak", [sys.executable, "scripts/soak_validate.py", "--quick"]))
         checks.append(worktree_control_step())
         checks.append(governance_control_step())
+        checks.append(round_log_control_step())
 
         with tempfile.TemporaryDirectory(prefix="master-agent-release-") as tmp:
             tmp_path = Path(tmp)

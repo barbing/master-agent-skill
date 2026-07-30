@@ -286,6 +286,122 @@ def write_work_order(path: Path, write_set: str, artifact_namespace: str, worktr
     )
 
 
+def write_guard_obligation(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "# Guard Obligation",
+                "",
+                "## Root Authorization",
+                "",
+                "- Source kind: current-user-request",
+                "- Source ref: soak_validate.py",
+                "- Grant id: grant-soak",
+                "- Objective: verify guarded control-plane obligation",
+                "- Approved production owners: Master Agent",
+                "- Approved production file scopes: docs/master-agent",
+                "- Approved material behavior domains: none",
+                "- Explicit exclusions: production implementation",
+                "",
+                "## Observation And Mutation",
+                "",
+                "- Observation outside owner allowed: yes",
+                "- Production mutation requires root grant: yes",
+                "- External mutation domain status: external_mutation_domain_identified",
+                "- Authority violation status: authority_required",
+                "",
+                "## Obligation Contract",
+                "",
+                "- Schema version: 6",
+                "- Obligation id: SOAK-GUARD-1",
+                "- Original target error: none",
+                "- Acceptance metric: diagnostic gate passed",
+                "- Completion maturity: diagnostic",
+                "- Required gate ids: diagnostic",
+                "- Contract docs: project-policy-pack.md",
+                "",
+                "## Loop Budget",
+                "",
+                "- Maximum implementation attempts: 2",
+                "- Maximum reassessments: 1",
+                "- Maximum recovery transitions: 1",
+                "- Budgets reset by reassessment: no",
+                "",
+                "## Loop Type And Progress",
+                "",
+                "- Loop type: validation",
+                "- Git-visible progress scope: docs/master-agent",
+                "- Ignored paths are progress: no",
+                "- Validation-only closeout allowed: yes",
+                "",
+                "## Structured Validation",
+                "",
+                "- Validation uses argv: yes",
+                "- Expected write roots declared: yes",
+                "- Native receipts update gates: yes",
+                "- Shell string allowed: no",
+                "",
+                "## Validation Support",
+                "",
+                "- Validation support roots: tests/",
+                "- Assertion policy: preserve",
+                "- Exact support files: tests/test_master_agent_system.py",
+                "- Production frozen during support: yes",
+                "",
+                "## Visual Gate Boundary",
+                "",
+                "- Visual review external: yes",
+                "- Receipt requires contract id: yes",
+                "- Receipt requires candidate fingerprint: yes",
+                "- Receipt requires coverage: yes",
+                "- Evidence index opaque: yes",
+                "",
+                "## Status Semantics",
+                "",
+                "- Authorization invalid status: authorization_invalid",
+                "- In-root transition status: in_root_transition_required",
+                "- External mutation domain status: external_mutation_domain_identified",
+                "- Authority required status: authority_required",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_round_log_snapshot(repo_root: Path, snapshot_id: str) -> None:
+    log_root = repo_root / ".codex-round-log"
+    snapshot_dir = log_root / snapshot_id
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / "manifest.json").write_text(
+        "\n".join(
+            [
+                "{",
+                f'  "id": "{snapshot_id}",',
+                '  "created_at": "2026-07-30T00:00:00+00:00",',
+                '  "mode": "checkpoint",',
+                '  "label": "soak snapshot",',
+                '  "branch": "main",',
+                '  "previous_snapshot_id": "",',
+                '  "copied_paths": ["docs/master-agent/runtime-status.md"],',
+                '  "deleted_paths": [],',
+                '  "file_index_path": "files-index.html"',
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (snapshot_dir / "files-index.html").write_text("<html></html>\n", encoding="utf-8")
+    (log_root / "state.json").write_text(
+        "{\n"
+        f'  "last_snapshot_id": "{snapshot_id}"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+
+
 def run_soak(cycles: int, quick: bool) -> None:
     plan_id = "SOAK-PLAN-1"
     with tempfile.TemporaryDirectory(prefix="master-agent-soak-") as tmp:
@@ -692,6 +808,54 @@ def run_soak(cycles: int, quick: bool) -> None:
                 predecessor_packet,
             ],
         )
+        round_snapshot_id = "0001_20260730T000000"
+        write_round_log_snapshot(project, round_snapshot_id)
+        run_step(
+            "round log status",
+            [
+                TOOL,
+                "round-log-status",
+                "--state-dir",
+                state_dir,
+                "--project-root",
+                project,
+                "--require-active",
+            ],
+        )
+        run_step(
+            "record round log evidence",
+            [
+                TOOL,
+                "record-round-log-evidence",
+                "--state-dir",
+                state_dir,
+                "--project-root",
+                project,
+                "--agent-id",
+                "coding-soak-2",
+                "--snapshot-id",
+                round_snapshot_id,
+                "--plan-id",
+                plan_id,
+                "--worktree-id",
+                "wt-soak-app",
+                "--expected-path",
+                "docs/master-agent/runtime-status.md",
+            ],
+        )
+        run_step(
+            "require round log evidence",
+            [
+                TOOL,
+                "require-round-log-evidence",
+                "--state-dir",
+                state_dir,
+                "--agent-id",
+                "coding-soak-2",
+                "--project-root",
+                project,
+            ],
+        )
 
         work_a = packets / "work-order-a.md"
         work_b = packets / "work-order-b.md"
@@ -700,6 +864,38 @@ def run_soak(cycles: int, quick: bool) -> None:
         run_step(
             "governance lint work order",
             [TOOL, "governance-lint", "--packet", work_a, "--packet-type", "work-order"],
+        )
+        guard_obligation = packets / "guard-obligation.md"
+        write_guard_obligation(guard_obligation)
+        run_step(
+            "governance lint guard obligation",
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                guard_obligation,
+                "--packet-type",
+                "guard-obligation",
+            ],
+        )
+        run_step(
+            "record recoverable governance status",
+            [
+                TOOL,
+                "record-governance-status",
+                "--state-dir",
+                state_dir,
+                "--agent-id",
+                "coding-soak-2",
+                "--status",
+                "evidence_required",
+                "--reason",
+                "visual receipt missing in synthetic soak",
+                "--evidence",
+                str(guard_obligation),
+                "--next-action",
+                "attach external receipt before visual maturity",
+            ],
         )
         run_step(
             "record diagnostic gate",

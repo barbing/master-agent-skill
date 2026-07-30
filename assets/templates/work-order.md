@@ -114,6 +114,8 @@
 ## Receipt Requirements
 
 - Changed files:
+- Round log snapshot required: yes | no
+- Round log evidence command: require-round-log-evidence
 - Commands run:
 - Artifacts produced:
 - Validation result:

@@ -37,7 +37,15 @@ AGENT_STATES = [
     "active",
     "validating",
     "blocked",
+    "authorization_invalid",
+    "evidence_required",
+    "attempt_recording_required",
+    "validation_support_required",
+    "in_root_transition_required",
+    "external_mutation_domain_identified",
     "authority_required",
+    "implementation_frozen_evidence_pending",
+    "implementation_budget_exhausted",
     "complete",
     "stopping",
 ]
@@ -60,8 +68,13 @@ SAFETY_AUTONOMOUS_ACTIONS = {
     "record-learning-effectiveness",
     "lint-governance-packet",
     "governance-lint",
+    "record-governance-status",
     "record-authority-required",
     "record-acceptance-gate",
+    "round-log-status",
+    "record-round-log-evidence",
+    "require-round-log-evidence",
+    "round-log-export",
 }
 SAFETY_REMEDIATION_ACTIONS = {
     "reinforce-context",
@@ -84,21 +97,25 @@ SAFETY_FORBIDDEN_ACTIONS = {
     "continue-hard-token-limit",
     "register-inactive-role",
     "overwrite-user-work",
+    "round-log-restore",
 }
 SAFETY_WARNING_BUDGET_IMPACT = 5_000
 SAFETY_HARD_BUDGET_IMPACT = 20_000
 USAGE_SOURCES = ("measured", "estimated", "self-reported")
 USAGE_CONFIDENCES = ("low", "medium", "high")
 LARGE_CONTINUATION_TOKENS = 5_000
-CURRENT_SCHEMA_VERSION = "1.2"
+CURRENT_SCHEMA_VERSION = "1.4"
 ORDERED_MIGRATIONS = [
     "0001-base-state",
     "0002-runtime-session-observability",
     "0003-learning-layer",
     "0004-governance-optimization",
+    "0005-guard-synchronization",
+    "0006-round-log-evidence",
 ]
 DEFAULT_CODEX_APP_READ_MAX_MINUTES = 60.0
 DEFAULT_WORKTREE_EVIDENCE_MAX_MINUTES = 60.0
+DEFAULT_ROUND_LOG_EVIDENCE_MAX_MINUTES = 1440.0
 
 ROOT_AUTHORITY_SOURCE_KINDS = {
     "current-user-request",
@@ -107,6 +124,46 @@ ROOT_AUTHORITY_SOURCE_KINDS = {
 }
 
 AUTHORITY_REQUIRED_STATUS = "authority_required"
+
+AUTHORIZATION_INVALID_STATUS = "authorization_invalid"
+IN_ROOT_TRANSITION_STATUS = "in_root_transition_required"
+EXTERNAL_MUTATION_DOMAIN_IDENTIFIED_STATUS = "external_mutation_domain_identified"
+
+GOVERNANCE_STATUS_VALUES = {
+    "continue",
+    "reassessment_required",
+    "blocked",
+    "evidence_required",
+    "closeout_pending",
+    "attempt_recording_required",
+    "validation_support_required",
+    "implementation_frozen_evidence_pending",
+    "implementation_budget_exhausted",
+    "scope_expansion_requires_explicit_domain",
+    "authorization_invalid",
+    "in_root_transition_required",
+    "external_mutation_domain_identified",
+    "blocked_scope_or_contract",
+    "concurrent_scope_conflict",
+    "invalid_implementation_progress_scope",
+    AUTHORITY_REQUIRED_STATUS,
+}
+
+AUTHORITY_STATUS_VALUES = {
+    "inside-envelope",
+    "needs-user-decision",
+    *GOVERNANCE_STATUS_VALUES,
+}
+
+LOOP_TYPES = {
+    "implementation",
+    "validation",
+}
+
+ASSERTION_POLICIES = {
+    "preserve",
+    "strengthen",
+}
 
 MATERIAL_BEHAVIOR_DOMAINS = {
     "none",
@@ -310,6 +367,10 @@ GOVERNANCE_PACKET_REQUIRED_FIELDS = {
             "Lower gates satisfied",
             "Evidence artifact",
         ],
+        "## Round Log Evidence": [
+            "Round log required",
+            "Changed paths match work order",
+        ],
         "## Representative Workflow": [
             "Claim scope",
             "Representative parity",
@@ -352,6 +413,70 @@ GOVERNANCE_PACKET_REQUIRED_FIELDS = {
             "Status",
             "Evidence artifact",
             "Lower gates satisfied",
+        ],
+    },
+    "guard-obligation": {
+        "## Root Authorization": [
+            "Source kind",
+            "Source ref",
+            "Grant id",
+            "Objective",
+            "Approved production owners",
+            "Approved production file scopes",
+            "Approved material behavior domains",
+            "Explicit exclusions",
+        ],
+        "## Observation And Mutation": [
+            "Observation outside owner allowed",
+            "Production mutation requires root grant",
+            "External mutation domain status",
+            "Authority violation status",
+        ],
+        "## Obligation Contract": [
+            "Schema version",
+            "Obligation id",
+            "Original target error",
+            "Acceptance metric",
+            "Completion maturity",
+            "Required gate ids",
+            "Contract docs",
+        ],
+        "## Loop Budget": [
+            "Maximum implementation attempts",
+            "Maximum reassessments",
+            "Maximum recovery transitions",
+            "Budgets reset by reassessment",
+        ],
+        "## Loop Type And Progress": [
+            "Loop type",
+            "Git-visible progress scope",
+            "Ignored paths are progress",
+            "Validation-only closeout allowed",
+        ],
+        "## Structured Validation": [
+            "Validation uses argv",
+            "Expected write roots declared",
+            "Native receipts update gates",
+            "Shell string allowed",
+        ],
+        "## Validation Support": [
+            "Validation support roots",
+            "Assertion policy",
+            "Exact support files",
+            "Production frozen during support",
+        ],
+        "## Visual Gate Boundary": [
+            "Visual review external",
+            "Receipt requires contract id",
+            "Receipt requires candidate fingerprint",
+            "Receipt requires coverage",
+            "Evidence index opaque",
+        ],
+        "## Status Semantics": [
+            "Authorization invalid status",
+            "In-root transition status",
+            "External mutation domain status",
+            "Authority required status",
         ],
     },
 }
@@ -437,6 +562,7 @@ UNFILLED_PACKET_VALUES = {
     "TODO",
     "TBD",
     "yes | no",
+    "yes | no | not-required",
     "low | medium | high",
     "create | extend | validator | skip | needs-more-evidence",
     "project-policy-pack | agents-md | skill | plugin-validator | template | memory-note | skip",
@@ -445,6 +571,9 @@ UNFILLED_PACKET_VALUES = {
     "diagnostic | focused_green | live_seam_green | representative_runtime_green | visual_accepted | production_accepted",
     "pending | passed | failed | inconclusive",
     "owner-internal-behavior | pipeline-order | batching-or-barrier-placement | persistence-or-checkpoint-timing | gui-event-timing | cancellation-or-failure-semantics | default-or-fallback-behavior",
+    "implementation | validation",
+    "preserve | strengthen",
+    "authorization_invalid | in_root_transition_required | external_mutation_domain_identified | authority_required",
 }
 
 DEFAULT_ROLES = {
@@ -673,7 +802,7 @@ def validate_predecessor_state_packet(path: Path) -> list[str]:
 
 
 def markdown_bullet_field(section_text: str, field_name: str) -> str | None:
-    pattern = re.compile(rf"^\s*[-*]\s+{re.escape(field_name)}:\s*(.*)$", re.MULTILINE)
+    pattern = re.compile(rf"^[ \t]*[-*][ \t]+{re.escape(field_name)}:[ \t]*(.*)$", re.MULTILINE)
     match = pattern.search(section_text)
     if not match:
         return None
@@ -895,10 +1024,10 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
                 "requires observed domains to be none"
             )
         authority_status = field_value(sections, authority_behavior_heading, "Authority status")
-        if authority_status and authority_status not in {"inside-envelope", AUTHORITY_REQUIRED_STATUS}:
+        if authority_status and authority_status not in AUTHORITY_STATUS_VALUES:
             errors.append(
                 "invalid field: ## Authority And Behavior / Authority status "
-                "must be inside-envelope or authority_required"
+                "must be a recognized governance status"
             )
 
     heuristic_heading = "## Heuristic Admission"
@@ -971,30 +1100,51 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
     policy_heading = "## Governance Review"
     if policy_heading in sections:
         authority_status = field_value(sections, policy_heading, "Authority status")
-        if authority_status and authority_status not in {
-            "inside-envelope",
-            "needs-user-decision",
-            AUTHORITY_REQUIRED_STATUS,
-        }:
+        if authority_status and authority_status not in AUTHORITY_STATUS_VALUES:
             errors.append(
-                "invalid field: ## Governance Review / Authority status must be "
-                "inside-envelope, needs-user-decision, or authority_required"
+                "invalid field: ## Governance Review / Authority status must be a recognized governance status"
             )
+
+    round_log_heading = "## Round Log Evidence"
+    if round_log_heading in sections:
+        required = validate_yes_no(
+            errors,
+            field_value(sections, round_log_heading, "Round log required"),
+            f"{round_log_heading} / Round log required",
+        )
+        match_status = field_value(sections, round_log_heading, "Changed paths match work order")
+        if match_status and match_status not in {"yes", "no", "not-required"}:
+            errors.append(
+                "invalid field: ## Round Log Evidence / Changed paths match work order "
+                "must be yes, no, or not-required"
+            )
+        if required == "yes":
+            for field_name in ["Snapshot id", "Manifest path"]:
+                value = markdown_bullet_field(sections[round_log_heading], field_name)
+                if not field_is_filled(value):
+                    errors.append(f"unfilled field: {round_log_heading} / {field_name}")
+            if match_status != "yes":
+                errors.append(
+                    "invalid field: ## Round Log Evidence / required round-log evidence "
+                    "must match the work order"
+                )
 
     obstacle_heading = "## Obstacle Recovery"
     if obstacle_heading in sections:
         status_requested = field_value(sections, obstacle_heading, "Status requested")
-        if status_requested and status_requested not in {
-            "continue",
-            "reassessment_required",
-            "blocked",
-            AUTHORITY_REQUIRED_STATUS,
-        }:
+        if status_requested and status_requested not in GOVERNANCE_STATUS_VALUES:
             errors.append(
                 "invalid field: ## Obstacle Recovery / Status requested must be "
-                "continue, reassessment_required, blocked, or authority_required"
+                "a recognized governance status"
             )
-        if status_requested in {"blocked", AUTHORITY_REQUIRED_STATUS}:
+        if status_requested in {
+            "blocked",
+            "reassessment_required",
+            IN_ROOT_TRANSITION_STATUS,
+            EXTERNAL_MUTATION_DOMAIN_IDENTIFIED_STATUS,
+            AUTHORITY_REQUIRED_STATUS,
+            "implementation_budget_exhausted",
+        }:
             for field_name in [
                 "Safe diagnostics attempted",
                 "In-scope alternatives attempted",
@@ -1005,6 +1155,147 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
                 value = markdown_bullet_field(sections[obstacle_heading], field_name)
                 if not field_is_filled(value):
                     errors.append(f"unfilled field: {obstacle_heading} / {field_name}")
+
+    observation_heading = "## Observation And Mutation"
+    if observation_heading in sections:
+        for field_name in [
+            "Observation outside owner allowed",
+            "Production mutation requires root grant",
+        ]:
+            validate_yes_no(
+                errors,
+                field_value(sections, observation_heading, field_name),
+                f"{observation_heading} / {field_name}",
+            )
+        for field_name in ["External mutation domain status", "Authority violation status"]:
+            status = field_value(sections, observation_heading, field_name)
+            if status and status not in GOVERNANCE_STATUS_VALUES:
+                errors.append(
+                    f"invalid field: {observation_heading} / {field_name} "
+                    "must be a recognized governance status"
+                )
+
+    obligation_heading = "## Obligation Contract"
+    if obligation_heading in sections:
+        schema_version = field_value(sections, obligation_heading, "Schema version")
+        if schema_version and schema_version != "6":
+            errors.append("invalid field: ## Obligation Contract / Schema version must be 6")
+        completion = field_value(sections, obligation_heading, "Completion maturity")
+        if completion:
+            validate_maturity(
+                errors,
+                completion,
+                f"{obligation_heading} / Completion maturity",
+            )
+
+    budget_heading = "## Loop Budget"
+    if budget_heading in sections:
+        reset = validate_yes_no(
+            errors,
+            field_value(sections, budget_heading, "Budgets reset by reassessment"),
+            f"{budget_heading} / Budgets reset by reassessment",
+        )
+        if reset == "yes":
+            errors.append(
+                "invalid field: ## Loop Budget / Budgets reset by reassessment must be no"
+            )
+
+    progress_heading = "## Loop Type And Progress"
+    if progress_heading in sections:
+        loop_type = field_value(sections, progress_heading, "Loop type")
+        if loop_type and loop_type not in LOOP_TYPES:
+            errors.append(
+                "invalid field: ## Loop Type And Progress / Loop type must be implementation or validation"
+            )
+        ignored_progress = validate_yes_no(
+            errors,
+            field_value(sections, progress_heading, "Ignored paths are progress"),
+            f"{progress_heading} / Ignored paths are progress",
+        )
+        if ignored_progress == "yes":
+            errors.append(
+                "invalid field: ## Loop Type And Progress / Ignored paths are progress must be no"
+            )
+        validation_closeout = validate_yes_no(
+            errors,
+            field_value(sections, progress_heading, "Validation-only closeout allowed"),
+            f"{progress_heading} / Validation-only closeout allowed",
+        )
+        if loop_type == "validation" and validation_closeout != "yes":
+            errors.append(
+                "invalid field: ## Loop Type And Progress / validation loop type requires validation-only closeout allowed"
+            )
+
+    validation_heading = "## Structured Validation"
+    if validation_heading in sections:
+        for field_name in [
+            "Validation uses argv",
+            "Expected write roots declared",
+            "Native receipts update gates",
+        ]:
+            value = validate_yes_no(
+                errors,
+                field_value(sections, validation_heading, field_name),
+                f"{validation_heading} / {field_name}",
+            )
+            if value == "no":
+                errors.append(f"invalid field: {validation_heading} / {field_name} must be yes")
+        shell_allowed = validate_yes_no(
+            errors,
+            field_value(sections, validation_heading, "Shell string allowed"),
+            f"{validation_heading} / Shell string allowed",
+        )
+        if shell_allowed == "yes":
+            errors.append("invalid field: ## Structured Validation / Shell string allowed must be no")
+
+    support_heading = "## Validation Support"
+    if support_heading in sections:
+        assertion_policy = field_value(sections, support_heading, "Assertion policy")
+        if assertion_policy and assertion_policy not in ASSERTION_POLICIES:
+            errors.append(
+                "invalid field: ## Validation Support / Assertion policy must be preserve or strengthen"
+            )
+        frozen = validate_yes_no(
+            errors,
+            field_value(sections, support_heading, "Production frozen during support"),
+            f"{support_heading} / Production frozen during support",
+        )
+        if frozen == "no":
+            errors.append(
+                "invalid field: ## Validation Support / Production frozen during support must be yes"
+            )
+
+    visual_heading = "## Visual Gate Boundary"
+    if visual_heading in sections:
+        for field_name in [
+            "Visual review external",
+            "Receipt requires contract id",
+            "Receipt requires candidate fingerprint",
+            "Receipt requires coverage",
+            "Evidence index opaque",
+        ]:
+            value = validate_yes_no(
+                errors,
+                field_value(sections, visual_heading, field_name),
+                f"{visual_heading} / {field_name}",
+            )
+            if value == "no":
+                errors.append(f"invalid field: {visual_heading} / {field_name} must be yes")
+
+    status_heading = "## Status Semantics"
+    if status_heading in sections:
+        expected_statuses = {
+            "Authorization invalid status": AUTHORIZATION_INVALID_STATUS,
+            "In-root transition status": IN_ROOT_TRANSITION_STATUS,
+            "External mutation domain status": EXTERNAL_MUTATION_DOMAIN_IDENTIFIED_STATUS,
+            "Authority required status": AUTHORITY_REQUIRED_STATUS,
+        }
+        for field_name, expected in expected_statuses.items():
+            actual = field_value(sections, status_heading, field_name)
+            if actual and actual != expected:
+                errors.append(
+                    f"invalid field: {status_heading} / {field_name} must be {expected}"
+                )
     return errors
 
 
@@ -1075,6 +1366,7 @@ def ensure_state_storage(state_dir: Path) -> None:
     learning_effectiveness_path = storage_dir / "learning-effectiveness.jsonl"
     governance_events_path = storage_dir / "governance-events.jsonl"
     acceptance_gates_path = storage_dir / "acceptance-gates.jsonl"
+    round_log_events_path = storage_dir / "round-log-events.jsonl"
     schema_path = storage_dir / "schema-version.json"
     if not agents_path.exists():
         atomic_write_text(agents_path, "{}\n")
@@ -1136,6 +1428,8 @@ def ensure_state_storage(state_dir: Path) -> None:
         atomic_write_text(governance_events_path, "")
     if not acceptance_gates_path.exists():
         atomic_write_text(acceptance_gates_path, "")
+    if not round_log_events_path.exists():
+        atomic_write_text(round_log_events_path, "")
     if not schema_path.exists():
         atomic_write_json(schema_path, default_schema_version())
 
@@ -1771,6 +2065,7 @@ def _state_file_paths(state_dir: Path) -> list[Path]:
         state_dir / "state" / "learning-effectiveness.jsonl",
         state_dir / "state" / "governance-events.jsonl",
         state_dir / "state" / "acceptance-gates.jsonl",
+        state_dir / "state" / "round-log-events.jsonl",
         state_dir / "state" / "schema-version.json",
     ]
 
@@ -4863,6 +5158,423 @@ def command_assess_parallelism(args: argparse.Namespace) -> int:
     return 2
 
 
+def append_round_log_event(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(state_dir / "state" / "round-log-events.jsonl", entry)
+
+
+def round_log_root(repo_root: Path) -> Path:
+    return repo_root / ".codex-round-log"
+
+
+def read_json_object(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def round_log_manifest_record(snapshot_dir: Path) -> dict | None:
+    manifest_path = snapshot_dir / "manifest.json"
+    manifest = read_json_object(manifest_path)
+    if not manifest:
+        return None
+    snapshot_id = str(manifest.get("id") or snapshot_dir.name)
+    copied_paths = [
+        normalize_repo_path(str(path))
+        for path in manifest.get("copied_paths", [])
+        if str(path).strip()
+    ]
+    deleted_paths = [
+        normalize_repo_path(str(path))
+        for path in manifest.get("deleted_paths", [])
+        if str(path).strip()
+    ]
+    file_index_path = str(manifest.get("file_index_path") or "")
+    return {
+        "snapshot_id": snapshot_id,
+        "snapshot_path": str(snapshot_dir),
+        "manifest_path": str(manifest_path),
+        "created_at": str(manifest.get("created_at") or ""),
+        "mode": str(manifest.get("mode") or ""),
+        "label": str(manifest.get("label") or ""),
+        "branch": str(manifest.get("branch") or ""),
+        "previous_snapshot_id": str(manifest.get("previous_snapshot_id") or ""),
+        "copied_paths": copied_paths,
+        "deleted_paths": deleted_paths,
+        "changed_paths": copied_paths + deleted_paths,
+        "file_count": len(copied_paths) + len(deleted_paths),
+        "file_index_path": file_index_path,
+    }
+
+
+def list_round_log_snapshots(repo_root: Path) -> list[dict]:
+    log_root = round_log_root(repo_root)
+    if not log_root.exists():
+        return []
+    snapshots: list[dict] = []
+    for path in log_root.iterdir():
+        if not path.is_dir() or path.name in {".tmp", "exports"}:
+            continue
+        record = round_log_manifest_record(path)
+        if record:
+            snapshots.append(record)
+    snapshots.sort(key=lambda item: (item.get("created_at") or "", item.get("snapshot_id") or ""))
+    return snapshots
+
+
+def latest_round_log_snapshot(repo_root: Path) -> dict | None:
+    snapshots = list_round_log_snapshots(repo_root)
+    return snapshots[-1] if snapshots else None
+
+
+def inspect_round_log(repo_root: Path) -> dict:
+    log_root = round_log_root(repo_root)
+    if not log_root.exists():
+        return {
+            "status": "missing",
+            "repo_root": str(repo_root),
+            "round_log_root": str(log_root),
+            "latest_snapshot_id": "",
+            "snapshot_count": 0,
+            "hook_failure": "",
+        }
+    snapshots = list_round_log_snapshots(repo_root)
+    state = read_json_object(log_root / "state.json") or {}
+    failure = read_json_object(log_root / "hook-failure.json")
+    latest = snapshots[-1] if snapshots else None
+    last_state_snapshot = str(state.get("last_snapshot_id") or "")
+    latest_id = str((latest or {}).get("snapshot_id") or last_state_snapshot)
+    if failure:
+        status = "warning"
+    elif latest:
+        status = "available"
+    else:
+        status = "empty"
+    return {
+        "status": status,
+        "repo_root": str(repo_root),
+        "round_log_root": str(log_root),
+        "latest_snapshot_id": latest_id,
+        "snapshot_count": len(snapshots),
+        "state_last_snapshot_id": last_state_snapshot,
+        "active_hook_snapshot_id": str(state.get("active_hook_snapshot_id") or ""),
+        "hook_failure": json.dumps(failure, ensure_ascii=False, sort_keys=True) if failure else "",
+        "latest_snapshot": latest or {},
+    }
+
+
+def run_round_log_command(
+    command: str,
+    extra_args: list[str],
+    timeout_seconds: float,
+) -> tuple[subprocess.CompletedProcess[str] | None, str | None]:
+    try:
+        argv = shlex.split(command, posix=os.name != "nt")
+    except ValueError as exc:
+        return None, f"Round-log command could not be parsed: {exc}"
+    if not argv:
+        return None, "Round-log command is empty"
+    try:
+        result = subprocess.run(
+            [*argv, *extra_args],
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"Round-log command timed out after {timeout_seconds:g}s"
+    except OSError as exc:
+        return None, f"Round-log command failed to start: {exc}"
+    return result, None
+
+
+def render_round_log_control(state_dir: Path) -> None:
+    events = load_jsonl_entries(state_dir / "state" / "round-log-events.jsonl")
+    latest_status = next(
+        (event for event in reversed(events) if event.get("event") == "round-log-status"),
+        {},
+    )
+    latest_evidence = next(
+        (event for event in reversed(events) if event.get("event") == "round-log-evidence"),
+        {},
+    )
+    latest_export = next(
+        (event for event in reversed(events) if event.get("event") == "round-log-export"),
+        {},
+    )
+    lines = [
+        "# Round Log Control",
+        "",
+        "## Purpose",
+        "",
+        "- Optional local history evidence for Codex implementation rounds.",
+        "- Complements Git status; it does not replace Git boundary enforcement.",
+        "",
+        "## Provider",
+        "",
+        f"- Status: {latest_status.get('status', '')}",
+        f"- Repo root: {latest_status.get('repo_root', '')}",
+        f"- Round log root: {latest_status.get('round_log_root', '')}",
+        f"- Latest snapshot id: {latest_status.get('latest_snapshot_id', '')}",
+        f"- Snapshot count: {latest_status.get('snapshot_count', '')}",
+        "",
+        "## Evidence Binding",
+        "",
+        f"- Latest agent id: {latest_evidence.get('agent_id', '')}",
+        f"- Latest plan id: {latest_evidence.get('plan_id', '')}",
+        f"- Latest worktree id: {latest_evidence.get('worktree_id', '')}",
+        f"- Latest evidence snapshot id: {latest_evidence.get('snapshot_id', '')}",
+        f"- Latest manifest path: {latest_evidence.get('manifest_path', '')}",
+        "",
+        "## Snapshot Policy",
+        "",
+        "- Master may inspect status, record evidence, require evidence, and export readable evidence explicitly.",
+        "- Master must not use round-log evidence as mutation authority.",
+        "- Restore is a human-directed recovery operation, not an autonomous Master action.",
+        "",
+        "## Export Policy",
+        "",
+        f"- Latest export snapshot id: {latest_export.get('snapshot_id', '')}",
+        f"- Latest export path: {latest_export.get('export_path', '')}",
+        "- Export creates review artifacts and must not mutate source snapshots.",
+        "",
+        "## Restore Policy",
+        "",
+        "- Run restore only after an explicit user decision.",
+        "- Prefer restore dry-run and current-state safety snapshot before any real restore.",
+        "",
+    ]
+    atomic_write_text(state_dir / "round-log-control.md", "\n".join(lines) + "\n")
+
+
+def command_round_log_status(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp = format_time(parse_time(args.at))
+    if repo_error:
+        print(f"Round-log status requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    status = inspect_round_log(repo_root)
+    command_stdout = ""
+    command_stderr = ""
+    command_returncode: int | None = None
+    if args.round_log_command:
+        result, command_error = run_round_log_command(
+            args.round_log_command,
+            ["list", "--repo", str(repo_root)],
+            args.timeout_seconds,
+        )
+        if command_error:
+            print(command_error, file=sys.stderr)
+            return 2
+        assert result is not None
+        command_returncode = result.returncode
+        command_stdout = result.stdout.strip()
+        command_stderr = result.stderr.strip()
+        if result.returncode != 0:
+            status["status"] = "command-failed"
+    event = {
+        "at": timestamp,
+        "event": "round-log-status",
+        **status,
+        "command_returncode": command_returncode,
+        "command_stdout": command_stdout[-2000:],
+        "command_stderr": command_stderr[-2000:],
+    }
+    append_round_log_event(state_dir, event)
+    render_round_log_control(state_dir)
+    print(f"Round log status: {status.get('status')}")
+    print(f"Repo root: {status.get('repo_root')}")
+    print(f"Round log root: {status.get('round_log_root')}")
+    print(f"Latest snapshot id: {status.get('latest_snapshot_id')}")
+    print(f"Snapshot count: {status.get('snapshot_count')}")
+    if command_stdout:
+        print("Command output:")
+        print(command_stdout)
+    if command_stderr:
+        print("Command stderr:")
+        print(command_stderr)
+    if status.get("status") == "command-failed":
+        return 2
+    if args.require_active and status.get("status") not in {"available", "warning"}:
+        return 1
+    return 0
+
+
+def command_record_round_log_evidence(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    agents = load_agents(state_dir)
+    if args.agent_id not in agents:
+        print(f"Unknown agent id: {args.agent_id}", file=sys.stderr)
+        return 1
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    if repo_error:
+        print(f"Round-log evidence requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    snapshot_dir = round_log_root(repo_root) / args.snapshot_id
+    snapshot = round_log_manifest_record(snapshot_dir)
+    if not snapshot:
+        print(f"Valid round-log snapshot not found: {args.snapshot_id}", file=sys.stderr)
+        return 1
+    agent = agents[args.agent_id]
+    if args.plan_id and agent.get("plan_id") and args.plan_id != agent.get("plan_id"):
+        print(
+            f"Plan mismatch for {args.agent_id}: agent has {agent.get('plan_id')}, evidence has {args.plan_id}",
+            file=sys.stderr,
+        )
+        return 1
+    expected_paths = [normalize_repo_path(path) for path in (args.expected_path or [])]
+    if expected_paths:
+        changed_paths = set(snapshot.get("changed_paths", []))
+        missing = [path for path in expected_paths if path not in changed_paths]
+        if missing:
+            print(
+                "Round-log snapshot does not contain expected paths: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
+            return 1
+    timestamp = format_time(parse_time(args.at))
+    event = {
+        "at": timestamp,
+        "event": "round-log-evidence",
+        "agent_id": args.agent_id,
+        "plan_id": args.plan_id or agent.get("plan_id", ""),
+        "worktree_id": args.worktree_id or "",
+        "task_id": agent.get("task_id", ""),
+        "snapshot_id": snapshot["snapshot_id"],
+        "snapshot_path": snapshot["snapshot_path"],
+        "manifest_path": snapshot["manifest_path"],
+        "created_at": snapshot["created_at"],
+        "mode": snapshot["mode"],
+        "label": snapshot["label"],
+        "branch": snapshot["branch"],
+        "previous_snapshot_id": snapshot["previous_snapshot_id"],
+        "file_count": snapshot["file_count"],
+        "changed_paths": snapshot["changed_paths"],
+        "receipt": args.receipt or "",
+        "work_order": args.work_order or "",
+        "note": args.note or "",
+    }
+    append_round_log_event(state_dir, event)
+    agent["latest_round_snapshot_id"] = snapshot["snapshot_id"]
+    agent["latest_round_snapshot_at"] = timestamp
+    agent["round_log_manifest_path"] = snapshot["manifest_path"]
+    save_agents(state_dir, agents)
+    render_running_agents(state_dir, agents)
+    render_round_log_control(state_dir)
+    print(f"Recorded round-log evidence for {args.agent_id}: {snapshot['snapshot_id']}")
+    return 0
+
+
+def latest_round_log_evidence(
+    state_dir: Path,
+    agent_id: str,
+    plan_id: str = "",
+    worktree_id: str = "",
+) -> dict | None:
+    for event in reversed(load_jsonl_entries(state_dir / "state" / "round-log-events.jsonl")):
+        if event.get("event") != "round-log-evidence":
+            continue
+        if event.get("agent_id") != agent_id:
+            continue
+        if plan_id and event.get("plan_id") != plan_id:
+            continue
+        if worktree_id and event.get("worktree_id") != worktree_id:
+            continue
+        return event
+    return None
+
+
+def command_require_round_log_evidence(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    event = latest_round_log_evidence(
+        state_dir,
+        args.agent_id,
+        plan_id=args.plan_id or "",
+        worktree_id=args.worktree_id or "",
+    )
+    if not event:
+        print(f"No round-log evidence recorded for {args.agent_id}", file=sys.stderr)
+        return 1
+    now = parse_time(args.at)
+    evidence_at = parse_time(str(event.get("at") or ""))
+    age_minutes = (now - evidence_at).total_seconds() / 60.0
+    if age_minutes > args.max_age_minutes:
+        print(
+            f"Round-log evidence for {args.agent_id} is stale: {age_minutes:.1f} minutes",
+            file=sys.stderr,
+        )
+        return 1
+    if args.project_root:
+        repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+        if repo_error:
+            print(f"Round-log evidence requires a Git repository: {repo_error}", file=sys.stderr)
+            return 2
+        assert repo_root is not None
+        snapshot_id = str(event.get("snapshot_id") or "")
+        if not round_log_manifest_record(round_log_root(repo_root) / snapshot_id):
+            print(f"Round-log manifest is missing or unreadable: {snapshot_id}", file=sys.stderr)
+            return 1
+    print(f"Round-log evidence present for {args.agent_id}: {event.get('snapshot_id')}")
+    return 0
+
+
+def command_round_log_export(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp = format_time(parse_time(args.at))
+    if repo_error:
+        print(f"Round-log export requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    if not round_log_manifest_record(round_log_root(repo_root) / args.snapshot_id):
+        print(f"Valid round-log snapshot not found: {args.snapshot_id}", file=sys.stderr)
+        return 1
+    extra_args = ["export", "--snapshot", args.snapshot_id, "--repo", str(repo_root)]
+    if args.output:
+        extra_args.extend(["--output", str(Path(args.output).resolve())])
+    result, command_error = run_round_log_command(
+        args.round_log_command,
+        extra_args,
+        args.timeout_seconds,
+    )
+    if command_error:
+        print(command_error, file=sys.stderr)
+        return 2
+    assert result is not None
+    output_path = str(Path(args.output).resolve()) if args.output else str(
+        round_log_root(repo_root) / "exports" / args.snapshot_id
+    )
+    event = {
+        "at": timestamp,
+        "event": "round-log-export",
+        "snapshot_id": args.snapshot_id,
+        "repo_root": str(repo_root),
+        "export_path": output_path,
+        "command_returncode": result.returncode,
+        "command_stdout": result.stdout.strip()[-2000:],
+        "command_stderr": result.stderr.strip()[-2000:],
+    }
+    append_round_log_event(state_dir, event)
+    render_round_log_control(state_dir)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        print(f"Round-log export failed: {detail}", file=sys.stderr)
+        return 2
+    print(f"Round-log export recorded: {output_path}")
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    return 0
+
+
 def load_jsonl_entries(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -4962,6 +5674,50 @@ def command_record_authority_required(args: argparse.Namespace) -> int:
         at=timestamp,
     )
     print(f"Marked {args.agent_id} authority_required")
+    return 0
+
+
+def command_record_governance_status(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    timestamp = format_time(parse_time(args.at))
+    agents = load_agents(state_dir)
+    if args.agent_id not in agents:
+        print(f"Unknown agent id: {args.agent_id}", file=sys.stderr)
+        return 1
+    if args.status == AUTHORITY_REQUIRED_STATUS:
+        print(
+            "Use record-authority-required for observed out-of-root production mutation.",
+            file=sys.stderr,
+        )
+        return 1
+    agents[args.agent_id]["status"] = args.status
+    agents[args.agent_id]["last_action"] = args.reason
+    agents[args.agent_id]["next_action"] = args.next_action
+    agents[args.agent_id]["risk"] = args.evidence
+    save_agents(state_dir, agents)
+    render_running_agents(state_dir, agents)
+    event = {
+        "at": timestamp,
+        "event_type": "governance-status",
+        "agent_id": args.agent_id,
+        "status": args.status,
+        "reason": args.reason,
+        "evidence": args.evidence,
+        "next_action": args.next_action,
+    }
+    append_governance_event(state_dir, event)
+    append_event_log(
+        state_dir=state_dir,
+        event_type="governance-status",
+        related_packet="governance-events.jsonl",
+        summary=f"{args.agent_id}: {args.status}",
+        evidence=args.evidence,
+        ledger_update=f"{args.agent_id} marked {args.status}",
+        next_action=args.next_action,
+        at=timestamp,
+    )
+    print(f"Marked {args.agent_id} {args.status}")
     return 0
 
 
@@ -6581,6 +7337,49 @@ def build_parser() -> argparse.ArgumentParser:
     validate_include.add_argument("--at")
     validate_include.set_defaults(func=command_validate_worktreeinclude)
 
+    round_status = subparsers.add_parser("round-log-status", help="Inspect optional codex-round-log snapshot evidence for a repository.")
+    round_status.add_argument("--state-dir", required=True)
+    round_status.add_argument("--project-root", required=True)
+    round_status.add_argument("--round-log-command")
+    round_status.add_argument("--timeout-seconds", type=float, default=60)
+    round_status.add_argument("--require-active", action="store_true")
+    round_status.add_argument("--at")
+    round_status.set_defaults(func=command_round_log_status)
+
+    round_evidence = subparsers.add_parser("record-round-log-evidence", help="Bind a round-log snapshot manifest to a sub-agent receipt.")
+    round_evidence.add_argument("--state-dir", required=True)
+    round_evidence.add_argument("--project-root", required=True)
+    round_evidence.add_argument("--agent-id", required=True)
+    round_evidence.add_argument("--snapshot-id", required=True)
+    round_evidence.add_argument("--plan-id")
+    round_evidence.add_argument("--worktree-id")
+    round_evidence.add_argument("--receipt")
+    round_evidence.add_argument("--work-order")
+    round_evidence.add_argument("--expected-path", action="append")
+    round_evidence.add_argument("--note")
+    round_evidence.add_argument("--at")
+    round_evidence.set_defaults(func=command_record_round_log_evidence)
+
+    require_round_evidence = subparsers.add_parser("require-round-log-evidence", help="Fail unless recent round-log evidence is bound to an agent.")
+    require_round_evidence.add_argument("--state-dir", required=True)
+    require_round_evidence.add_argument("--agent-id", required=True)
+    require_round_evidence.add_argument("--plan-id")
+    require_round_evidence.add_argument("--worktree-id")
+    require_round_evidence.add_argument("--project-root")
+    require_round_evidence.add_argument("--max-age-minutes", type=float, default=DEFAULT_ROUND_LOG_EVIDENCE_MAX_MINUTES)
+    require_round_evidence.add_argument("--at")
+    require_round_evidence.set_defaults(func=command_require_round_log_evidence)
+
+    round_export = subparsers.add_parser("round-log-export", help="Explicitly export a readable round-log snapshot for review evidence.")
+    round_export.add_argument("--state-dir", required=True)
+    round_export.add_argument("--project-root", required=True)
+    round_export.add_argument("--snapshot-id", required=True)
+    round_export.add_argument("--round-log-command", required=True)
+    round_export.add_argument("--output")
+    round_export.add_argument("--timeout-seconds", type=float, default=60)
+    round_export.add_argument("--at")
+    round_export.set_defaults(func=command_round_log_export)
+
     enforce_boundary = subparsers.add_parser("enforce-master-boundary", help="Fail when Master changes exceed the allowed state/doc boundary.")
     enforce_boundary.add_argument("--project-root", required=True)
     enforce_boundary.add_argument("--state-dir", required=True)
@@ -6601,6 +7400,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(GOVERNANCE_PACKET_REQUIRED_FIELDS),
     )
     governance_lint.set_defaults(func=command_governance_lint)
+
+    governance_status = subparsers.add_parser("record-governance-status", help="Record a recoverable governance status without treating it as an authority violation.")
+    governance_status.add_argument("--state-dir", required=True)
+    governance_status.add_argument("--agent-id", required=True)
+    governance_status.add_argument("--status", required=True, choices=sorted(GOVERNANCE_STATUS_VALUES - {AUTHORITY_REQUIRED_STATUS}))
+    governance_status.add_argument("--reason", required=True)
+    governance_status.add_argument("--evidence", required=True)
+    governance_status.add_argument("--next-action", required=True)
+    governance_status.add_argument("--at")
+    governance_status.set_defaults(func=command_record_governance_status)
 
     authority_required = subparsers.add_parser("record-authority-required", help="Freeze an agent at an authority boundary and record the required decision.")
     authority_required.add_argument("--state-dir", required=True)

@@ -12,8 +12,13 @@
 - monitor-budget
 - recommend-token-strategy
 - governance-lint
+- record-governance-status
 - record-authority-required
 - record-acceptance-gate
+- round-log-status
+- record-round-log-evidence
+- require-round-log-evidence
+- round-log-export
 
 ## Requires Human Decision
 
@@ -32,6 +37,7 @@
 - continue-hard-token-limit
 - register-inactive-role
 - overwrite-user-work
+- round-log-restore
 
 ## Budget And Role Limits
 

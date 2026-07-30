@@ -20,7 +20,7 @@
 - Observed files inside envelope: yes | no
 - Observed material behavior domains: none
 - No material behavior change: yes
-- Authority status: inside-envelope | authority_required
+- Authority status: inside-envelope | authorization_invalid | in_root_transition_required | external_mutation_domain_identified | authority_required
 
 ## Validation
 
@@ -33,6 +33,17 @@
 - Current maturity: diagnostic
 - Lower gates satisfied: yes
 - Evidence artifact:
+
+## Round Log Evidence
+
+- Round log required: yes | no
+- Agent id:
+- Plan id:
+- Worktree id:
+- Snapshot id:
+- Manifest path:
+- Export path:
+- Changed paths match work order: yes | no | not-required
 
 ## Representative Workflow
 

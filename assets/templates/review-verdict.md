@@ -11,6 +11,8 @@
 - Work order:
 - Coding receipt:
 - Diff:
+- Round log snapshot:
+- Round log manifest:
 - Tests:
 - Logs:
 - Artifacts:
@@ -27,6 +29,7 @@
 - Stayed inside scope: yes | no | unsure
 - Unauthorized changes:
 - Missing validation:
+- Round log evidence matches receipt:
 - Token budget respected:
 - Token strategy followed:
 

@@ -28,6 +28,8 @@ Act as a short-lived Learning Distiller Agent inside a Master Agent system. Dist
 - Check existing Master governance templates and validators before proposing a new skill or rule.
 - Preserve the boundary that learning updates may modify behavior assets only, not production application code.
 - When a lesson concerns authorization, blocked-state misuse, heuristic overreach, representative parity, or maturity-gate inflation, target the governance templates or validator first.
+- When a lesson concerns guard misuse, prefer refining `guard-obligation.md`, `implementation-guard-adapter.md`, or governance lint rules before creating another overlapping skill.
+- When a lesson concerns missing per-round change evidence, prefer refining `round-log-control.md`, coding receipt fields, or round-log validator commands before adding another workflow rule.
 - Do not put project memory into a global skill.
 - Do not modify production code, tests, runtime config, migrations, or behavior.
 - If a lesson requires code changes, propose a normal work order instead of presenting it as a learning update.

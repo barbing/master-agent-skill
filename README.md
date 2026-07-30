@@ -2,14 +2,14 @@
 
 Project-neutral Codex skill pack for coordinating long-running, multi-agent project work through a non-implementing Master Agent control plane.
 
-The system is designed to keep project continuity outside chat history by using structured ledgers, packets, heartbeats, role contracts, root authorization envelopes, material behavior-domain checks, token budgets, runtime supervision, review gates, and a governed correction-learning layer.
+The system is designed to keep project continuity outside chat history by using structured ledgers, packets, heartbeats, role contracts, root authorization envelopes, material behavior-domain checks, guard-obligation packets, optional round-log snapshot evidence, token budgets, runtime supervision, review gates, and a governed correction-learning layer.
 
 ## What This Provides
 
 - A main `master-agent-system` Codex skill.
 - Role skills for Strategy, Coding, Review, Policy Review, and Learning Distiller agents.
 - State-pack templates under `assets/templates/`.
-- CLI helpers under `scripts/` for bootstrapping, validation, Strategy-packet gating, governance packet linting, monotonic acceptance gates, authority-required state transitions, session control, Worktree control, strict session rotation, role governance, heartbeat monitoring, token tracking, correction distillation, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, soak validation, release validation, and recovery.
+- CLI helpers under `scripts/` for bootstrapping, validation, Strategy-packet gating, governance packet linting, recoverable guard-status recording, monotonic acceptance gates, authority-required state transitions, session control, Worktree control, optional codex-round-log evidence binding, strict session rotation, role governance, heartbeat monitoring, token tracking, correction distillation, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, soak validation, release validation, and recovery.
 - A provider-command reference adapter at `scripts/file_session_provider.py`.
 - CI and pre-commit examples for release and Master-boundary enforcement.
 - Regression tests for safety-critical behavior.
@@ -103,11 +103,14 @@ Read `references/master-agent-system.md` before deploying the workflow on a real
 - `provider=codex-app` is the Codex desktop tool-mediated path. Use Codex thread tools for create/send/read/archive, then record evidence with `session-confirm-create`, `session-confirm-send`, `session-confirm-read`, and `session-confirm-archive`.
 - Worktree control is also evidence-based. Use `worktree-plan`, `worktree-confirm-create`, `worktree-assign-session`, `worktree-reconcile`, `worktree-close`, and `worktree-confirm-close` so sub-agents work in isolated Worktrees instead of mutating the user's foreground checkout or remote branches.
 - Run `validate-worktreeinclude` before relying on ignored local files in Codex-managed Worktrees. `.worktreeinclude` must list only intentionally ignored local setup files; tracked files, broad patterns, repository escapes, and symlinks are release blockers.
+- `codex-round-log` / `change-round-logger` integration is optional and local. Use `round-log-status` to inspect repo-local snapshot health, `record-round-log-evidence` to bind a snapshot manifest to an agent receipt, `require-round-log-evidence` before accepting receipts that demand snapshot evidence, and `round-log-export` only when readable review evidence is needed. Round-log evidence complements Git status; Git remains the boundary-enforcement source.
 - `accept-strategy` validates Strategy packets before they become current plan state. Coding, Review, and Policy Review registration/session launch require the current plan to carry that validation evidence.
 - Use `strategy-packet-lint` for preflight diagnostics and `require-strategy-packet-before-work` as an explicit gate before issuing sub-agent work from an accepted Strategy packet.
 - Use `governance-lint` before launching from a context packet, work order, receipt, review verdict, policy verdict, obstacle-recovery packet, or acceptance-gate packet.
+- Use `guard-obligation.md` and `governance-lint --packet-type guard-obligation` when a task uses an implementation guard or a validation-only acceptance obligation.
+- Use `record-governance-status` for recoverable guard states such as `authorization_invalid`, `evidence_required`, `in_root_transition_required`, and `external_mutation_domain_identified`.
 - Use `record-acceptance-gate` to record ordered maturity evidence. Higher gates cannot pass until all lower gates for the same scope have passed.
-- Use `record-authority-required` when a sub-agent reaches a needed action outside the root authorization envelope.
+- Use `record-authority-required` only when an observed production mutation is outside the root authorization envelope.
 - Use `request-rotation`, `validate-predecessor-state`, and `rotate-session` to replace overloaded agents. Normal rotation requires a validated predecessor-state packet; emergency rotation requires `--emergency-without-predecessor-state`.
 - Use `enforce-master-boundary` before completing Master-led work, and `assess-parallelism` before running multiple sub-agents.
 - Use `record-learning-correction`, `learning-cycle-start`, `learning-proposal-lint`, `accept-learning-proposal`, and `record-learning-effectiveness` to convert repeated corrections into reviewed behavior updates.

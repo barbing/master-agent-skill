@@ -10,7 +10,7 @@
 
 ## Obstacle Recovery
 
-- Status requested: continue | reassessment_required | blocked | authority_required
+- Status requested: continue | reassessment_required | evidence_required | in_root_transition_required | external_mutation_domain_identified | blocked | authority_required
 - First failing boundary:
 - Safe diagnostics attempted:
 - In-scope alternatives attempted:

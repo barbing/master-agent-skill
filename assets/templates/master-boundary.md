@@ -7,6 +7,7 @@
 ## Allowed Master Write Paths
 
 - docs/master-agent/**
+- .codex-round-log/**
 
 ## Forbidden Master Write Paths
 
@@ -15,6 +16,7 @@
 - runtime configuration
 - migrations
 - packaging or deployment behavior
+- round-log restore or source rewrite without explicit user decision
 
 ## Enforcement Policy
 

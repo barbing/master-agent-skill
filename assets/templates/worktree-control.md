@@ -48,3 +48,4 @@
 
 - Append all Worktree lifecycle events to state/worktrees.jsonl.
 - Record linked session events in state/session-control.jsonl.
+- When codex-round-log is available, bind implementation snapshots in state/round-log-events.jsonl.

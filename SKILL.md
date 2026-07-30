@@ -1,6 +1,6 @@
 ---
 name: master-agent-system
-description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, distilling corrections into governed learning updates, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, or standardizing strategy, coding, review, policy, and learning handoffs.
+description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, distilling corrections into governed learning updates, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, binding optional codex-round-log evidence, or standardizing strategy, coding, review, policy, and learning handoffs.
 ---
 
 # Master Agent System
@@ -35,12 +35,17 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Heartbeats are required | Any running sub-agent must emit structured progress packets on checkpoint, before risky edits, after validation, and when blocked. |
 | Token strategy is required | Every project should set a project budget, per-agent budget when possible, heartbeat/session caps, and a token strategy before spawning sub-agents. |
 | Worktrees isolate implementation | Plan and confirm a Worktree before implementation sessions when isolation is needed; do not mutate the user's local checkout or remote branches without an explicit merge/release gate. |
+| Round logs add temporal evidence | When `codex-round-log` is available, bind snapshot manifests to sub-agent receipts; use Git for current boundary enforcement and round logs for who/when evidence. |
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
 | Root authority is non-escalating | A plan or repair record may narrow or sequence work, but it cannot widen the original user grant, approved owners, file scopes, or material behavior domains. |
 | Material behavior is declared | Every context packet, work order, and receipt declares whether it touches pipeline order, batching/barriers, persistence/checkpoints, GUI timing, cancellation/failure semantics, or default/fallback behavior. |
 | Heuristics require admission | A heuristic is allowed only when the packet names authorization, target-independent invariant, owning boundary, representative evidence, non-regression coverage, and failure behavior. |
 | Acceptance maturity is monotonic | Do not claim a higher maturity gate until all lower gates are recorded as passed for the same scope. |
-| Authority stops are explicit | When the next action needs a wider grant or user decision, mark the agent `authority_required` and record a governance event. |
+| Observation is not mutation authority | Reading, tracing, existing tests, and approved validation may cross module boundaries without adding mutation owners. |
+| Guard statuses are precise | Use `authorization_invalid`, `evidence_required`, `in_root_transition_required`, and `external_mutation_domain_identified` before escalating to `authority_required`. |
+| Authority stops are explicit | Reserve `authority_required` for an observed production mutation outside the root authorization envelope. |
+| Validation support is evidence maintenance | Assertion-preserving validation support may be recorded without widening production authority; it is not implementation progress. |
+| Visual gates are external receipts | The Master records visual review receipt binding and verdict; it does not manage image generation, retention, or inspection methodology. |
 | Review is separate | Coding receipts are not accepted until reviewed, unless the user explicitly chooses to skip review. |
 | Rotation is strict | Launch a successor only from a validated predecessor-state packet, except explicit emergency recovery. |
 | Learning is governed | Corrections become durable behavior only through a correction record, learning cycle, linted learning proposal, acceptance event, and recurrence check. |
@@ -68,17 +73,20 @@ Define custom roles only when a project has a recurring or specialized responsib
 4. Check `role-catalog.md` and decide whether the next step fits an active role, needs a role proposal, or should remain direct ledger maintenance.
 5. Accept only complete Strategy packets. `accept-strategy` runs Strategy packet validation and records validation evidence; `require-strategy-packet-before-work` verifies that evidence before Coding, Review, or Policy Review work.
 6. For implementation work, plan an isolated Worktree with `worktree-plan`, validate `.worktreeinclude` when ignored local files are needed, confirm provider evidence with `worktree-confirm-create`, and bind the session with `worktree-assign-session`.
-7. Create a context packet or work order with `new-packet`, fill the root authorization envelope, material behavior domains, representative workflow fields, acceptance gates, and heuristic admission fields, then run `governance-lint`.
-8. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
-9. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
-10. Register the running sub-agent and require heartbeats plus token usage reports.
-11. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, and `recommend-token-strategy` until the agent completes, blocks, drifts, or needs authority.
-12. Use `record-authority-required` when the next necessary action exceeds the root authorization envelope.
-13. Accept, reject, or request clarification on the return packet.
-14. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
-15. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
-16. Update the master ledger and event log only after acceptance.
-17. Derive the next action from the updated ledger, not from conversational momentum.
+7. When `codex-round-log` is installed for the repository, run `round-log-status` before accepting concurrent implementation receipts and require `record-round-log-evidence` / `require-round-log-evidence` for work orders that demand snapshot evidence.
+8. Create a context packet or work order with `new-packet`, fill the root authorization envelope, material behavior domains, representative workflow fields, acceptance gates, and heuristic admission fields, then run `governance-lint`.
+9. For guarded implementation or validation-only obligations, fill `guard-obligation.md` with schema-v6 fields, loop type, Git-visible progress scope, structured validation, validation-support roots, and visual receipt boundaries.
+10. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
+11. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
+12. Register the running sub-agent and require heartbeats plus token usage reports.
+13. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, `round-log-status`, and `recommend-token-strategy` until the agent completes, blocks, drifts, needs evidence, needs a same-root transition, identifies an external mutation domain, or needs authority.
+14. Use `record-governance-status` for recoverable guard states such as `authorization_invalid`, `evidence_required`, `in_root_transition_required`, or `external_mutation_domain_identified`.
+15. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
+16. Accept, reject, or request clarification on the return packet.
+17. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
+18. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
+19. Update the master ledger and event log only after acceptance.
+20. Derive the next action from the updated ledger, not from conversational momentum.
 
 ## Agent Selection
 
@@ -191,6 +199,10 @@ python scripts/master_agent_tool.py worktree-assign-session --state-dir <state-d
 python scripts/master_agent_tool.py worktree-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py worktree-close --state-dir <state-dir> --worktree-id wt-task-1 --reason "task accepted"
 python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-dir> --worktree-id wt-task-1
+python scripts/master_agent_tool.py round-log-status --state-dir <state-dir> --project-root <project-root> --round-log-command "python <plugin-root>/scripts/round_logger.py"
+python scripts/master_agent_tool.py record-round-log-evidence --state-dir <state-dir> --project-root <project-root> --agent-id coding-1 --snapshot-id <snapshot-id> --plan-id PLAN-1 --worktree-id wt-task-1 --receipt packets/coding-receipt.md
+python scripts/master_agent_tool.py require-round-log-evidence --state-dir <state-dir> --agent-id coding-1 --project-root <project-root> --max-age-minutes 1440
+python scripts/master_agent_tool.py round-log-export --state-dir <state-dir> --project-root <project-root> --snapshot-id <snapshot-id> --round-log-command "python <plugin-root>/scripts/round_logger.py"
 python scripts/master_agent_tool.py request-rotation --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift
 python scripts/master_agent_tool.py validate-predecessor-state --packet packets/coding-1-predecessor-state-packet.md
 python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file --predecessor-state-packet packets/coding-1-predecessor-state-packet.md
@@ -198,7 +210,9 @@ python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --age
 python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
 python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
 python scripts/master_agent_tool.py governance-lint --packet packets/work-order-a.md --packet-type work-order
+python scripts/master_agent_tool.py governance-lint --packet packets/guard-obligation.md --packet-type guard-obligation
 python scripts/master_agent_tool.py record-acceptance-gate --state-dir <state-dir> --scope-id TASK-1 --maturity diagnostic --status passed --evidence packets/task-record.md
+python scripts/master_agent_tool.py record-governance-status --state-dir <state-dir> --agent-id coding-1 --status external_mutation_domain_identified --reason "diagnosis proved external owner" --evidence packets/obstacle-recovery-packet.md --next-action "ask only if user chooses implementation there"
 python scripts/master_agent_tool.py record-authority-required --state-dir <state-dir> --agent-id coding-1 --reason "owner boundary exceeded" --evidence packets/obstacle-recovery-packet.md --required-user-decision "approve wider owner or narrow task"
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
@@ -265,12 +279,14 @@ The state pack contains:
 - `obstacle-recovery-packet.md`
 - `acceptance-gate.md`
 - `task-record.md`
+- `guard-obligation.md`
 - `implementation-guard-adapter.md`
 - `runtime-supervisor.md`
 - `runtime-status.md`
 - `runtime-deployment.md`
 - `session-control.md`
 - `worktree-control.md`
+- `round-log-control.md`
 - `incident-log.md`
 - `alert-queue.md`
 - `state-schema.md`
@@ -294,6 +310,7 @@ The state pack contains:
 - `state/runtime.json`
 - `state/session-control.jsonl`
 - `state/worktrees.jsonl`
+- `state/round-log-events.jsonl`
 - `state/incidents.jsonl`
 - `state/alerts.jsonl`
 - `state/learning-corrections.jsonl`

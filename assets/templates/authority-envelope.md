@@ -17,6 +17,13 @@
 - No material behavior change: yes
 - Domain rationale:
 
+## Observation And Mutation
+
+- Observation outside owner allowed: yes
+- Production mutation requires root grant: yes
+- External mutation domain status: external_mutation_domain_identified
+- Authority violation status: authority_required
+
 ## Representative Workflow
 
 - Claim scope:

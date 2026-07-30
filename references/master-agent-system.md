@@ -71,6 +71,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `obstacle-recovery-packet.md` | Evidence required before an agent can claim blocked, reassessment required, or authority required. |
 | `acceptance-gate.md` | Scope-level maturity gate record for diagnostic through production acceptance. |
 | `task-record.md` | Durable one-off task scope, work, evidence, decision, and future-agent notes. |
+| `guard-obligation.md` | Project-neutral schema-v6 guard obligation packet for implementation or validation-only acceptance. |
 | `implementation-guard-adapter.md` | Optional mapping from Master governance state into external loop-guard tooling. |
 | `strategy-packet.md` | Strategy recommendation and proposed work order. |
 | `work-order.md` | Bounded implementation assignment. |
@@ -80,6 +81,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `runtime-deployment.md` | Windows startup, process identity, crash recovery, stop/status commands, and production limits. |
 | `session-control.md` | Provider-neutral session lifecycle contract and audit trail rules. |
 | `worktree-control.md` | Worktree planning, session binding, ignored-file copy policy, handoff, merge, cleanup, and reconciliation rules. |
+| `round-log-control.md` | Optional `codex-round-log` evidence binding, snapshot policy, export policy, and human-directed restore policy. |
 | `incident-log.md` | Open and resolved incident summaries, severity levels, remediation, and operator handoff. |
 | `alert-queue.md` | Pending alerts, severity, acknowledgement, suppression, and escalation status. |
 | `state-schema.md` | Current schema version, migration order, compatibility policy, recovery policy, and stale lock handling. |
@@ -100,6 +102,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `state/runtime.json` | Supervisor loop state, recovery counts, breach counts, and next wakeup. |
 | `state/session-control.jsonl` | Append-only requested and confirmed provider session events. |
 | `state/worktrees.jsonl` | Append-only Worktree plan, confirmation, binding, stale, close, and `.worktreeinclude` validation events. |
+| `state/round-log-events.jsonl` | Append-only round-log status, snapshot evidence, and export events. |
 | `state/incidents.jsonl` | Append-only incident records. |
 | `state/alerts.jsonl` | Append-only alert-opened and acknowledgement records. |
 | `state/learning-corrections.jsonl` | Append-only correction records for learning cycles. |
@@ -220,10 +223,16 @@ python scripts/master_agent_tool.py worktree-assign-session --state-dir <state-d
 python scripts/master_agent_tool.py worktree-reconcile --state-dir <state-dir>
 python scripts/master_agent_tool.py worktree-close --state-dir <state-dir> --worktree-id wt-task-1 --reason "task accepted"
 python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-dir> --worktree-id wt-task-1
+python scripts/master_agent_tool.py round-log-status --state-dir <state-dir> --project-root <project-root> --round-log-command "python <plugin-root>/scripts/round_logger.py"
+python scripts/master_agent_tool.py record-round-log-evidence --state-dir <state-dir> --project-root <project-root> --agent-id coding-wt-1 --snapshot-id <snapshot-id> --plan-id PLAN-1 --worktree-id wt-task-1 --receipt packets/coding-receipt.md
+python scripts/master_agent_tool.py require-round-log-evidence --state-dir <state-dir> --agent-id coding-wt-1 --project-root <project-root>
+python scripts/master_agent_tool.py round-log-export --state-dir <state-dir> --project-root <project-root> --snapshot-id <snapshot-id> --round-log-command "python <plugin-root>/scripts/round_logger.py"
 python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
 python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
 python scripts/master_agent_tool.py governance-lint --packet packets/work-order-a.md --packet-type work-order
+python scripts/master_agent_tool.py governance-lint --packet packets/guard-obligation.md --packet-type guard-obligation
 python scripts/master_agent_tool.py record-acceptance-gate --state-dir <state-dir> --scope-id TASK-1 --maturity diagnostic --status passed --evidence packets/task-record.md
+python scripts/master_agent_tool.py record-governance-status --state-dir <state-dir> --agent-id coding-1 --status in_root_transition_required --reason "same-root prerequisite proven" --evidence packets/obstacle-recovery-packet.md --next-action "prepare audited transition packet"
 python scripts/master_agent_tool.py record-authority-required --state-dir <state-dir> --agent-id coding-1 --reason "owner boundary exceeded" --evidence packets/obstacle-recovery-packet.md --required-user-decision "approve wider owner or narrow task"
 python scripts/master_agent_tool.py record-incident --state-dir <state-dir> --severity critical --summary "Safety breach" --source supervisor
 python scripts/master_agent_tool.py alert-status --state-dir <state-dir>
@@ -290,6 +299,28 @@ python scripts/master_agent_tool.py worktree-confirm-close --state-dir <state-di
 ```
 
 `assess-parallelism` requires each work order to name Worktree Mode, Worktree Id, Base Branch, Local Mutation Policy, and Remote Mutation Policy. Parallel work is blocked if Worktree IDs overlap, write sets overlap, artifact namespaces overlap, mutation policies do not protect the local checkout and remote branches, or the conflict protocol is missing.
+
+## Round Log Evidence
+
+Use round-log evidence when the local `codex-round-log` / `change-round-logger` plugin is available. This integration is optional and project-neutral: the Master Agent does not vendor the plugin, does not require it for minimal operation, and does not use it as production mutation authority.
+
+Git remains the source for current boundary enforcement through `enforce-master-boundary` and work-order write sets. Round-log manifests add temporal evidence: which Codex round produced a snapshot, which files were captured, which branch/worktree was active, and which prior snapshot it followed. This is especially useful when several sub-agents run concurrently or when ignored source/document files are changed locally.
+
+Normal evidence loop:
+
+```bash
+python scripts/master_agent_tool.py round-log-status --state-dir <state-dir> --project-root <project-root> --round-log-command "python <plugin-root>/scripts/round_logger.py"
+python scripts/master_agent_tool.py record-round-log-evidence --state-dir <state-dir> --project-root <project-root> --agent-id coding-wt-1 --snapshot-id <snapshot-id> --plan-id PLAN-1 --worktree-id wt-task-1 --receipt packets/coding-receipt.md
+python scripts/master_agent_tool.py require-round-log-evidence --state-dir <state-dir> --agent-id coding-wt-1 --project-root <project-root>
+```
+
+Use `round-log-export` only when a reviewer needs a readable flat view:
+
+```bash
+python scripts/master_agent_tool.py round-log-export --state-dir <state-dir> --project-root <project-root> --snapshot-id <snapshot-id> --round-log-command "python <plugin-root>/scripts/round_logger.py"
+```
+
+Do not automate restore from the Master Agent. Restore rewrites working files and requires an explicit human decision, preferably after a dry-run and safety snapshot.
 
 Use `request-rotation` when a sub-agent has accumulated too much context, loops on the same next action, reports attention drift, exceeds heartbeat caps, or needs a clean successor session. The predecessor must return a `predecessor-state-packet.md`. Validate it with `validate-predecessor-state`, then call `rotate-session`. Normal rotation requires `--predecessor-state-packet`; `--emergency-without-predecessor-state` is reserved for unrecoverable sessions and records degraded continuity.
 
@@ -374,6 +405,10 @@ The governance layer converts the local-agent lessons into mechanical Master Age
 
 Root authorization is non-escalating. A current user request, current goal, or user-approved plan may create the root grant. Strategy packets, repair records, task records, and learning records may narrow or sequence that grant, but they cannot add owners, file scopes, material behavior domains, autonomous-loop authority, or acceptance criteria. When the next required step exceeds the grant, use `record-authority-required` and stop the sub-agent until the missing decision exists.
 
+Root authorization governs production mutation, not observation. Unless a project policy explicitly forbids it, a sub-agent may read adjacent modules, trace calls, inspect logs and artifacts, run existing cross-module tests, and run approved end-to-end validation without adding those modules to the mutation grant. If diagnosis proves the next implementation owner is outside the root and no mutation occurred there, record `external_mutation_domain_identified`, continue bounded observation, and ask once only if the user chooses implementation in that domain.
+
+Guard status semantics are precise. Use `authorization_invalid` when a candidate source reference, hash, lineage, or approved-plan binding is bad and no out-of-root mutation was observed. Use `evidence_required` when locked validation or an external receipt is missing. Use `in_root_transition_required` when evidence proves a prerequisite outside the active scope but still inside the persistent root. Reserve `authority_required` for observed production owner, file, or material behavior mutation outside the persistent root.
+
 Material behavior domains must be declared in context packets, work orders, and receipts. The built-in domain names are `none`, `owner-internal-behavior`, `pipeline-order`, `batching-or-barrier-placement`, `persistence-or-checkpoint-timing`, `gui-event-timing`, `cancellation-or-failure-semantics`, and `default-or-fallback-behavior`. A packet that says no material behavior changed must declare `none`.
 
 Obstacle recovery is required before `blocked` or `authority_required`. The agent must name the first failing boundary, safe diagnostics attempted, in-scope alternatives attempted, remaining safe in-scope actions, external or authority condition, and smallest unblocking action. This prevents ordinary difficulty, timeouts, or a first failed attempt from being mislabeled as a terminal blocker.
@@ -384,11 +419,19 @@ Representative workflow parity is required for readiness claims. Runtime, provid
 
 Acceptance maturity is monotonic by scope. Use `record-acceptance-gate` to record `diagnostic`, `focused_green`, `live_seam_green`, `representative_runtime_green`, `visual_accepted`, and `production_accepted`. A higher gate cannot pass until every lower gate has already passed for the same `scope-id`.
 
+Guarded implementation uses `guard-obligation.md` as the Master-facing packet for schema-v6 guard systems. The packet records `loop_type` as either `implementation` or `validation`, Git-visible progress scope, finite implementation/reassessment/transition budgets, required gate ids, contract docs, structured validation requirements, validation-support roots, and visual-review receipt boundaries. Do not require or manufacture a production edit for a validation-only obligation whose locked evidence can establish completion.
+
+Validation support is evidence maintenance, not production authority. It may cover exact assertion-preserving test, fixture, spec, harness, or validation-artifact files under declared support roots when direct evidence proves the support need. It must preserve or strengthen assertions, freeze production, rerun the locked structured validation step, and never count as implementation progress or acceptance-gate progress by itself.
+
+Visual gates are external. The review workflow owns originals, crops, overlays, rendered pages, output paths, retention, cleanup, inspection methodology, and the verdict. The Master or guard consumes only one receipt bound to the current candidate fingerprint, review contract id, coverage, verdict, opaque evidence index, and review timestamp.
+
 Minimum governance loop:
 
 ```bash
 python scripts/master_agent_tool.py governance-lint --packet packets/work-order.md --packet-type work-order
+python scripts/master_agent_tool.py governance-lint --packet packets/guard-obligation.md --packet-type guard-obligation
 python scripts/master_agent_tool.py record-acceptance-gate --state-dir <state-dir> --scope-id TASK-1 --maturity diagnostic --status passed --evidence packets/task-record.md
+python scripts/master_agent_tool.py record-governance-status --state-dir <state-dir> --agent-id coding-1 --status external_mutation_domain_identified --reason "diagnosis proved external owner" --evidence packets/obstacle-recovery-packet.md --next-action "ask only if user chooses implementation there"
 python scripts/master_agent_tool.py record-authority-required --state-dir <state-dir> --agent-id coding-1 --reason "approved owner boundary exceeded" --evidence packets/obstacle-recovery-packet.md --required-user-decision "approve wider owner or narrow task"
 ```
 
@@ -401,16 +444,18 @@ Use this loop for long-running Codex projects:
 1. Bootstrap or migrate state with `init`, `upgrade-state`, `migrate-state`, and `validate --strict`.
 2. Accept only validated Strategy packets; run `require-strategy-packet-before-work` before issuing Coding, Review, or Policy Review work.
 3. Run `governance-lint` on context packets and work orders before launch.
-4. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
-5. Run `assess-parallelism` before launching more than one sub-agent.
-6. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
-7. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
-8. Record acceptance maturity with `record-acceptance-gate`; do not claim readiness above the highest passed gate.
-9. Use `record-authority-required` when the next needed action exceeds the root authorization envelope.
-10. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
-11. Run `enforce-master-boundary` before finalizing any Master turn.
-12. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
-13. Record incidents and alert acknowledgements instead of erasing failures.
+4. Fill and lint `guard-obligation.md` before a guarded implementation or validation-only obligation.
+5. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
+6. Run `assess-parallelism` before launching more than one sub-agent.
+7. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
+8. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
+9. Record acceptance maturity with `record-acceptance-gate`; do not claim readiness above the highest passed gate.
+10. Record recoverable guard statuses with `record-governance-status`; do not use `authority_required` for observation-only findings or candidate-envelope defects.
+11. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
+12. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
+13. Run `enforce-master-boundary` before finalizing any Master turn.
+14. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
+15. Record incidents and alert acknowledgements instead of erasing failures.
 
 The operating loop is designed to fail closed. If the Master cannot prove current strategy, provider liveness, boundary compliance, packet completeness, or budget safety, it should stop work and create a remediation packet instead of continuing from chat memory.
 

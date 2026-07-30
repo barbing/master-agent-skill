@@ -75,6 +75,7 @@ def ensure_state_storage(target_dir: Path) -> None:
     learning_effectiveness_path = storage_dir / "learning-effectiveness.jsonl"
     governance_events_path = storage_dir / "governance-events.jsonl"
     acceptance_gates_path = storage_dir / "acceptance-gates.jsonl"
+    round_log_events_path = storage_dir / "round-log-events.jsonl"
     schema_path = storage_dir / "schema-version.json"
     if not agents_path.exists():
         atomic_write_json(agents_path, {})
@@ -138,11 +139,13 @@ def ensure_state_storage(target_dir: Path) -> None:
         atomic_write_text(governance_events_path, "")
     if not acceptance_gates_path.exists():
         atomic_write_text(acceptance_gates_path, "")
+    if not round_log_events_path.exists():
+        atomic_write_text(round_log_events_path, "")
     if not schema_path.exists():
         atomic_write_json(
             schema_path,
             {
-                "schema_version": "1.2",
+                "schema_version": "1.4",
                 "compatible_tool": "master_agent_tool.py",
                 "migration_history": [],
             },

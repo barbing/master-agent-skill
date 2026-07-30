@@ -25,7 +25,7 @@
 - Material behavior domains checked: yes | no
 - Heuristic admission checked: yes | no
 - Representative workflow checked: yes | no
-- Authority status: inside-envelope | needs-user-decision | authority_required
+- Authority status: inside-envelope | needs-user-decision | authorization_invalid | in_root_transition_required | external_mutation_domain_identified | authority_required
 
 ## Conditions Or Blockers
 

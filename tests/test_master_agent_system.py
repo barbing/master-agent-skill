@@ -297,6 +297,40 @@ def accept_valid_strategy(state_dir: Path, tmp: Path, plan_id: str = "PLAN-1") -
     return packet
 
 
+def write_round_log_snapshot(
+    repo_root: Path,
+    snapshot_id: str = "0001_20260730T000000",
+    copied_paths: list[str] | None = None,
+    deleted_paths: list[str] | None = None,
+) -> Path:
+    copied = copied_paths if copied_paths is not None else ["src/module.py"]
+    deleted = deleted_paths if deleted_paths is not None else []
+    log_root = repo_root / ".codex-round-log"
+    snapshot_dir = log_root / snapshot_id
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "id": snapshot_id,
+        "created_at": "2026-07-30T00:00:00+00:00",
+        "mode": "checkpoint",
+        "label": "test snapshot",
+        "branch": "main",
+        "previous_snapshot_id": "",
+        "copied_paths": copied,
+        "deleted_paths": deleted,
+        "file_index_path": "files-index.html",
+    }
+    (snapshot_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (snapshot_dir / "files-index.html").write_text("<html></html>\n", encoding="utf-8")
+    (log_root / "state.json").write_text(
+        json.dumps({"last_snapshot_id": snapshot_id}, indent=2),
+        encoding="utf-8",
+    )
+    return snapshot_dir
+
+
 class MasterAgentToolTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="master-agent-system-test-"))
@@ -384,6 +418,16 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIn("## Worktree Policy", worktree_control)
         self.assertTrue((self.state_dir / "state" / "worktrees.jsonl").exists())
 
+    def test_init_creates_round_log_control_state(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        round_log_control = (self.state_dir / "round-log-control.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("# Round Log Control", round_log_control)
+        self.assertIn("## Evidence Binding", round_log_control)
+        self.assertTrue((self.state_dir / "state" / "round-log-events.jsonl").exists())
+
     def test_init_creates_learning_layer_state(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
 
@@ -415,6 +459,7 @@ class MasterAgentToolTests(unittest.TestCase):
             "acceptance-gate.md",
             "task-record.md",
             "implementation-guard-adapter.md",
+            "guard-obligation.md",
         ]:
             self.assertTrue((self.state_dir / filename).exists(), filename)
         self.assertTrue((self.state_dir / "state" / "governance-events.jsonl").exists())
@@ -424,7 +469,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(schema["schema_version"], "1.2")
+        self.assertEqual(schema["schema_version"], "1.4")
 
     def test_learning_correction_creates_cycle_and_summary(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -4350,7 +4395,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(schema["schema_version"], "1.2")
+        self.assertEqual(schema["schema_version"], "1.4")
         self.assertIn("migration_history", schema)
 
     def test_migration_runs_in_order(self):
@@ -4369,6 +4414,8 @@ class MasterAgentToolTests(unittest.TestCase):
                 "0002-runtime-session-observability",
                 "0003-learning-layer",
                 "0004-governance-optimization",
+                "0005-guard-synchronization",
+                "0006-round-log-evidence",
             ],
         )
         second = run_cmd([TOOL, "migrate-state", "--state-dir", self.state_dir])
@@ -4617,6 +4664,96 @@ class MasterAgentToolTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def write_guard_obligation(
+        self,
+        path: Path,
+        loop_type: str = "implementation",
+        validation_closeout: str = "no",
+        budget_reset: str = "no",
+        shell_string_allowed: str = "no",
+        assertion_policy: str = "preserve",
+    ) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "# Guard Obligation",
+                    "",
+                    "## Root Authorization",
+                    "",
+                    "- Source kind: current-user-request",
+                    "- Source ref: test",
+                    "- Grant id: grant-test",
+                    "- Objective: verify guarded obligation semantics",
+                    "- Approved production owners: Coding",
+                    "- Approved production file scopes: src/module",
+                    "- Approved material behavior domains: none",
+                    "- Explicit exclusions: unrelated owners",
+                    "",
+                    "## Observation And Mutation",
+                    "",
+                    "- Observation outside owner allowed: yes",
+                    "- Production mutation requires root grant: yes",
+                    "- External mutation domain status: external_mutation_domain_identified",
+                    "- Authority violation status: authority_required",
+                    "",
+                    "## Obligation Contract",
+                    "",
+                    "- Schema version: 6",
+                    "- Obligation id: OBLIGATION-TEST",
+                    "- Original target error: first failing boundary unresolved",
+                    "- Acceptance metric: diagnostic gate passed",
+                    "- Completion maturity: diagnostic",
+                    "- Required gate ids: gate-diagnostic",
+                    "- Contract docs: docs/plan.md",
+                    "",
+                    "## Loop Budget",
+                    "",
+                    "- Maximum implementation attempts: 2",
+                    "- Maximum reassessments: 1",
+                    "- Maximum recovery transitions: 1",
+                    f"- Budgets reset by reassessment: {budget_reset}",
+                    "",
+                    "## Loop Type And Progress",
+                    "",
+                    f"- Loop type: {loop_type}",
+                    "- Git-visible progress scope: src/module",
+                    "- Ignored paths are progress: no",
+                    f"- Validation-only closeout allowed: {validation_closeout}",
+                    "",
+                    "## Structured Validation",
+                    "",
+                    "- Validation uses argv: yes",
+                    "- Expected write roots declared: yes",
+                    "- Native receipts update gates: yes",
+                    f"- Shell string allowed: {shell_string_allowed}",
+                    "",
+                    "## Validation Support",
+                    "",
+                    "- Validation support roots: tests/",
+                    f"- Assertion policy: {assertion_policy}",
+                    "- Exact support files: tests/test_contract.py",
+                    "- Production frozen during support: yes",
+                    "",
+                    "## Visual Gate Boundary",
+                    "",
+                    "- Visual review external: yes",
+                    "- Receipt requires contract id: yes",
+                    "- Receipt requires candidate fingerprint: yes",
+                    "- Receipt requires coverage: yes",
+                    "- Evidence index opaque: yes",
+                    "",
+                    "## Status Semantics",
+                    "",
+                    "- Authorization invalid status: authorization_invalid",
+                    "- In-root transition status: in_root_transition_required",
+                    "- External mutation domain status: external_mutation_domain_identified",
+                    "- Authority required status: authority_required",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def test_assess_parallelism_allows_disjoint_work_orders(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         one = self.tmp / "one.md"
@@ -4734,6 +4871,164 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertIn("Governance packet is valid", result.stdout)
 
+    def test_governance_lint_accepts_valid_guard_obligation(self):
+        obligation = self.tmp / "guard-obligation.md"
+        self.write_guard_obligation(obligation)
+
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                obligation,
+                "--packet-type",
+                "guard-obligation",
+            ]
+        )
+        self.assertIn("Governance packet is valid", result.stdout)
+
+    def test_governance_lint_accepts_validation_only_guard_obligation(self):
+        obligation = self.tmp / "guard-validation-obligation.md"
+        self.write_guard_obligation(
+            obligation,
+            loop_type="validation",
+            validation_closeout="yes",
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                obligation,
+                "--packet-type",
+                "guard-obligation",
+            ]
+        )
+        self.assertIn("Governance packet is valid", result.stdout)
+
+    def test_governance_lint_rejects_invalid_guard_obligation_semantics(self):
+        budget_reset = self.tmp / "budget-reset.md"
+        self.write_guard_obligation(budget_reset, budget_reset="yes")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                budget_reset,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Budgets reset by reassessment must be no", result.stderr)
+
+        shell_string = self.tmp / "shell-string.md"
+        self.write_guard_obligation(shell_string, shell_string_allowed="yes")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                shell_string,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Shell string allowed must be no", result.stderr)
+
+        validation_loop = self.tmp / "validation-loop.md"
+        self.write_guard_obligation(validation_loop, loop_type="validation")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                validation_loop,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("validation loop type requires validation-only closeout allowed", result.stderr)
+
+    def test_governance_lint_enforces_required_round_log_receipt_evidence(self):
+        receipt = self.tmp / "coding-receipt.md"
+        receipt.write_text(
+            "\n".join(
+                [
+                    "# Coding Receipt",
+                    "",
+                    "## Authority And Behavior",
+                    "",
+                    "- Grant id: grant-test",
+                    "- Observed owner: Coding",
+                    "- Observed files inside envelope: yes",
+                    "- Observed material behavior domains: none",
+                    "- No material behavior change: yes",
+                    "- Authority status: inside-envelope",
+                    "",
+                    "## Acceptance Gates",
+                    "",
+                    "- Current maturity: diagnostic",
+                    "- Lower gates satisfied: yes",
+                    "- Evidence artifact: test evidence",
+                    "",
+                    "## Round Log Evidence",
+                    "",
+                    "- Round log required: yes",
+                    "- Snapshot id:",
+                    "- Manifest path:",
+                    "- Changed paths match work order: no",
+                    "",
+                    "## Representative Workflow",
+                    "",
+                    "- Claim scope: diagnostic",
+                    "- Representative parity: yes",
+                    "- Diagnostic-only if mismatch: no",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        missing = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                receipt,
+                "--packet-type",
+                "coding-receipt",
+            ],
+            check=False,
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("Snapshot id", missing.stderr)
+        self.assertIn("must match the work order", missing.stderr)
+
+        receipt.write_text(
+            receipt.read_text(encoding="utf-8")
+            .replace("- Snapshot id:", "- Snapshot id: 0001_20260730T000000")
+            .replace("- Manifest path:", "- Manifest path: .codex-round-log/0001_20260730T000000/manifest.json")
+            .replace("- Changed paths match work order: no", "- Changed paths match work order: yes"),
+            encoding="utf-8",
+        )
+        valid = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                receipt,
+                "--packet-type",
+                "coding-receipt",
+            ]
+        )
+        self.assertIn("Governance packet is valid", valid.stdout)
+
     def test_governance_lint_rejects_unadmitted_heuristic(self):
         order = self.tmp / "bad-heuristic.md"
         self.write_work_order(order, "src/parser", "artifacts/parser")
@@ -4834,6 +5129,106 @@ class MasterAgentToolTests(unittest.TestCase):
             .splitlines()
         ]
         self.assertEqual(events[-1]["event_type"], "authority-required")
+
+    def test_record_governance_status_marks_recoverable_status_and_event(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-GOV")
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-gov",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-GOV",
+                "--objective",
+                "Implement bounded work",
+                "--scope",
+                "src/parser",
+                "--plan-id",
+                "PLAN-GOV",
+            ]
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "record-governance-status",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-gov",
+                "--status",
+                "external_mutation_domain_identified",
+                "--reason",
+                "diagnosis proved a renderer owner is required",
+                "--evidence",
+                "packets/obstacle-recovery-packet.md",
+                "--next-action",
+                "ask only if the user chooses renderer implementation",
+            ]
+        )
+        self.assertIn("Marked coding-gov external_mutation_domain_identified", result.stdout)
+        agents = json.loads((self.state_dir / "state" / "agents.json").read_text(encoding="utf-8"))
+        self.assertEqual(agents["coding-gov"]["status"], "external_mutation_domain_identified")
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "governance-events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(events[-1]["event_type"], "governance-status")
+        self.assertEqual(events[-1]["status"], "external_mutation_domain_identified")
+
+    def test_record_governance_status_rejects_authority_required(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-GOV-REJECT")
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-gov-reject",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-GOV-REJECT",
+                "--objective",
+                "Implement bounded work",
+                "--scope",
+                "src/parser",
+                "--plan-id",
+                "PLAN-GOV-REJECT",
+            ]
+        )
+
+        result = run_cmd(
+            [
+                TOOL,
+                "record-governance-status",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-gov-reject",
+                "--status",
+                "authority_required",
+                "--reason",
+                "observed out-of-root production mutation",
+                "--evidence",
+                "git diff",
+                "--next-action",
+                "use record-authority-required",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice", result.stderr)
 
     def test_acceptance_gate_requires_lower_gate_order(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -4949,6 +5344,234 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("too broad or unsafe", blocked.stdout)
+
+    def test_round_log_status_reports_missing_and_available_snapshots(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        missing = run_cmd(
+            [
+                TOOL,
+                "round-log-status",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--require-active",
+            ],
+            check=False,
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("Round log status: missing", missing.stdout)
+
+        write_round_log_snapshot(self.tmp, "0002_20260730T000000")
+        available = run_cmd(
+            [
+                TOOL,
+                "round-log-status",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--require-active",
+            ]
+        )
+        self.assertIn("Round log status: available", available.stdout)
+        self.assertIn("0002_20260730T000000", available.stdout)
+        control = (self.state_dir / "round-log-control.md").read_text(encoding="utf-8")
+        self.assertIn("0002_20260730T000000", control)
+
+    def test_record_and_require_round_log_evidence_binds_agent_snapshot(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-ROUND")
+        run_cmd(
+            [
+                TOOL,
+                "register-agent",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-round",
+                "--role",
+                "Coding",
+                "--task-id",
+                "TASK-ROUND",
+                "--objective",
+                "Implement bounded work",
+                "--scope",
+                "src",
+                "--plan-id",
+                "PLAN-ROUND",
+            ]
+        )
+        write_round_log_snapshot(
+            self.tmp,
+            "0003_20260730T000000",
+            copied_paths=["src/module.py", "tests/test_module.py"],
+        )
+
+        missing_path = run_cmd(
+            [
+                TOOL,
+                "record-round-log-evidence",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--agent-id",
+                "coding-round",
+                "--snapshot-id",
+                "0003_20260730T000000",
+                "--expected-path",
+                "src/missing.py",
+            ],
+            check=False,
+        )
+        self.assertEqual(missing_path.returncode, 1)
+        self.assertIn("does not contain expected paths", missing_path.stderr)
+
+        recorded = run_cmd(
+            [
+                TOOL,
+                "record-round-log-evidence",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--agent-id",
+                "coding-round",
+                "--snapshot-id",
+                "0003_20260730T000000",
+                "--plan-id",
+                "PLAN-ROUND",
+                "--worktree-id",
+                "wt-round",
+                "--receipt",
+                "packets/coding-receipt.md",
+                "--expected-path",
+                "src/module.py",
+            ]
+        )
+        self.assertIn("Recorded round-log evidence", recorded.stdout)
+
+        required = run_cmd(
+            [
+                TOOL,
+                "require-round-log-evidence",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-round",
+                "--project-root",
+                self.tmp,
+                "--plan-id",
+                "PLAN-ROUND",
+                "--worktree-id",
+                "wt-round",
+            ]
+        )
+        self.assertIn("Round-log evidence present", required.stdout)
+        agents = json.loads((self.state_dir / "state" / "agents.json").read_text(encoding="utf-8"))
+        self.assertEqual(agents["coding-round"]["latest_round_snapshot_id"], "0003_20260730T000000")
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "round-log-events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(events[-1]["event"], "round-log-evidence")
+
+    def test_require_round_log_evidence_rejects_missing_or_stale_evidence(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        missing = run_cmd(
+            [
+                TOOL,
+                "require-round-log-evidence",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "missing-agent",
+            ],
+            check=False,
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("No round-log evidence", missing.stderr)
+
+        append_jsonl_locked(
+            self.state_dir / "state" / "round-log-events.jsonl",
+            {
+                "at": "2026-07-28T00:00:00+00:00",
+                "event": "round-log-evidence",
+                "agent_id": "coding-stale",
+                "snapshot_id": "0001_old",
+            },
+        )
+        stale = run_cmd(
+            [
+                TOOL,
+                "require-round-log-evidence",
+                "--state-dir",
+                self.state_dir,
+                "--agent-id",
+                "coding-stale",
+                "--max-age-minutes",
+                "1",
+                "--at",
+                "2026-07-30T00:00:00+00:00",
+            ],
+            check=False,
+        )
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("is stale", stale.stderr)
+
+    def test_round_log_export_uses_explicit_command_and_records_event(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        write_round_log_snapshot(self.tmp, "0004_20260730T000000")
+        fake_command = self.tmp / "fake_round_logger.py"
+        fake_command.write_text(
+            "\n".join(
+                [
+                    "import sys",
+                    "from pathlib import Path",
+                    "args = sys.argv[1:]",
+                    "output = Path(args[args.index('--output') + 1]) if '--output' in args else Path('unused')",
+                    "output.mkdir(parents=True, exist_ok=True)",
+                    "(output / 'export-info.json').write_text('{\"ok\": true}\\n', encoding='utf-8')",
+                    "print('Exported readable snapshot')",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        output = self.tmp / "round-export"
+
+        result = run_cmd(
+            [
+                TOOL,
+                "round-log-export",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--snapshot-id",
+                "0004_20260730T000000",
+                "--round-log-command",
+                f"{PYTHON} {fake_command}",
+                "--output",
+                output,
+            ]
+        )
+        self.assertIn("Round-log export recorded", result.stdout)
+        self.assertTrue((output / "export-info.json").exists())
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "round-log-events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(events[-1]["event"], "round-log-export")
 
     def test_release_validator_runs_fake_quick_validate_under_test_hook(self):
         fake_quick = self.tmp / "quick_validate.py"
