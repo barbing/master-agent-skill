@@ -314,6 +314,16 @@ REQUIRED_HEADINGS = {
         "## Export Policy",
         "## Restore Policy",
     ],
+    "repair-log-control.md": [
+        "# Repair Log Control",
+        "## Purpose",
+        "## Provider",
+        "## Task Record Lane",
+        "## Repair Cycle Lane",
+        "## Current Row Gate",
+        "## Record Policy",
+        "## Audit Trail",
+    ],
     "incident-log.md": [
         "# Incident Log",
         "## Incident Summary",
@@ -419,6 +429,7 @@ STRICT_STATE_FILES = [
     Path("state") / "governance-events.jsonl",
     Path("state") / "acceptance-gates.jsonl",
     Path("state") / "round-log-events.jsonl",
+    Path("state") / "repair-log-events.jsonl",
     Path("state") / "schema-version.json",
 ]
 

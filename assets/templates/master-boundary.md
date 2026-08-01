@@ -7,6 +7,7 @@
 ## Allowed Master Write Paths
 
 - docs/master-agent/**
+- docs/repair-execution-log/**
 - .codex-round-log/**
 
 ## Forbidden Master Write Paths
@@ -17,6 +18,7 @@
 - migrations
 - packaging or deployment behavior
 - round-log restore or source rewrite without explicit user decision
+- repair-log records that widen root authorization or hide a blocked current row
 
 ## Enforcement Policy
 

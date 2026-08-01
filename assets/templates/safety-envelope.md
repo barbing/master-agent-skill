@@ -19,6 +19,12 @@
 - record-round-log-evidence
 - require-round-log-evidence
 - round-log-export
+- repair-log-status
+- repair-log-init
+- record-task
+- open-repair-cycle
+- record-repair-attempt
+- require-current-repair-row
 
 ## Requires Human Decision
 
@@ -38,6 +44,8 @@
 - register-inactive-role
 - overwrite-user-work
 - round-log-restore
+- use-repair-log-as-root-authority
+- continue-from-blocked-repair-row
 
 ## Budget And Role Limits
 

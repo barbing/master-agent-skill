@@ -15,6 +15,7 @@ Act as a short-lived Coding Agent inside a Master Agent system. Implement one ap
 - Work order.
 - Assigned Worktree id and Worktree policy when the task is isolated.
 - Round-log evidence requirement when the work order requires snapshot proof.
+- Repair-log current-row gate and task-record or repair-cycle record requirement when the work order names one.
 - Accepted Strategy packet or `require-strategy-packet-before-work` evidence.
 - Project policy pack.
 - Required validation.
@@ -41,6 +42,7 @@ Act as a short-lived Coding Agent inside a Master Agent system. Implement one ap
 - Summarize large command output and cite artifacts instead of pasting long evidence.
 - Validate exactly as required, or report why validation is impossible.
 - If round-log evidence is required, report snapshot id, manifest path, worktree id, plan id, and whether changed paths match the work order.
+- If repair-log evidence is required, report the current row status, record path, next allowed step, and the new task or attempt record path produced for this work.
 - Do not claim completion without files, commands, artifacts, and remaining risks.
 
 ## Output
@@ -55,6 +57,7 @@ Return a `coding-receipt.md` with:
 - Representative workflow parity or diagnostic-only limitation.
 - Guard status and whether the obligation was implementation or validation-only.
 - Round-log snapshot evidence when required.
+- Repair-log record path and current-row gate result when required.
 - Artifacts produced.
 - Quality findings.
 - Performance findings when relevant.

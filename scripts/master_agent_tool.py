@@ -75,6 +75,12 @@ SAFETY_AUTONOMOUS_ACTIONS = {
     "record-round-log-evidence",
     "require-round-log-evidence",
     "round-log-export",
+    "repair-log-status",
+    "repair-log-init",
+    "record-task",
+    "open-repair-cycle",
+    "record-repair-attempt",
+    "require-current-repair-row",
 }
 SAFETY_REMEDIATION_ACTIONS = {
     "reinforce-context",
@@ -104,7 +110,7 @@ SAFETY_HARD_BUDGET_IMPACT = 20_000
 USAGE_SOURCES = ("measured", "estimated", "self-reported")
 USAGE_CONFIDENCES = ("low", "medium", "high")
 LARGE_CONTINUATION_TOKENS = 5_000
-CURRENT_SCHEMA_VERSION = "1.4"
+CURRENT_SCHEMA_VERSION = "1.5"
 ORDERED_MIGRATIONS = [
     "0001-base-state",
     "0002-runtime-session-observability",
@@ -112,10 +118,23 @@ ORDERED_MIGRATIONS = [
     "0004-governance-optimization",
     "0005-guard-synchronization",
     "0006-round-log-evidence",
+    "0007-repair-log-control",
 ]
 DEFAULT_CODEX_APP_READ_MAX_MINUTES = 60.0
 DEFAULT_WORKTREE_EVIDENCE_MAX_MINUTES = 60.0
 DEFAULT_ROUND_LOG_EVIDENCE_MAX_MINUTES = 1440.0
+DEFAULT_REPAIR_LOG_ALLOWED_STATUSES = {"active", "continue", "in-progress", "ready"}
+DEFAULT_REPAIR_LOG_BLOCKED_STATUSES = {
+    "accepted",
+    "blocked",
+    "complete",
+    "no-further-action",
+    "not-ready",
+    "paused",
+    "repair-cycle-needed",
+    "rollback-only",
+    "superseded",
+}
 
 ROOT_AUTHORITY_SOURCE_KINDS = {
     "current-user-request",
@@ -1367,6 +1386,7 @@ def ensure_state_storage(state_dir: Path) -> None:
     governance_events_path = storage_dir / "governance-events.jsonl"
     acceptance_gates_path = storage_dir / "acceptance-gates.jsonl"
     round_log_events_path = storage_dir / "round-log-events.jsonl"
+    repair_log_events_path = storage_dir / "repair-log-events.jsonl"
     schema_path = storage_dir / "schema-version.json"
     if not agents_path.exists():
         atomic_write_text(agents_path, "{}\n")
@@ -1430,6 +1450,8 @@ def ensure_state_storage(state_dir: Path) -> None:
         atomic_write_text(acceptance_gates_path, "")
     if not round_log_events_path.exists():
         atomic_write_text(round_log_events_path, "")
+    if not repair_log_events_path.exists():
+        atomic_write_text(repair_log_events_path, "")
     if not schema_path.exists():
         atomic_write_json(schema_path, default_schema_version())
 
@@ -2066,6 +2088,7 @@ def _state_file_paths(state_dir: Path) -> list[Path]:
         state_dir / "state" / "governance-events.jsonl",
         state_dir / "state" / "acceptance-gates.jsonl",
         state_dir / "state" / "round-log-events.jsonl",
+        state_dir / "state" / "repair-log-events.jsonl",
         state_dir / "state" / "schema-version.json",
     ]
 
@@ -5575,6 +5598,719 @@ def command_round_log_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def repair_log_root(repo_root: Path) -> Path:
+    return repo_root / "docs" / "repair-execution-log"
+
+
+def repair_log_event_path(state_dir: Path) -> Path:
+    return state_dir / "state" / "repair-log-events.jsonl"
+
+
+def append_repair_log_event(state_dir: Path, entry: dict) -> None:
+    append_jsonl_locked(repair_log_event_path(state_dir), entry)
+
+
+def repair_log_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "record"
+
+
+def markdown_cell(value: object) -> str:
+    return table_value(value).replace("\r", " ").replace("\n", " ")
+
+
+def append_markdown_locked(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with with_lock(lock_path):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def ensure_repair_log_layout(repo_root: Path, force: bool = False) -> list[Path]:
+    root = repair_log_root(repo_root)
+    task_root = root / "task-records"
+    created: list[Path] = []
+    files = {
+        root / "README.md": "\n".join(
+            [
+                "# Repair Execution Log",
+                "",
+                "## Purpose",
+                "",
+                "- Repository-local document memory for bounded task records and repeated repair cycles.",
+                "- The log preserves current status, next allowed step, escalation trigger, and evidence paths.",
+                "- Records may narrow or sequence an authorized task; they do not create root authorization.",
+                "",
+                "## Layout",
+                "",
+                "- `task-records/` stores bounded non-loop work.",
+                "- `<cycle-id>-execution-log/` stores repeated repair-cycle plans and attempt records.",
+                "- `plan-index.md` tracks repair cycles and their current status.",
+                "",
+            ]
+        )
+        + "\n",
+        root / "lifecycle-summary.md": "\n".join(
+            [
+                "# Repair Lifecycle Summary",
+                "",
+                "## Active Workstreams",
+                "",
+                "| Workstream | Current Status | Current Record | Next Allowed Step |",
+                "| --- | --- | --- | --- |",
+                "|  |  |  |  |",
+                "",
+                "## Blocked Or Paused Work",
+                "",
+                "| Workstream | Reason | Required Decision |",
+                "| --- | --- | --- |",
+                "|  |  |  |",
+                "",
+                "## Superseded Or Closed Work",
+                "",
+                "| Workstream | Closing Record | Notes |",
+                "| --- | --- | --- |",
+                "|  |  |  |",
+                "",
+            ]
+        )
+        + "\n",
+        root / "plan-index.md": "\n".join(
+            [
+                "# Repair Plan Index",
+                "",
+                "| Date | Cycle Id | Status | Current Record | Next Allowed Step | Escalation Trigger | Notes |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        + "\n",
+        task_root / "README.md": "\n".join(
+            [
+                "# Task Records",
+                "",
+                "## Purpose",
+                "",
+                "- Lightweight durable records for bounded non-loop work.",
+                "- A task record is an execution receipt, not a repair-cycle plan.",
+                "- Use a repair cycle when repeated attempts, rollback/retry, or autonomous iteration begins.",
+                "",
+            ]
+        )
+        + "\n",
+        task_root / "plan-index.md": "\n".join(
+            [
+                "# Task Record Plan Index",
+                "",
+                "| Date | Workstream | Status | Outcome | Record | Next Allowed Step | Escalation Trigger |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        + "\n",
+    }
+    for path, text in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and not force:
+            continue
+        atomic_write_text(path, text)
+        created.append(path)
+    return created
+
+
+def repair_log_table_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    header: list[str] | None = None
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if not header:
+            header = [re.sub(r"[^a-z0-9]+", "_", cell.lower()).strip("_") for cell in cells]
+            continue
+        if all(set(cell.replace(":", "").strip()) <= {"-"} for cell in cells):
+            continue
+        values = {key: cells[index] if index < len(cells) else "" for index, key in enumerate(header)}
+        values["_index_path"] = str(path)
+        values["_line"] = line_number
+        rows.append(values)
+    return rows
+
+
+def repair_row_status(row: dict) -> str:
+    value = str(
+        row.get("status")
+        or row.get("outcome")
+        or row.get("decision")
+        or row.get("current_status")
+        or ""
+    )
+    return re.sub(r"[\s_]+", "-", value.strip().lower())
+
+
+def repair_row_record_path(row: dict) -> str:
+    return str(
+        row.get("record")
+        or row.get("current_record")
+        or row.get("record_path")
+        or row.get("plan")
+        or ""
+    ).strip()
+
+
+def repair_row_next_step(row: dict) -> str:
+    return str(
+        row.get("next_allowed_step")
+        or row.get("next_step")
+        or row.get("current_next_allowed_step")
+        or ""
+    ).strip()
+
+
+def latest_repair_row(
+    repo_root: Path,
+    workstream: str = "",
+    cycle_id: str = "",
+) -> dict | None:
+    root = repair_log_root(repo_root)
+    candidates: list[Path] = []
+    if cycle_id:
+        candidates.append(root / f"{repair_log_slug(cycle_id)}-execution-log" / "plan-index.md")
+    elif workstream:
+        stream_slug = repair_log_slug(workstream)
+        stream_index = root / "task-records" / stream_slug / "plan-index.md"
+        if stream_index.exists():
+            candidates.append(stream_index)
+        candidates.append(root / "task-records" / "plan-index.md")
+    else:
+        candidates.extend([root / "plan-index.md", root / "task-records" / "plan-index.md"])
+
+    rows: list[dict] = []
+    for candidate in candidates:
+        for row in repair_log_table_rows(candidate):
+            if workstream:
+                row_workstream = str(row.get("workstream") or "").strip().lower()
+                if row_workstream and row_workstream != workstream.strip().lower():
+                    continue
+            if cycle_id:
+                row_cycle = str(row.get("cycle_id") or "").strip().lower()
+                if row_cycle and row_cycle != repair_log_slug(cycle_id).lower():
+                    continue
+            rows.append(row)
+    return rows[-1] if rows else None
+
+
+def inspect_repair_log(repo_root: Path, workstream: str = "", cycle_id: str = "") -> dict:
+    root = repair_log_root(repo_root)
+    task_index = root / "task-records" / "plan-index.md"
+    cycle_index = root / "plan-index.md"
+    missing: list[str] = []
+    for path in [root / "README.md", root / "lifecycle-summary.md", cycle_index, task_index]:
+        if not path.exists():
+            missing.append(str(path.relative_to(repo_root).as_posix()))
+    current = latest_repair_row(repo_root, workstream=workstream, cycle_id=cycle_id)
+    if not root.exists():
+        status = "missing"
+    elif missing:
+        status = "partial"
+    elif current and repair_row_status(current) in DEFAULT_REPAIR_LOG_BLOCKED_STATUSES:
+        status = "blocked"
+    elif current:
+        status = "active"
+    else:
+        status = "initialized"
+    return {
+        "status": status,
+        "repo_root": str(repo_root),
+        "repair_log_root": str(root),
+        "task_index": str(task_index),
+        "cycle_index": str(cycle_index),
+        "missing": missing,
+        "workstream": workstream,
+        "cycle_id": cycle_id,
+        "current_row": current or {},
+        "current_status": repair_row_status(current or {}),
+        "current_record": repair_row_record_path(current or {}),
+        "current_next_allowed_step": repair_row_next_step(current or {}),
+    }
+
+
+def render_repair_log_control(state_dir: Path) -> None:
+    events = load_jsonl_entries(repair_log_event_path(state_dir))
+    latest = events[-1] if events else {}
+    latest_status = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("event") in {"repair-log-status", "repair-log-current-row-required"}
+        ),
+        {},
+    )
+    latest_record = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("event") in {"task-recorded", "repair-cycle-opened", "repair-attempt-recorded"}
+        ),
+        {},
+    )
+    lines = [
+        "# Repair Log Control",
+        "",
+        "## Purpose",
+        "",
+        "- Project-local document memory for bounded tasks and repeated repair cycles.",
+        "- Keeps continuity in repository docs instead of raw conversation history.",
+        "- Complements Master ledgers, guard obligations, round-log evidence, and Git status.",
+        "",
+        "## Provider",
+        "",
+        f"- Repair log root: {latest_status.get('repair_log_root', '')}",
+        f"- Status: {latest_status.get('status', '')}",
+        f"- Latest index: {latest_status.get('latest_index', '')}",
+        f"- Latest row status: {latest_status.get('current_status', '')}",
+        f"- Latest row next allowed step: {latest_status.get('current_next_allowed_step', '')}",
+        "",
+        "## Task Record Lane",
+        "",
+        "- Task records root: docs/repair-execution-log/task-records",
+        "- Task index: docs/repair-execution-log/task-records/plan-index.md",
+        "- One-off task records do not authorize autonomous loops.",
+        "- A paused, rollback-only, superseded, or no-further-action task row blocks successor work.",
+        "",
+        "## Repair Cycle Lane",
+        "",
+        "- Cycle index: docs/repair-execution-log/plan-index.md",
+        f"- Active cycle: {latest_status.get('cycle_id', '')}",
+        f"- Active cycle plan: {latest_status.get('cycle_plan', '')}",
+        f"- Active cycle record: {latest_status.get('current_record', '')}",
+        "- Repair cycles require explicit current user, goal, or approved-plan authority.",
+        "",
+        "## Current Row Gate",
+        "",
+        "- Required before launching or accepting sub-agent work when prior document memory exists.",
+        "- The current row must name status, record path, next allowed step, and escalation trigger.",
+        "- Blocked statuses: paused, blocked, not-ready, repair-cycle-needed, rollback-only, no-further-action, superseded, complete, accepted.",
+        "- Allowed statuses default to active, continue, in-progress, ready.",
+        "",
+        "## Record Policy",
+        "",
+        "- Record task outcomes that affect future work.",
+        "- Open a repair cycle for repeated failure classes, rollback/retry sequences, or autonomous iteration.",
+        "- Do not treat task records, repair records, or plan-index rows as root authorization.",
+        "- Do not create command-level record spam; consolidate when record volume grows.",
+        "",
+        "## Audit Trail",
+        "",
+        "- Events file: state/repair-log-events.jsonl",
+        f"- Latest event: {latest.get('event', '')}",
+        f"- Latest event at: {latest.get('at', '')}",
+        f"- Latest record path: {latest_record.get('record_path', '')}",
+        "",
+    ]
+    atomic_write_text(state_dir / "repair-log-control.md", "\n".join(lines) + "\n")
+
+
+def command_repair_log_init(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp = format_time(parse_time(args.at))
+    if repo_error:
+        print(f"Repair log init requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    created = ensure_repair_log_layout(repo_root, force=args.force)
+    event = {
+        "at": timestamp,
+        "event": "repair-log-init",
+        "repo_root": str(repo_root),
+        "repair_log_root": str(repair_log_root(repo_root)),
+        "created": [path.relative_to(repo_root).as_posix() for path in created],
+    }
+    append_repair_log_event(state_dir, event)
+    render_repair_log_control(state_dir)
+    print(f"Repair log initialized: {repair_log_root(repo_root)}")
+    if created:
+        print("created:")
+        for path in created:
+            print(f"- {path.relative_to(repo_root).as_posix()}")
+    else:
+        print("created: none")
+    return 0
+
+
+def command_repair_log_status(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp = format_time(parse_time(args.at))
+    if repo_error:
+        print(f"Repair log status requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    status = inspect_repair_log(repo_root, workstream=args.workstream or "", cycle_id=args.cycle_id or "")
+    current_row = status.get("current_row") or {}
+    status["latest_index"] = current_row.get("_index_path", "")
+    event = {"at": timestamp, "event": "repair-log-status", **status}
+    append_repair_log_event(state_dir, event)
+    render_repair_log_control(state_dir)
+    print(f"Repair log status: {status['status']}")
+    print(f"Repair log root: {status['repair_log_root']}")
+    print(f"Current status: {status['current_status'] or 'none'}")
+    print(f"Current record: {status['current_record'] or 'none'}")
+    print(f"Next allowed step: {status['current_next_allowed_step'] or 'none'}")
+    if status["missing"]:
+        print("Missing:")
+        for missing in status["missing"]:
+            print(f"- {missing}")
+    if args.require_current:
+        return require_current_repair_row(
+            repo_root,
+            args.workstream or "",
+            args.cycle_id or "",
+            set(args.allowed_status or DEFAULT_REPAIR_LOG_ALLOWED_STATUSES),
+        )
+    return 1 if args.require_initialized and status["status"] in {"missing", "partial"} else 0
+
+
+def require_current_repair_row(
+    repo_root: Path,
+    workstream: str,
+    cycle_id: str,
+    allowed_statuses: set[str],
+) -> int:
+    row = latest_repair_row(repo_root, workstream=workstream, cycle_id=cycle_id)
+    if not row:
+        print("No current repair-log row found", file=sys.stderr)
+        return 1
+    status = repair_row_status(row)
+    record = repair_row_record_path(row)
+    next_step = repair_row_next_step(row)
+    if status in DEFAULT_REPAIR_LOG_BLOCKED_STATUSES or status not in allowed_statuses:
+        print(
+            f"Current repair-log row status blocks work: {status or 'missing'}",
+            file=sys.stderr,
+        )
+        return 1
+    if not record:
+        print("Current repair-log row has no record path", file=sys.stderr)
+        return 1
+    if not next_step:
+        print("Current repair-log row has no next allowed step", file=sys.stderr)
+        return 1
+    print(f"Current repair-log row allows work: status={status} record={record}")
+    print(f"Next allowed step: {next_step}")
+    return 0
+
+
+def command_require_current_repair_row(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp = format_time(parse_time(args.at))
+    if repo_error:
+        print(f"Repair log gate requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    allowed = {
+        repair_row_status({"status": value})
+        for value in (args.allowed_status or DEFAULT_REPAIR_LOG_ALLOWED_STATUSES)
+    }
+    result = require_current_repair_row(repo_root, args.workstream or "", args.cycle_id or "", allowed)
+    row = latest_repair_row(repo_root, workstream=args.workstream or "", cycle_id=args.cycle_id or "")
+    append_repair_log_event(
+        state_dir,
+        {
+            "at": timestamp,
+            "event": "repair-log-current-row-required",
+            "repo_root": str(repo_root),
+            "workstream": args.workstream or "",
+            "cycle_id": args.cycle_id or "",
+            "result": "passed" if result == 0 else "failed",
+            "current_status": repair_row_status(row or {}),
+            "current_record": repair_row_record_path(row or {}),
+            "current_next_allowed_step": repair_row_next_step(row or {}),
+        },
+    )
+    render_repair_log_control(state_dir)
+    return result
+
+
+def command_record_task(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp_dt = parse_time(args.at)
+    timestamp = format_time(timestamp_dt)
+    if repo_error:
+        print(f"Task record requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    ensure_repair_log_layout(repo_root)
+    workstream = args.workstream or "general"
+    workstream_slug = repair_log_slug(workstream)
+    title_slug = repair_log_slug(args.slug or args.title)
+    date_prefix = timestamp_dt.date().isoformat()
+    record_dir = repair_log_root(repo_root) / "task-records" / workstream_slug
+    record_path = record_dir / f"{date_prefix}-{title_slug}.md"
+    if record_path.exists() and not args.force:
+        print(f"Task record already exists: {record_path}", file=sys.stderr)
+        return 1
+    record_text = "\n".join(
+        [
+            f"# {date_prefix} - {args.title}",
+            "",
+            "## Scope",
+            "",
+            "- task type: bounded task record",
+            f"- user objective: {args.objective}",
+            f"- source docs: {', '.join(args.source_doc or [])}",
+            f"- explicit non-goals: {', '.join(args.explicit_non_goal or [])}",
+            "",
+            "## Work Performed",
+            "",
+            f"- files touched: {', '.join(args.files_touched or [])}",
+            f"- commands run: {', '.join(args.commands_run or [])}",
+            f"- artifacts produced: {', '.join(args.artifact or [])}",
+            "",
+            "## Evidence",
+            "",
+            f"- validation: {', '.join(args.validation or [])}",
+            "- visual review:",
+            "- performance:",
+            f"- missing or inconclusive evidence: {args.missing_evidence or ''}",
+            "",
+            "## Decision",
+            "",
+            f"- outcome: {args.outcome}",
+            f"- first failing boundary: {args.first_failing_boundary or ''}",
+            f"- reason: {args.reason}",
+            f"- next allowed step: {args.next_step}",
+            "",
+            "## Notes For Future Agents",
+            "",
+            f"- what to trust: {args.trust or ''}",
+            f"- what not to treat as proof: {args.not_proof or ''}",
+            f"- related records or artifact roots: {', '.join(args.related or [])}",
+            "",
+        ]
+    )
+    record_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(record_path, record_text)
+    rel_record = record_path.relative_to(repo_root).as_posix()
+    row = (
+        f"| {date_prefix} | {markdown_cell(workstream)} | {markdown_cell(args.status)} | "
+        f"{markdown_cell(args.outcome)} | {markdown_cell(rel_record)} | "
+        f"{markdown_cell(args.next_step)} | {markdown_cell(args.escalation_trigger)} |\n"
+    )
+    global_index = repair_log_root(repo_root) / "task-records" / "plan-index.md"
+    stream_index = record_dir / "plan-index.md"
+    if not stream_index.exists():
+        atomic_write_text(
+            stream_index,
+            "# Task Record Plan Index\n\n"
+            "| Date | Workstream | Status | Outcome | Record | Next Allowed Step | Escalation Trigger |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n",
+        )
+    append_markdown_locked(global_index, row)
+    append_markdown_locked(stream_index, row)
+    event = {
+        "at": timestamp,
+        "event": "task-recorded",
+        "repo_root": str(repo_root),
+        "workstream": workstream,
+        "status": args.status,
+        "outcome": args.outcome,
+        "record_path": rel_record,
+        "next_allowed_step": args.next_step,
+        "escalation_trigger": args.escalation_trigger,
+    }
+    append_repair_log_event(state_dir, event)
+    render_repair_log_control(state_dir)
+    print(f"Task record created: {record_path}")
+    return 0
+
+
+def command_open_repair_cycle(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp_dt = parse_time(args.at)
+    timestamp = format_time(timestamp_dt)
+    if repo_error:
+        print(f"Repair cycle requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    ensure_repair_log_layout(repo_root)
+    cycle_id = repair_log_slug(args.cycle_id)
+    cycle_dir = repair_log_root(repo_root) / f"{cycle_id}-execution-log"
+    plan_path = cycle_dir / "plan.md"
+    index_path = cycle_dir / "plan-index.md"
+    records_dir = cycle_dir / "records"
+    if plan_path.exists() and not args.force:
+        print(f"Repair cycle already exists: {plan_path}", file=sys.stderr)
+        return 1
+    records_dir.mkdir(parents=True, exist_ok=True)
+    plan_text = "\n".join(
+        [
+            f"# {args.repair_area} Repair Cycle",
+            "",
+            "## Cycle",
+            "",
+            f"- cycle id: {cycle_id}",
+            f"- repair area: {args.repair_area}",
+            f"- status: {args.status}",
+            f"- branch: {args.branch or ''}",
+            f"- controlling docs: {', '.join(args.controlling_doc or [])}",
+            "",
+            "## Objective",
+            "",
+            f"- objective: {args.objective}",
+            f"- original target error: {args.target_error}",
+            f"- first failing boundary: {args.first_failing_boundary}",
+            f"- acceptance metric: {args.acceptance_metric}",
+            "",
+            "## Boundaries",
+            "",
+            f"- forbidden boundaries: {', '.join(args.forbidden_boundary or [])}",
+            f"- non-goals: {', '.join(args.non_goal or [])}",
+            "",
+            "## Prior Attempt Review",
+            "",
+            f"- duplicates or conflicts: {args.prior_attempt_review or ''}",
+            "- failure-bucket migration risk:",
+            "",
+            "## Budget",
+            "",
+            f"- attempt budget: {args.attempt_budget}",
+            "- reassessment trigger: repeated failed attempts or no acceptance-metric movement",
+            "",
+            "## Current Next Allowed Step",
+            "",
+            f"- {args.next_step}",
+            "",
+        ]
+    )
+    atomic_write_text(plan_path, plan_text)
+    atomic_write_text(
+        index_path,
+        "# Repair Cycle Plan Index\n\n"
+        "| Date | Cycle Id | Status | Current Record | Next Allowed Step | Escalation Trigger | Notes |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n",
+    )
+    date_prefix = timestamp_dt.date().isoformat()
+    rel_plan = plan_path.relative_to(repo_root).as_posix()
+    row = (
+        f"| {date_prefix} | {markdown_cell(cycle_id)} | {markdown_cell(args.status)} | "
+        f"{markdown_cell(rel_plan)} | {markdown_cell(args.next_step)} | "
+        f"{markdown_cell(args.escalation_trigger)} | {markdown_cell(args.objective)} |\n"
+    )
+    append_markdown_locked(index_path, row)
+    append_markdown_locked(repair_log_root(repo_root) / "plan-index.md", row)
+    event = {
+        "at": timestamp,
+        "event": "repair-cycle-opened",
+        "repo_root": str(repo_root),
+        "cycle_id": cycle_id,
+        "status": args.status,
+        "record_path": rel_plan,
+        "next_allowed_step": args.next_step,
+        "escalation_trigger": args.escalation_trigger,
+    }
+    append_repair_log_event(state_dir, event)
+    render_repair_log_control(state_dir)
+    print(f"Repair cycle opened: {plan_path}")
+    return 0
+
+
+def command_record_repair_attempt(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    ensure_state_storage(state_dir)
+    repo_root, repo_error = git_repo_root(Path(args.project_root).resolve())
+    timestamp_dt = parse_time(args.at)
+    timestamp = format_time(timestamp_dt)
+    if repo_error:
+        print(f"Repair attempt requires a Git repository: {repo_error}", file=sys.stderr)
+        return 2
+    assert repo_root is not None
+    cycle_id = repair_log_slug(args.cycle_id)
+    cycle_dir = repair_log_root(repo_root) / f"{cycle_id}-execution-log"
+    plan_path = cycle_dir / "plan.md"
+    if not plan_path.exists():
+        print(f"Repair cycle plan not found: {plan_path}", file=sys.stderr)
+        return 1
+    attempt_slug = repair_log_slug(args.slug or args.attempt_id)
+    date_prefix = timestamp_dt.date().isoformat()
+    record_path = cycle_dir / "records" / f"{date_prefix}-{attempt_slug}.md"
+    if record_path.exists() and not args.force:
+        print(f"Repair attempt record already exists: {record_path}", file=sys.stderr)
+        return 1
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_text = "\n".join(
+        [
+            f"# {date_prefix} - {args.attempt_id}",
+            "",
+            "## Hypothesis",
+            "",
+            f"- {args.hypothesis}",
+            "",
+            "## Intended Boundary",
+            "",
+            f"- {args.intended_boundary}",
+            "",
+            "## Diff Scope",
+            "",
+            f"- files touched: {', '.join(args.files_touched or [])}",
+            "",
+            "## Validation",
+            "",
+            f"- commands and artifacts: {', '.join(args.validation or [])}",
+            "",
+            "## Acceptance Movement",
+            "",
+            f"- acceptance metric movement: {args.metric_status}",
+            f"- failure-bucket movement: {args.failure_bucket or ''}",
+            "",
+            "## Decision",
+            "",
+            f"- decision: {args.decision}",
+            f"- rollback/salvage/revert: {args.diff_decision or ''}",
+            f"- next allowed step: {args.next_step}",
+            "",
+        ]
+    )
+    atomic_write_text(record_path, record_text)
+    rel_record = record_path.relative_to(repo_root).as_posix()
+    row = (
+        f"| {date_prefix} | {markdown_cell(cycle_id)} | {markdown_cell(args.decision)} | "
+        f"{markdown_cell(rel_record)} | {markdown_cell(args.next_step)} | "
+        f"{markdown_cell(args.escalation_trigger)} | {markdown_cell(args.metric_status)} |\n"
+    )
+    append_markdown_locked(cycle_dir / "plan-index.md", row)
+    append_markdown_locked(repair_log_root(repo_root) / "plan-index.md", row)
+    event = {
+        "at": timestamp,
+        "event": "repair-attempt-recorded",
+        "repo_root": str(repo_root),
+        "cycle_id": cycle_id,
+        "attempt_id": args.attempt_id,
+        "decision": args.decision,
+        "metric_status": args.metric_status,
+        "record_path": rel_record,
+        "next_allowed_step": args.next_step,
+        "escalation_trigger": args.escalation_trigger,
+    }
+    append_repair_log_event(state_dir, event)
+    render_repair_log_control(state_dir)
+    print(f"Repair attempt recorded: {record_path}")
+    return 0
+
+
 def load_jsonl_entries(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -6345,6 +7081,7 @@ def command_telemetry_summary(args: argparse.Namespace) -> int:
     learning_checks = load_jsonl_entries(state_dir / "state" / "learning-effectiveness.jsonl")
     governance_events = load_jsonl_entries(state_dir / "state" / "governance-events.jsonl")
     acceptance_gates = load_jsonl_entries(state_dir / "state" / "acceptance-gates.jsonl")
+    repair_log_events = load_jsonl_entries(state_dir / "state" / "repair-log-events.jsonl")
     recurrence_count = sum(
         1 for check in learning_checks if check.get("status") == "recurrence-detected"
     )
@@ -6358,6 +7095,7 @@ def command_telemetry_summary(args: argparse.Namespace) -> int:
     print(f"Learning recurrences: {recurrence_count}")
     print(f"Governance events: {len(governance_events)}")
     print(f"Acceptance gates: {len(acceptance_gates)}")
+    print(f"Repair-log events: {len(repair_log_events)}")
     print(f"Runtime state: {runtime.get('supervisor_state')}")
     print(f"Last supervisor check: {runtime.get('last_check_at', '')}")
     return 1 if alerts else 0
@@ -7379,6 +8117,102 @@ def build_parser() -> argparse.ArgumentParser:
     round_export.add_argument("--timeout-seconds", type=float, default=60)
     round_export.add_argument("--at")
     round_export.set_defaults(func=command_round_log_export)
+
+    repair_init = subparsers.add_parser("repair-log-init", help="Initialize the project-local docs/repair-execution-log document-memory lane.")
+    repair_init.add_argument("--state-dir", required=True)
+    repair_init.add_argument("--project-root", required=True)
+    repair_init.add_argument("--force", action="store_true")
+    repair_init.add_argument("--at")
+    repair_init.set_defaults(func=command_repair_log_init)
+
+    repair_status = subparsers.add_parser("repair-log-status", help="Inspect the project-local repair-execution-log document memory.")
+    repair_status.add_argument("--state-dir", required=True)
+    repair_status.add_argument("--project-root", required=True)
+    repair_status.add_argument("--workstream")
+    repair_status.add_argument("--cycle-id")
+    repair_status.add_argument("--require-initialized", action="store_true")
+    repair_status.add_argument("--require-current", action="store_true")
+    repair_status.add_argument("--allowed-status", action="append")
+    repair_status.add_argument("--at")
+    repair_status.set_defaults(func=command_repair_log_status)
+
+    require_repair_row = subparsers.add_parser("require-current-repair-row", help="Fail unless the current repair-log row allows successor work.")
+    require_repair_row.add_argument("--state-dir", required=True)
+    require_repair_row.add_argument("--project-root", required=True)
+    require_repair_row.add_argument("--workstream")
+    require_repair_row.add_argument("--cycle-id")
+    require_repair_row.add_argument("--allowed-status", action="append")
+    require_repair_row.add_argument("--at")
+    require_repair_row.set_defaults(func=command_require_current_repair_row)
+
+    record_task = subparsers.add_parser("record-task", help="Create a bounded task record in docs/repair-execution-log/task-records.")
+    record_task.add_argument("--state-dir", required=True)
+    record_task.add_argument("--project-root", required=True)
+    record_task.add_argument("--title", required=True)
+    record_task.add_argument("--workstream", default="general")
+    record_task.add_argument("--objective", required=True)
+    record_task.add_argument("--status", default="complete")
+    record_task.add_argument("--outcome", required=True, choices=["complete", "not-ready", "inconclusive", "reverted", "salvage", "paused"])
+    record_task.add_argument("--reason", required=True)
+    record_task.add_argument("--next-step", required=True)
+    record_task.add_argument("--escalation-trigger", required=True)
+    record_task.add_argument("--source-doc", action="append")
+    record_task.add_argument("--explicit-non-goal", action="append")
+    record_task.add_argument("--files-touched", action="append")
+    record_task.add_argument("--commands-run", action="append")
+    record_task.add_argument("--artifact", action="append")
+    record_task.add_argument("--validation", action="append")
+    record_task.add_argument("--missing-evidence")
+    record_task.add_argument("--first-failing-boundary")
+    record_task.add_argument("--trust")
+    record_task.add_argument("--not-proof")
+    record_task.add_argument("--related", action="append")
+    record_task.add_argument("--slug")
+    record_task.add_argument("--force", action="store_true")
+    record_task.add_argument("--at")
+    record_task.set_defaults(func=command_record_task)
+
+    open_cycle = subparsers.add_parser("open-repair-cycle", help="Open a governed repeated-repair document-memory cycle.")
+    open_cycle.add_argument("--state-dir", required=True)
+    open_cycle.add_argument("--project-root", required=True)
+    open_cycle.add_argument("--cycle-id", required=True)
+    open_cycle.add_argument("--repair-area", required=True)
+    open_cycle.add_argument("--objective", required=True)
+    open_cycle.add_argument("--target-error", required=True)
+    open_cycle.add_argument("--first-failing-boundary", required=True)
+    open_cycle.add_argument("--acceptance-metric", required=True)
+    open_cycle.add_argument("--next-step", required=True)
+    open_cycle.add_argument("--attempt-budget", type=int, required=True)
+    open_cycle.add_argument("--status", default="active")
+    open_cycle.add_argument("--branch")
+    open_cycle.add_argument("--controlling-doc", action="append")
+    open_cycle.add_argument("--forbidden-boundary", action="append")
+    open_cycle.add_argument("--non-goal", action="append")
+    open_cycle.add_argument("--prior-attempt-review")
+    open_cycle.add_argument("--escalation-trigger", default="two failed attempts or next step exits authority")
+    open_cycle.add_argument("--force", action="store_true")
+    open_cycle.add_argument("--at")
+    open_cycle.set_defaults(func=command_open_repair_cycle)
+
+    repair_attempt = subparsers.add_parser("record-repair-attempt", help="Record one repair-cycle hypothesis, evidence, decision, and next allowed step.")
+    repair_attempt.add_argument("--state-dir", required=True)
+    repair_attempt.add_argument("--project-root", required=True)
+    repair_attempt.add_argument("--cycle-id", required=True)
+    repair_attempt.add_argument("--attempt-id", required=True)
+    repair_attempt.add_argument("--hypothesis", required=True)
+    repair_attempt.add_argument("--intended-boundary", required=True)
+    repair_attempt.add_argument("--files-touched", action="append")
+    repair_attempt.add_argument("--validation", action="append")
+    repair_attempt.add_argument("--metric-status", required=True, choices=["improved", "unchanged", "regressed", "closed", "inconclusive"])
+    repair_attempt.add_argument("--failure-bucket")
+    repair_attempt.add_argument("--decision", required=True, choices=["continue", "reassess", "accepted", "paused", "blocked", "reverted", "salvage"])
+    repair_attempt.add_argument("--diff-decision")
+    repair_attempt.add_argument("--next-step", required=True)
+    repair_attempt.add_argument("--escalation-trigger", required=True)
+    repair_attempt.add_argument("--slug")
+    repair_attempt.add_argument("--force", action="store_true")
+    repair_attempt.add_argument("--at")
+    repair_attempt.set_defaults(func=command_record_repair_attempt)
 
     enforce_boundary = subparsers.add_parser("enforce-master-boundary", help="Fail when Master changes exceed the allowed state/doc boundary.")
     enforce_boundary.add_argument("--project-root", required=True)

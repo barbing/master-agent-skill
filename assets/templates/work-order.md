@@ -101,6 +101,10 @@
 
 - Task record required: yes | no
 - Record path or reason:
+- Repair log current-row check required: yes | no
+- Repair log workstream:
+- Repair log cycle id:
+- Repair log gate command: require-current-repair-row
 
 ## Heartbeat Requirements
 

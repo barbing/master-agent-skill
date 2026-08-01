@@ -21,6 +21,7 @@ The Master Agent is the control plane. It routes work, monitors heartbeats, enfo
 - Prevent runaway token usage by requiring budgets, usage records, heartbeat caps, escalation thresholds, and token-saving strategy recommendations.
 - Convert repeated corrections and agent mistakes into governed learning proposals instead of relying on raw conversation memory.
 - Isolate sub-agent implementation in planned Worktrees so the user's local checkout and GitHub branches are not changed without an explicit gate.
+- Preserve document memory through repo-local repair-execution logs that record task outcomes, repair-cycle state, and current next allowed steps.
 - Keep project-specific policy outside the reusable skill.
 - Allow the Master Agent to decide when parallel sub-agents are safe.
 - Allow project-specific roles only through a governed role catalog.
@@ -82,6 +83,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `session-control.md` | Provider-neutral session lifecycle contract and audit trail rules. |
 | `worktree-control.md` | Worktree planning, session binding, ignored-file copy policy, handoff, merge, cleanup, and reconciliation rules. |
 | `round-log-control.md` | Optional `codex-round-log` evidence binding, snapshot policy, export policy, and human-directed restore policy. |
+| `repair-log-control.md` | Repo-local `docs/repair-execution-log` document-memory status, current-row gate, bounded task record lane, and repair-cycle lane. |
 | `incident-log.md` | Open and resolved incident summaries, severity levels, remediation, and operator handoff. |
 | `alert-queue.md` | Pending alerts, severity, acknowledgement, suppression, and escalation status. |
 | `state-schema.md` | Current schema version, migration order, compatibility policy, recovery policy, and stale lock handling. |
@@ -103,6 +105,7 @@ The Master Agent reads the current ledger and project policy pack first. It read
 | `state/session-control.jsonl` | Append-only requested and confirmed provider session events. |
 | `state/worktrees.jsonl` | Append-only Worktree plan, confirmation, binding, stale, close, and `.worktreeinclude` validation events. |
 | `state/round-log-events.jsonl` | Append-only round-log status, snapshot evidence, and export events. |
+| `state/repair-log-events.jsonl` | Append-only repair-log status, task-record, repair-cycle, and current-row gate events. |
 | `state/incidents.jsonl` | Append-only incident records. |
 | `state/alerts.jsonl` | Append-only alert-opened and acknowledgement records. |
 | `state/learning-corrections.jsonl` | Append-only correction records for learning cycles. |
@@ -227,6 +230,12 @@ python scripts/master_agent_tool.py round-log-status --state-dir <state-dir> --p
 python scripts/master_agent_tool.py record-round-log-evidence --state-dir <state-dir> --project-root <project-root> --agent-id coding-wt-1 --snapshot-id <snapshot-id> --plan-id PLAN-1 --worktree-id wt-task-1 --receipt packets/coding-receipt.md
 python scripts/master_agent_tool.py require-round-log-evidence --state-dir <state-dir> --agent-id coding-wt-1 --project-root <project-root>
 python scripts/master_agent_tool.py round-log-export --state-dir <state-dir> --project-root <project-root> --snapshot-id <snapshot-id> --round-log-command "python <plugin-root>/scripts/round_logger.py"
+python scripts/master_agent_tool.py repair-log-init --state-dir <state-dir> --project-root <project-root>
+python scripts/master_agent_tool.py repair-log-status --state-dir <state-dir> --project-root <project-root>
+python scripts/master_agent_tool.py require-current-repair-row --state-dir <state-dir> --project-root <project-root> --workstream <workstream>
+python scripts/master_agent_tool.py record-task --state-dir <state-dir> --project-root <project-root> --title "Bounded result" --workstream <workstream> --objective "Record accepted evidence" --outcome complete --reason "accepted packet reviewed" --next-step "issue next work order" --escalation-trigger "new blocker"
+python scripts/master_agent_tool.py open-repair-cycle --state-dir <state-dir> --project-root <project-root> --cycle-id <cycle-id> --repair-area <area> --objective "Close repeated failure" --target-error "original failure" --first-failing-boundary <boundary> --acceptance-metric <metric> --next-step "first bounded attempt" --attempt-budget 2
+python scripts/master_agent_tool.py record-repair-attempt --state-dir <state-dir> --project-root <project-root> --cycle-id <cycle-id> --attempt-id attempt-001 --hypothesis "owner-boundary fix" --intended-boundary <boundary> --metric-status unchanged --decision reassess --next-step "write reassessment before patching again" --escalation-trigger "same failure recurs"
 python scripts/master_agent_tool.py enforce-master-boundary --project-root <project-root> --state-dir <state-dir>
 python scripts/master_agent_tool.py assess-parallelism --state-dir <state-dir> --work-order packets/work-order-a.md --work-order packets/work-order-b.md --output packets/parallelism-verdict.md
 python scripts/master_agent_tool.py governance-lint --packet packets/work-order-a.md --packet-type work-order

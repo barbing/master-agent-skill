@@ -228,6 +228,38 @@ def round_log_control_step() -> tuple[str, int, str]:
     return "round-log control surface", 0, ""
 
 
+def repair_log_control_step() -> tuple[str, int, str]:
+    required_files = [
+        ROOT / "assets" / "templates" / "repair-log-control.md",
+        ROOT / "assets" / "templates" / "work-order.md",
+        ROOT / "scripts" / "master_agent_tool.py",
+        ROOT / "scripts" / "validate_state_pack.py",
+        ROOT / "references" / "master-agent-system.md",
+        ROOT / "README.md",
+        ROOT / "SKILL.md",
+    ]
+    missing = [str(path.relative_to(ROOT)) for path in required_files if not path.exists()]
+    if missing:
+        return "repair-log control surface", 1, "missing files: " + ", ".join(missing)
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in required_files)
+    required_terms = [
+        "repair-log-init",
+        "repair-log-status",
+        "require-current-repair-row",
+        "record-task",
+        "open-repair-cycle",
+        "record-repair-attempt",
+        "docs/repair-execution-log",
+        "state/repair-log-events.jsonl",
+        "repair-log-control.md",
+        "Repair Log Control",
+    ]
+    missing_terms = [term for term in required_terms if term not in combined]
+    if missing_terms:
+        return "repair-log control surface", 1, "missing terms: " + ", ".join(missing_terms)
+    return "repair-log control surface", 0, ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate Master Agent System release readiness.")
     parser.add_argument("--quick-validate", help="Path to Codex skill quick_validate.py")
@@ -262,6 +294,7 @@ def main() -> int:
         checks.append(worktree_control_step())
         checks.append(governance_control_step())
         checks.append(round_log_control_step())
+        checks.append(repair_log_control_step())
 
         with tempfile.TemporaryDirectory(prefix="master-agent-release-") as tmp:
             tmp_path = Path(tmp)

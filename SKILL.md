@@ -1,6 +1,6 @@
 ---
 name: master-agent-system
-description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, distilling corrections into governed learning updates, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, binding optional codex-round-log evidence, or standardizing strategy, coding, review, policy, and learning handoffs.
+description: Use when coordinating multiple Codex sessions or sub-agents across a project, designing a non-implementing master agent, maintaining project ledgers, issuing work orders, monitoring heartbeats, running a runtime supervisor, rotating overloaded sessions into successor agents, managing token budgets, optimizing sub-agent token use, preserving document memory through repair-execution logs, distilling corrections into governed learning updates, defining or activating project-specific agent roles, enforcing Master write boundaries, assessing parallel sub-agent safety, binding optional codex-round-log evidence, or standardizing strategy, coding, review, policy, and learning handoffs.
 ---
 
 # Master Agent System
@@ -9,13 +9,13 @@ description: Use when coordinating multiple Codex sessions or sub-agents across 
 
 Use this skill to run a project-neutral Master Agent control system. The Master Agent is a non-implementing coordination layer: it may update docs and state ledgers, but it must not patch production code.
 
-The system keeps long project continuity outside conversation history by using ledgers, context packets, heartbeats, work orders, return packets, and review verdicts.
+The system keeps long project continuity outside conversation history by using ledgers, context packets, heartbeats, work orders, document-memory repair logs, return packets, and review verdicts.
 
 ## Load Order
 
 Read `references/master-agent-system.md` when setting up the system, designing a new project adapter, or resolving a coordination ambiguity.
 
-Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, lints and accepts strategy plans, requires the current Strategy packet before work, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, records learning corrections, lints and accepts learning proposals, detects stale or over-budget agents, creates packet files, and installs role skills.
+Use `scripts/master_agent_tool.py` as the primary tool. It bootstraps state, validates readiness, registers agents, governs roles, lints and accepts strategy plans, requires the current Strategy packet before work, records heartbeats, audits anomalies, creates remediation packets, requests strict rotation state, rotates overloaded sessions into successor agents, records Codex app session confirmations, enforces Master boundaries, assesses parallelism, runs supervisor cycles, tracks token budgets, recommends token-saving constraints, controls repair-execution-log document memory, records learning corrections, lints and accepts learning proposals, detects stale or over-budget agents, creates packet files, and installs role skills.
 
 Use `scripts/soak_validate.py --quick` before release or after runtime-control changes. Use `scripts/file_session_provider.py` as the provider-command reference adapter when testing unattended `provider=codex` flows.
 
@@ -36,6 +36,7 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Token strategy is required | Every project should set a project budget, per-agent budget when possible, heartbeat/session caps, and a token strategy before spawning sub-agents. |
 | Worktrees isolate implementation | Plan and confirm a Worktree before implementation sessions when isolation is needed; do not mutate the user's local checkout or remote branches without an explicit merge/release gate. |
 | Round logs add temporal evidence | When `codex-round-log` is available, bind snapshot manifests to sub-agent receipts; use Git for current boundary enforcement and round logs for who/when evidence. |
+| Repair logs preserve document memory | Use `docs/repair-execution-log/` for bounded task records and repeated repair cycles; require the current row before launching or accepting work when prior document memory exists. |
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
 | Root authority is non-escalating | A plan or repair record may narrow or sequence work, but it cannot widen the original user grant, approved owners, file scopes, or material behavior domains. |
 | Material behavior is declared | Every context packet, work order, and receipt declares whether it touches pipeline order, batching/barriers, persistence/checkpoints, GUI timing, cancellation/failure semantics, or default/fallback behavior. |
@@ -74,19 +75,21 @@ Define custom roles only when a project has a recurring or specialized responsib
 5. Accept only complete Strategy packets. `accept-strategy` runs Strategy packet validation and records validation evidence; `require-strategy-packet-before-work` verifies that evidence before Coding, Review, or Policy Review work.
 6. For implementation work, plan an isolated Worktree with `worktree-plan`, validate `.worktreeinclude` when ignored local files are needed, confirm provider evidence with `worktree-confirm-create`, and bind the session with `worktree-assign-session`.
 7. When `codex-round-log` is installed for the repository, run `round-log-status` before accepting concurrent implementation receipts and require `record-round-log-evidence` / `require-round-log-evidence` for work orders that demand snapshot evidence.
-8. Create a context packet or work order with `new-packet`, fill the root authorization envelope, material behavior domains, representative workflow fields, acceptance gates, and heuristic admission fields, then run `governance-lint`.
-9. For guarded implementation or validation-only obligations, fill `guard-obligation.md` with schema-v6 fields, loop type, Git-visible progress scope, structured validation, validation-support roots, and visual receipt boundaries.
-10. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
-11. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
-12. Register the running sub-agent and require heartbeats plus token usage reports.
-13. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, `round-log-status`, and `recommend-token-strategy` until the agent completes, blocks, drifts, needs evidence, needs a same-root transition, identifies an external mutation domain, or needs authority.
-14. Use `record-governance-status` for recoverable guard states such as `authorization_invalid`, `evidence_required`, `in_root_transition_required`, or `external_mutation_domain_identified`.
-15. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
-16. Accept, reject, or request clarification on the return packet.
-17. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
-18. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
-19. Update the master ledger and event log only after acceptance.
-20. Derive the next action from the updated ledger, not from conversational momentum.
+8. When the project has `docs/repair-execution-log/`, run `repair-log-status` and `require-current-repair-row` before launching or accepting sub-agent work that depends on prior attempts.
+9. Create a context packet or work order with `new-packet`, fill the root authorization envelope, material behavior domains, representative workflow fields, acceptance gates, repair-log requirements, and heuristic admission fields, then run `governance-lint`.
+10. For guarded implementation or validation-only obligations, fill `guard-obligation.md` with schema-v6 fields, loop type, Git-visible progress scope, structured validation, validation-support roots, and visual receipt boundaries.
+11. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
+12. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
+13. Register the running sub-agent and require heartbeats plus token usage reports.
+14. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, `round-log-status`, `repair-log-status`, and `recommend-token-strategy` until the agent completes, blocks, drifts, needs evidence, needs a same-root transition, identifies an external mutation domain, or needs authority.
+15. Use `record-governance-status` for recoverable guard states such as `authorization_invalid`, `evidence_required`, `in_root_transition_required`, or `external_mutation_domain_identified`.
+16. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
+17. Accept, reject, or request clarification on the return packet.
+18. Record task outcomes or repair attempts with `record-task`, `open-repair-cycle`, or `record-repair-attempt` when the result affects future execution.
+19. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
+20. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
+21. Update the master ledger and event log only after acceptance.
+22. Derive the next action from the updated ledger and repair-log current row, not from conversational momentum.
 
 ## Agent Selection
 
@@ -203,6 +206,12 @@ python scripts/master_agent_tool.py round-log-status --state-dir <state-dir> --p
 python scripts/master_agent_tool.py record-round-log-evidence --state-dir <state-dir> --project-root <project-root> --agent-id coding-1 --snapshot-id <snapshot-id> --plan-id PLAN-1 --worktree-id wt-task-1 --receipt packets/coding-receipt.md
 python scripts/master_agent_tool.py require-round-log-evidence --state-dir <state-dir> --agent-id coding-1 --project-root <project-root> --max-age-minutes 1440
 python scripts/master_agent_tool.py round-log-export --state-dir <state-dir> --project-root <project-root> --snapshot-id <snapshot-id> --round-log-command "python <plugin-root>/scripts/round_logger.py"
+python scripts/master_agent_tool.py repair-log-init --state-dir <state-dir> --project-root <project-root>
+python scripts/master_agent_tool.py repair-log-status --state-dir <state-dir> --project-root <project-root>
+python scripts/master_agent_tool.py require-current-repair-row --state-dir <state-dir> --project-root <project-root> --workstream <workstream>
+python scripts/master_agent_tool.py record-task --state-dir <state-dir> --project-root <project-root> --title "Review result" --workstream <workstream> --objective "Record bounded result" --outcome complete --reason "evidence accepted" --next-step "issue next work order" --escalation-trigger "new blocker"
+python scripts/master_agent_tool.py open-repair-cycle --state-dir <state-dir> --project-root <project-root> --cycle-id <cycle-id> --repair-area <area> --objective "Close repeated failure" --target-error "original failure" --first-failing-boundary <boundary> --acceptance-metric <metric> --next-step "first bounded attempt" --attempt-budget 2
+python scripts/master_agent_tool.py record-repair-attempt --state-dir <state-dir> --project-root <project-root> --cycle-id <cycle-id> --attempt-id attempt-001 --hypothesis "owner-boundary fix" --intended-boundary <boundary> --metric-status unchanged --decision reassess --next-step "write reassessment before patching again" --escalation-trigger "same failure recurs"
 python scripts/master_agent_tool.py request-rotation --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift
 python scripts/master_agent_tool.py validate-predecessor-state --packet packets/coding-1-predecessor-state-packet.md
 python scripts/master_agent_tool.py rotate-session --state-dir <state-dir> --agent-id coding-1 --successor-agent-id coding-2 --reason attention-drift --provider file --predecessor-state-packet packets/coding-1-predecessor-state-packet.md
@@ -287,6 +296,7 @@ The state pack contains:
 - `session-control.md`
 - `worktree-control.md`
 - `round-log-control.md`
+- `repair-log-control.md`
 - `incident-log.md`
 - `alert-queue.md`
 - `state-schema.md`
@@ -311,6 +321,7 @@ The state pack contains:
 - `state/session-control.jsonl`
 - `state/worktrees.jsonl`
 - `state/round-log-events.jsonl`
+- `state/repair-log-events.jsonl`
 - `state/incidents.jsonl`
 - `state/alerts.jsonl`
 - `state/learning-corrections.jsonl`

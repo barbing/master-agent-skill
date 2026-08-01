@@ -2,14 +2,14 @@
 
 Project-neutral Codex skill pack for coordinating long-running, multi-agent project work through a non-implementing Master Agent control plane.
 
-The system is designed to keep project continuity outside chat history by using structured ledgers, packets, heartbeats, role contracts, root authorization envelopes, material behavior-domain checks, guard-obligation packets, optional round-log snapshot evidence, token budgets, runtime supervision, review gates, and a governed correction-learning layer.
+The system is designed to keep project continuity outside chat history by using structured ledgers, packets, heartbeats, role contracts, root authorization envelopes, material behavior-domain checks, guard-obligation packets, optional round-log snapshot evidence, repair-execution-log document memory, token budgets, runtime supervision, review gates, and a governed correction-learning layer.
 
 ## What This Provides
 
 - A main `master-agent-system` Codex skill.
 - Role skills for Strategy, Coding, Review, Policy Review, and Learning Distiller agents.
 - State-pack templates under `assets/templates/`.
-- CLI helpers under `scripts/` for bootstrapping, validation, Strategy-packet gating, governance packet linting, recoverable guard-status recording, monotonic acceptance gates, authority-required state transitions, session control, Worktree control, optional codex-round-log evidence binding, strict session rotation, role governance, heartbeat monitoring, token tracking, correction distillation, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, soak validation, release validation, and recovery.
+- CLI helpers under `scripts/` for bootstrapping, validation, Strategy-packet gating, governance packet linting, recoverable guard-status recording, monotonic acceptance gates, authority-required state transitions, session control, Worktree control, optional codex-round-log evidence binding, repair-execution-log document-memory control, strict session rotation, role governance, heartbeat monitoring, token tracking, correction distillation, supervisor lifecycle, Master-boundary enforcement, parallelism assessment, soak validation, release validation, and recovery.
 - A provider-command reference adapter at `scripts/file_session_provider.py`.
 - CI and pre-commit examples for release and Master-boundary enforcement.
 - Regression tests for safety-critical behavior.
@@ -104,6 +104,7 @@ Read `references/master-agent-system.md` before deploying the workflow on a real
 - Worktree control is also evidence-based. Use `worktree-plan`, `worktree-confirm-create`, `worktree-assign-session`, `worktree-reconcile`, `worktree-close`, and `worktree-confirm-close` so sub-agents work in isolated Worktrees instead of mutating the user's foreground checkout or remote branches.
 - Run `validate-worktreeinclude` before relying on ignored local files in Codex-managed Worktrees. `.worktreeinclude` must list only intentionally ignored local setup files; tracked files, broad patterns, repository escapes, and symlinks are release blockers.
 - `codex-round-log` / `change-round-logger` integration is optional and local. Use `round-log-status` to inspect repo-local snapshot health, `record-round-log-evidence` to bind a snapshot manifest to an agent receipt, `require-round-log-evidence` before accepting receipts that demand snapshot evidence, and `round-log-export` only when readable review evidence is needed. Round-log evidence complements Git status; Git remains the boundary-enforcement source.
+- Repair-log document memory is repo-local. Use `repair-log-init` to create `docs/repair-execution-log/`, `repair-log-status` to inspect the current row, `require-current-repair-row` before launching or accepting work that depends on prior attempts, `record-task` for bounded non-loop outcomes, `open-repair-cycle` for repeated failure classes, and `record-repair-attempt` for each repair-cycle hypothesis. Repair records sequence work; they do not create root authorization.
 - `accept-strategy` validates Strategy packets before they become current plan state. Coding, Review, and Policy Review registration/session launch require the current plan to carry that validation evidence.
 - Use `strategy-packet-lint` for preflight diagnostics and `require-strategy-packet-before-work` as an explicit gate before issuing sub-agent work from an accepted Strategy packet.
 - Use `governance-lint` before launching from a context packet, work order, receipt, review verdict, policy verdict, obstacle-recovery packet, or acceptance-gate packet.
@@ -127,6 +128,7 @@ python -m py_compile scripts/bootstrap_project_state.py scripts/file_session_pro
 python scripts/validate_state_pack.py assets/templates
 python scripts/soak_validate.py --quick
 python scripts/master_agent_tool.py validate-worktreeinclude --state-dir <project-root>/docs/master-agent --project-root <project-root>
+python scripts/master_agent_tool.py repair-log-status --state-dir <project-root>/docs/master-agent --project-root <project-root>
 ```
 
 Validate the skill metadata with Codex's skill validator:

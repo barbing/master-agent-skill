@@ -8,7 +8,7 @@
 ## Migration Order
 
 - Ordered, idempotent migrations are recorded in state/schema-version.json.
-- Current schema includes governance optimization, guard synchronization, and round-log evidence through schema 1.4.
+- Current schema includes governance optimization, guard synchronization, round-log evidence, and repair-log control through schema 1.5.
 
 ## Compatibility Policy
 
@@ -40,6 +40,7 @@
 - state/governance-events.jsonl
 - state/acceptance-gates.jsonl
 - state/round-log-events.jsonl
+- state/repair-log-events.jsonl
 
 ## Stale Lock Handling
 

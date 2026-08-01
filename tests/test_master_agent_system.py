@@ -428,6 +428,16 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIn("## Evidence Binding", round_log_control)
         self.assertTrue((self.state_dir / "state" / "round-log-events.jsonl").exists())
 
+    def test_init_creates_repair_log_control_state(self):
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        repair_log_control = (self.state_dir / "repair-log-control.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("# Repair Log Control", repair_log_control)
+        self.assertIn("## Current Row Gate", repair_log_control)
+        self.assertTrue((self.state_dir / "state" / "repair-log-events.jsonl").exists())
+
     def test_init_creates_learning_layer_state(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
 
@@ -469,7 +479,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(schema["schema_version"], "1.4")
+        self.assertEqual(schema["schema_version"], "1.5")
 
     def test_learning_correction_creates_cycle_and_summary(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -4395,7 +4405,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(schema["schema_version"], "1.4")
+        self.assertEqual(schema["schema_version"], "1.5")
         self.assertIn("migration_history", schema)
 
     def test_migration_runs_in_order(self):
@@ -4416,6 +4426,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 "0004-governance-optimization",
                 "0005-guard-synchronization",
                 "0006-round-log-evidence",
+                "0007-repair-log-control",
             ],
         )
         second = run_cmd([TOOL, "migrate-state", "--state-dir", self.state_dir])
@@ -5572,6 +5583,241 @@ class MasterAgentToolTests(unittest.TestCase):
             .splitlines()
         ]
         self.assertEqual(events[-1]["event"], "round-log-export")
+
+    def test_repair_log_init_status_and_task_current_row_gate(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+
+        missing = run_cmd(
+            [
+                TOOL,
+                "repair-log-status",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--require-initialized",
+            ],
+            check=False,
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("Repair log status: missing", missing.stdout)
+
+        initialized = run_cmd(
+            [TOOL, "repair-log-init", "--state-dir", self.state_dir, "--project-root", self.tmp]
+        )
+        self.assertIn("Repair log initialized", initialized.stdout)
+        self.assertTrue((self.tmp / "docs" / "repair-execution-log" / "task-records" / "plan-index.md").exists())
+
+        no_row = run_cmd(
+            [
+                TOOL,
+                "require-current-repair-row",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--workstream",
+                "renderer",
+            ],
+            check=False,
+        )
+        self.assertEqual(no_row.returncode, 1)
+        self.assertIn("No current repair-log row", no_row.stderr)
+
+        recorded = run_cmd(
+            [
+                TOOL,
+                "record-task",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--title",
+                "Renderer handoff",
+                "--workstream",
+                "renderer",
+                "--objective",
+                "Record bounded renderer handoff",
+                "--status",
+                "active",
+                "--outcome",
+                "inconclusive",
+                "--reason",
+                "review requires a follow-up",
+                "--next-step",
+                "issue one bounded review work order",
+                "--escalation-trigger",
+                "new graph owner required",
+                "--validation",
+                "review-verdict.md",
+            ]
+        )
+        self.assertIn("Task record created", recorded.stdout)
+
+        allowed = run_cmd(
+            [
+                TOOL,
+                "require-current-repair-row",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--workstream",
+                "renderer",
+            ]
+        )
+        self.assertIn("Current repair-log row allows work", allowed.stdout)
+        control = (self.state_dir / "repair-log-control.md").read_text(encoding="utf-8")
+        self.assertIn("issue one bounded review work order", control)
+        events = [
+            json.loads(line)
+            for line in (self.state_dir / "state" / "repair-log-events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(events[-1]["event"], "repair-log-current-row-required")
+
+    def test_repair_log_current_row_blocks_paused_or_complete_status(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        run_cmd([TOOL, "repair-log-init", "--state-dir", self.state_dir, "--project-root", self.tmp])
+        run_cmd(
+            [
+                TOOL,
+                "record-task",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--title",
+                "Paused architecture work",
+                "--workstream",
+                "architecture",
+                "--objective",
+                "Record pause",
+                "--status",
+                "paused",
+                "--outcome",
+                "paused",
+                "--reason",
+                "needs user decision",
+                "--next-step",
+                "wait for explicit decision",
+                "--escalation-trigger",
+                "implementation requested before decision",
+            ]
+        )
+
+        blocked = run_cmd(
+            [
+                TOOL,
+                "require-current-repair-row",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--workstream",
+                "architecture",
+            ],
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("status blocks work: paused", blocked.stderr)
+
+    def test_repair_cycle_records_attempt_and_blocks_reassessment(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        run_cmd([TOOL, "repair-log-init", "--state-dir", self.state_dir, "--project-root", self.tmp])
+        opened = run_cmd(
+            [
+                TOOL,
+                "open-repair-cycle",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--cycle-id",
+                "renderer-visible-text",
+                "--repair-area",
+                "Renderer Visible Text",
+                "--objective",
+                "Close repeated visible text failure",
+                "--target-error",
+                "rendered text incomplete",
+                "--first-failing-boundary",
+                "renderer handoff",
+                "--acceptance-metric",
+                "representative runtime gate passes",
+                "--next-step",
+                "make first bounded owner fix",
+                "--attempt-budget",
+                "2",
+            ]
+        )
+        self.assertIn("Repair cycle opened", opened.stdout)
+
+        allowed = run_cmd(
+            [
+                TOOL,
+                "require-current-repair-row",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--cycle-id",
+                "renderer-visible-text",
+            ]
+        )
+        self.assertIn("status=active", allowed.stdout)
+
+        recorded = run_cmd(
+            [
+                TOOL,
+                "record-repair-attempt",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--cycle-id",
+                "renderer-visible-text",
+                "--attempt-id",
+                "attempt-001",
+                "--hypothesis",
+                "the handoff omits source-bearing child text",
+                "--intended-boundary",
+                "renderer handoff",
+                "--files-touched",
+                "app/render/renderer.py",
+                "--validation",
+                "focused tests failed",
+                "--metric-status",
+                "unchanged",
+                "--decision",
+                "reassess",
+                "--next-step",
+                "write reassessment before another patch",
+                "--escalation-trigger",
+                "same failure recurs",
+            ]
+        )
+        self.assertIn("Repair attempt recorded", recorded.stdout)
+
+        blocked = run_cmd(
+            [
+                TOOL,
+                "require-current-repair-row",
+                "--state-dir",
+                self.state_dir,
+                "--project-root",
+                self.tmp,
+                "--cycle-id",
+                "renderer-visible-text",
+            ],
+            check=False,
+        )
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("status blocks work: reassess", blocked.stderr)
 
     def test_release_validator_runs_fake_quick_validate_under_test_hook(self):
         fake_quick = self.tmp / "quick_validate.py"

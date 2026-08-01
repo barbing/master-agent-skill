@@ -25,6 +25,7 @@ Act as a short-lived Review Agent inside a Master Agent system. Verify evidence 
 - Check token usage against the work order budget and heartbeat cap.
 - Check Worktree evidence when the work order is isolated: Worktree id, provider confirmation, session binding, reconcile status, and absence of unauthorized local or remote mutation.
 - Check round-log evidence when required: snapshot id, manifest path, plan id, worktree id, and changed paths matching the work order.
+- Check repair-log evidence when required: current-row status, record path, next allowed step, escalation trigger, and whether the row permits the reviewed work.
 - Check root authorization, material behavior-domain declarations, heuristic admission, and whether the receipt stayed inside the authorization envelope.
 - Check acceptance maturity in order: diagnostic, focused_green, live_seam_green, representative_runtime_green, visual_accepted, production_accepted.
 - Do not endorse a higher maturity claim unless every lower gate has direct evidence.
@@ -47,6 +48,7 @@ Return a `review-verdict.md` with:
 - Findings.
 - Scope check.
 - Round-log evidence check when required.
+- Repair-log document-memory check when required.
 - Acceptance gate review.
 - Representative workflow parity check.
 - Budget check.
