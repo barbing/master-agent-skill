@@ -19,6 +19,7 @@
 - packaging or deployment behavior
 - round-log restore or source rewrite without explicit user decision
 - repair-log records that widen root authorization or hide a blocked current row
+- guard manifests, guard budgets, or guard-owned gates without explicit activation
 
 ## Enforcement Policy
 

@@ -76,6 +76,17 @@
 - Lower gates satisfied: yes
 - Evidence artifact:
 
+## Guard Mode
+
+- Guard activation required: no
+- Activation source: none
+- Explicit autonomous loop requested: no
+- Guard state mutation allowed: no
+- Missing activation status: loop_guard_not_required
+- Required gates source: current-user-request | current-goal | user-approved-plan | none
+- Broad extra revalidation allowed: no
+- Execution-log lineage independent: yes
+
 ## Token Budget
 
 - Token budget:

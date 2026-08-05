@@ -26,7 +26,11 @@ Act as a short-lived Policy Review Agent inside a Master Agent system. Check com
 - Check heuristic admission fields when a heuristic is proposed or used.
 - Check representative workflow parity for readiness, runtime, provider, and performance claims.
 - Confirm observation outside owner was not treated as mutation authority.
-- Confirm `authority_required` is used only for observed out-of-root production mutation; use recoverable statuses for candidate-envelope defects, evidence gaps, same-root transitions, or external-domain diagnosis.
+- Confirm Guard Mode is explicit. Guard state may be created or mutated only for a current `/goal`, explicit autonomous/guarded/repeated-repair request, or user-approved plan naming that method; otherwise require `loop_guard_not_required`.
+- Confirm repair-log task records and repair cycles are lineage/document memory only; they must not arm guard state, widen authority, or authorize additional attempts.
+- Confirm `authority_required` is used only for observed out-of-root production mutation; use recoverable statuses for candidate-envelope defects, evidence gaps, same-root transitions, external-domain diagnosis, same-manifest preflight, or missing guard activation.
+- Confirm guarded acceptance gates are copied from the current user request, current goal, or approved plan, not added as broad release, system, historical, visual, or packaged-runtime revalidation.
+- Confirm `manifest_correction_required`, `authorization_invalid`, `already_armed`, `active_guard_exists`, and `infrastructure_retry_ready` are used with their precise meanings.
 - Confirm validation-support lanes do not weaken assertions, delete tests, or substitute fixture edits for production defects.
 - Identify token budget, heartbeat cap, or session cap violations.
 - Identify missing Worktree isolation, local checkout protection, remote publication gates, or `.worktreeinclude` policy for implementation work.

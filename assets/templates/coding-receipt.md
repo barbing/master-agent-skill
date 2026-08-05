@@ -20,7 +20,7 @@
 - Observed files inside envelope: yes | no
 - Observed material behavior domains: none
 - No material behavior change: yes
-- Authority status: inside-envelope | authorization_invalid | in_root_transition_required | external_mutation_domain_identified | authority_required
+- Authority status: inside-envelope | loop_guard_not_required | manifest_correction_required | authorization_invalid | already_armed | active_guard_exists | evidence_required | infrastructure_retry_ready | in_root_transition_required | external_mutation_domain_identified | authority_required
 
 ## Validation
 

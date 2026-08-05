@@ -37,10 +37,15 @@ AGENT_STATES = [
     "active",
     "validating",
     "blocked",
+    "loop_guard_not_required",
+    "manifest_correction_required",
     "authorization_invalid",
+    "already_armed",
+    "active_guard_exists",
     "evidence_required",
     "attempt_recording_required",
     "validation_support_required",
+    "infrastructure_retry_ready",
     "in_root_transition_required",
     "external_mutation_domain_identified",
     "authority_required",
@@ -71,6 +76,7 @@ SAFETY_AUTONOMOUS_ACTIONS = {
     "record-governance-status",
     "record-authority-required",
     "record-acceptance-gate",
+    "record-loop-guard-not-required",
     "round-log-status",
     "record-round-log-evidence",
     "require-round-log-evidence",
@@ -104,6 +110,13 @@ SAFETY_FORBIDDEN_ACTIONS = {
     "register-inactive-role",
     "overwrite-user-work",
     "round-log-restore",
+    "use-repair-log-as-root-authority",
+    "continue-from-blocked-repair-row",
+    "arm-guard-without-explicit-activation",
+    "create-guard-owned-gates-for-bounded-task",
+    "use-repair-cycle-as-loop-authority",
+    "add-broad-extra-revalidation-gates",
+    "rerun-infrastructure-retry-more-than-once",
 }
 SAFETY_WARNING_BUDGET_IMPACT = 5_000
 SAFETY_HARD_BUDGET_IMPACT = 20_000
@@ -147,15 +160,25 @@ AUTHORITY_REQUIRED_STATUS = "authority_required"
 AUTHORIZATION_INVALID_STATUS = "authorization_invalid"
 IN_ROOT_TRANSITION_STATUS = "in_root_transition_required"
 EXTERNAL_MUTATION_DOMAIN_IDENTIFIED_STATUS = "external_mutation_domain_identified"
+LOOP_GUARD_NOT_REQUIRED_STATUS = "loop_guard_not_required"
+MANIFEST_CORRECTION_REQUIRED_STATUS = "manifest_correction_required"
+ALREADY_ARMED_STATUS = "already_armed"
+ACTIVE_GUARD_EXISTS_STATUS = "active_guard_exists"
+INFRASTRUCTURE_RETRY_READY_STATUS = "infrastructure_retry_ready"
 
 GOVERNANCE_STATUS_VALUES = {
     "continue",
     "reassessment_required",
     "blocked",
+    LOOP_GUARD_NOT_REQUIRED_STATUS,
+    MANIFEST_CORRECTION_REQUIRED_STATUS,
+    ALREADY_ARMED_STATUS,
+    ACTIVE_GUARD_EXISTS_STATUS,
     "evidence_required",
     "closeout_pending",
     "attempt_recording_required",
     "validation_support_required",
+    INFRASTRUCTURE_RETRY_READY_STATUS,
     "implementation_frozen_evidence_pending",
     "implementation_budget_exhausted",
     "scope_expansion_requires_explicit_domain",
@@ -367,6 +390,16 @@ GOVERNANCE_PACKET_REQUIRED_FIELDS = {
             "Lower gates satisfied",
             "Evidence artifact",
         ],
+        "## Guard Mode": [
+            "Guard activation required",
+            "Activation source",
+            "Explicit autonomous loop requested",
+            "Guard state mutation allowed",
+            "Missing activation status",
+            "Required gates source",
+            "Broad extra revalidation allowed",
+            "Execution-log lineage independent",
+        ],
         "## Task Record": [
             "Task record required",
             "Record path or reason",
@@ -451,6 +484,16 @@ GOVERNANCE_PACKET_REQUIRED_FIELDS = {
             "External mutation domain status",
             "Authority violation status",
         ],
+        "## Guard Activation": [
+            "Guard activation required",
+            "Activation source",
+            "Explicit autonomous loop requested",
+            "Guard state mutation allowed",
+            "Unrelated bounded requests passivate predecessor",
+            "Missing activation status",
+            "Same manifest status",
+            "Distinct active-loop conflict status",
+        ],
         "## Obligation Contract": [
             "Schema version",
             "Obligation id",
@@ -459,6 +502,8 @@ GOVERNANCE_PACKET_REQUIRED_FIELDS = {
             "Completion maturity",
             "Required gate ids",
             "Contract docs",
+            "Required gates source",
+            "Broad extra revalidation allowed",
         ],
         "## Loop Budget": [
             "Maximum implementation attempts",
@@ -493,9 +538,25 @@ GOVERNANCE_PACKET_REQUIRED_FIELDS = {
         ],
         "## Status Semantics": [
             "Authorization invalid status",
+            "Manifest correction status",
             "In-root transition status",
             "External mutation domain status",
+            "Infrastructure retry status",
             "Authority required status",
+        ],
+        "## Manifest Correction Policy": [
+            "Correctable defect status",
+            "Authorization reference defect status",
+            "Active state changed by correction refusal",
+            "Correction may widen contract",
+            "Same refusal stop required",
+        ],
+        "## Infrastructure Retry": [
+            "Infrastructure retry status",
+            "Maximum infrastructure retries",
+            "Production frozen during retry",
+            "Requires unchanged manifest commands gates authority",
+            "Requires unchanged production fingerprints",
         ],
     },
 }
@@ -587,6 +648,7 @@ UNFILLED_PACKET_VALUES = {
     "project-policy-pack | agents-md | skill | plugin-validator | template | memory-note | skip",
     "not-yet-measured | recurrence-prevented | recurrence-detected | needs-more-evidence",
     "current-user-request | current-goal | user-approved-plan",
+    "current-user-request | current-goal | user-approved-plan | none",
     "diagnostic | focused_green | live_seam_green | representative_runtime_green | visual_accepted | production_accepted",
     "pending | passed | failed | inconclusive",
     "owner-internal-behavior | pipeline-order | batching-or-barrier-placement | persistence-or-checkpoint-timing | gui-event-timing | cancellation-or-failure-semantics | default-or-fallback-behavior",
@@ -964,6 +1026,20 @@ def validate_maturity(
     return value
 
 
+def validate_activation_source(
+    errors: list[str],
+    value: str,
+    label: str,
+) -> str:
+    allowed = ROOT_AUTHORITY_SOURCE_KINDS | {"none"}
+    if value and value not in allowed:
+        errors.append(
+            f"invalid field: {label} must be one of "
+            + ", ".join(sorted(allowed))
+        )
+    return value
+
+
 def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
     errors: list[str] = []
     if packet_type not in GOVERNANCE_PACKET_REQUIRED_FIELDS:
@@ -1148,6 +1224,84 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
                     "must match the work order"
                 )
 
+    guard_mode_heading = "## Guard Mode"
+    if guard_mode_heading in sections:
+        guard_required = validate_yes_no(
+            errors,
+            field_value(sections, guard_mode_heading, "Guard activation required"),
+            f"{guard_mode_heading} / Guard activation required",
+        )
+        activation_source = validate_activation_source(
+            errors,
+            field_value(sections, guard_mode_heading, "Activation source"),
+            f"{guard_mode_heading} / Activation source",
+        )
+        explicit_loop = validate_yes_no(
+            errors,
+            field_value(sections, guard_mode_heading, "Explicit autonomous loop requested"),
+            f"{guard_mode_heading} / Explicit autonomous loop requested",
+        )
+        state_mutation = validate_yes_no(
+            errors,
+            field_value(sections, guard_mode_heading, "Guard state mutation allowed"),
+            f"{guard_mode_heading} / Guard state mutation allowed",
+        )
+        missing_status = field_value(sections, guard_mode_heading, "Missing activation status")
+        if missing_status and missing_status != LOOP_GUARD_NOT_REQUIRED_STATUS:
+            errors.append(
+                f"invalid field: {guard_mode_heading} / Missing activation status "
+                f"must be {LOOP_GUARD_NOT_REQUIRED_STATUS}"
+            )
+        gates_source = validate_activation_source(
+            errors,
+            field_value(sections, guard_mode_heading, "Required gates source"),
+            f"{guard_mode_heading} / Required gates source",
+        )
+        broad_extra = validate_yes_no(
+            errors,
+            field_value(sections, guard_mode_heading, "Broad extra revalidation allowed"),
+            f"{guard_mode_heading} / Broad extra revalidation allowed",
+        )
+        if broad_extra == "yes":
+            errors.append(
+                f"invalid field: {guard_mode_heading} / Broad extra revalidation allowed must be no"
+            )
+        lineage_independent = validate_yes_no(
+            errors,
+            field_value(sections, guard_mode_heading, "Execution-log lineage independent"),
+            f"{guard_mode_heading} / Execution-log lineage independent",
+        )
+        if lineage_independent == "no":
+            errors.append(
+                f"invalid field: {guard_mode_heading} / Execution-log lineage independent must be yes"
+            )
+        if guard_required == "yes":
+            if activation_source == "none":
+                errors.append(
+                    f"invalid field: {guard_mode_heading} / guard-required work needs an activation source"
+                )
+            if explicit_loop != "yes":
+                errors.append(
+                    f"invalid field: {guard_mode_heading} / guard-required work needs explicit autonomous loop requested"
+                )
+            if state_mutation != "yes":
+                errors.append(
+                    f"invalid field: {guard_mode_heading} / guard-required work needs guard state mutation allowed"
+                )
+            if gates_source == "none":
+                errors.append(
+                    f"invalid field: {guard_mode_heading} / guard-required work needs a required gates source"
+                )
+        elif guard_required == "no":
+            if state_mutation == "yes":
+                errors.append(
+                    f"invalid field: {guard_mode_heading} / guard-not-required work cannot mutate guard state"
+                )
+            if explicit_loop == "yes":
+                errors.append(
+                    f"invalid field: {guard_mode_heading} / guard-not-required work cannot claim explicit autonomous loop"
+                )
+
     obstacle_heading = "## Obstacle Recovery"
     if obstacle_heading in sections:
         status_requested = field_value(sections, obstacle_heading, "Status requested")
@@ -1194,6 +1348,67 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
                     "must be a recognized governance status"
                 )
 
+    guard_activation_heading = "## Guard Activation"
+    if guard_activation_heading in sections:
+        guard_required = validate_yes_no(
+            errors,
+            field_value(sections, guard_activation_heading, "Guard activation required"),
+            f"{guard_activation_heading} / Guard activation required",
+        )
+        activation_source = validate_activation_source(
+            errors,
+            field_value(sections, guard_activation_heading, "Activation source"),
+            f"{guard_activation_heading} / Activation source",
+        )
+        explicit_loop = validate_yes_no(
+            errors,
+            field_value(sections, guard_activation_heading, "Explicit autonomous loop requested"),
+            f"{guard_activation_heading} / Explicit autonomous loop requested",
+        )
+        state_mutation = validate_yes_no(
+            errors,
+            field_value(sections, guard_activation_heading, "Guard state mutation allowed"),
+            f"{guard_activation_heading} / Guard state mutation allowed",
+        )
+        passivates = validate_yes_no(
+            errors,
+            field_value(sections, guard_activation_heading, "Unrelated bounded requests passivate predecessor"),
+            f"{guard_activation_heading} / Unrelated bounded requests passivate predecessor",
+        )
+        if passivates == "no":
+            errors.append(
+                f"invalid field: {guard_activation_heading} / Unrelated bounded requests passivate predecessor must be yes"
+            )
+        expected_activation_statuses = {
+            "Missing activation status": LOOP_GUARD_NOT_REQUIRED_STATUS,
+            "Same manifest status": ALREADY_ARMED_STATUS,
+            "Distinct active-loop conflict status": ACTIVE_GUARD_EXISTS_STATUS,
+        }
+        for field_name, expected in expected_activation_statuses.items():
+            actual = field_value(sections, guard_activation_heading, field_name)
+            if actual and actual != expected:
+                errors.append(
+                    f"invalid field: {guard_activation_heading} / {field_name} must be {expected}"
+                )
+        if guard_required == "yes":
+            if activation_source == "none":
+                errors.append(
+                    f"invalid field: {guard_activation_heading} / guard-required obligation needs an activation source"
+                )
+            if explicit_loop != "yes":
+                errors.append(
+                    f"invalid field: {guard_activation_heading} / guard-required obligation needs explicit autonomous loop requested"
+                )
+            if state_mutation != "yes":
+                errors.append(
+                    f"invalid field: {guard_activation_heading} / guard-required obligation needs guard state mutation allowed"
+                )
+        elif guard_required == "no":
+            if explicit_loop == "yes" or state_mutation == "yes":
+                errors.append(
+                    f"invalid field: {guard_activation_heading} / guard-not-required obligation cannot claim loop or guard state mutation"
+                )
+
     obligation_heading = "## Obligation Contract"
     if obligation_heading in sections:
         schema_version = field_value(sections, obligation_heading, "Schema version")
@@ -1205,6 +1420,24 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
                 errors,
                 completion,
                 f"{obligation_heading} / Completion maturity",
+            )
+        gates_source = validate_activation_source(
+            errors,
+            field_value(sections, obligation_heading, "Required gates source"),
+            f"{obligation_heading} / Required gates source",
+        )
+        if gates_source == "none":
+            errors.append(
+                "invalid field: ## Obligation Contract / Required gates source cannot be none"
+            )
+        broad_extra = validate_yes_no(
+            errors,
+            field_value(sections, obligation_heading, "Broad extra revalidation allowed"),
+            f"{obligation_heading} / Broad extra revalidation allowed",
+        )
+        if broad_extra == "yes":
+            errors.append(
+                "invalid field: ## Obligation Contract / Broad extra revalidation allowed must be no"
             )
 
     budget_heading = "## Loop Budget"
@@ -1305,8 +1538,10 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
     if status_heading in sections:
         expected_statuses = {
             "Authorization invalid status": AUTHORIZATION_INVALID_STATUS,
+            "Manifest correction status": MANIFEST_CORRECTION_REQUIRED_STATUS,
             "In-root transition status": IN_ROOT_TRANSITION_STATUS,
             "External mutation domain status": EXTERNAL_MUTATION_DOMAIN_IDENTIFIED_STATUS,
+            "Infrastructure retry status": INFRASTRUCTURE_RETRY_READY_STATUS,
             "Authority required status": AUTHORITY_REQUIRED_STATUS,
         }
         for field_name, expected in expected_statuses.items():
@@ -1315,6 +1550,72 @@ def validate_governance_packet(path: Path, packet_type: str) -> list[str]:
                 errors.append(
                     f"invalid field: {status_heading} / {field_name} must be {expected}"
                 )
+
+    correction_heading = "## Manifest Correction Policy"
+    if correction_heading in sections:
+        expected_correction_statuses = {
+            "Correctable defect status": MANIFEST_CORRECTION_REQUIRED_STATUS,
+            "Authorization reference defect status": AUTHORIZATION_INVALID_STATUS,
+        }
+        for field_name, expected in expected_correction_statuses.items():
+            actual = field_value(sections, correction_heading, field_name)
+            if actual and actual != expected:
+                errors.append(
+                    f"invalid field: {correction_heading} / {field_name} must be {expected}"
+                )
+        active_changed = validate_yes_no(
+            errors,
+            field_value(sections, correction_heading, "Active state changed by correction refusal"),
+            f"{correction_heading} / Active state changed by correction refusal",
+        )
+        if active_changed == "yes":
+            errors.append(
+                f"invalid field: {correction_heading} / Active state changed by correction refusal must be no"
+            )
+        may_widen = validate_yes_no(
+            errors,
+            field_value(sections, correction_heading, "Correction may widen contract"),
+            f"{correction_heading} / Correction may widen contract",
+        )
+        if may_widen == "yes":
+            errors.append(
+                f"invalid field: {correction_heading} / Correction may widen contract must be no"
+            )
+        same_refusal_stop = validate_yes_no(
+            errors,
+            field_value(sections, correction_heading, "Same refusal stop required"),
+            f"{correction_heading} / Same refusal stop required",
+        )
+        if same_refusal_stop == "no":
+            errors.append(
+                f"invalid field: {correction_heading} / Same refusal stop required must be yes"
+            )
+
+    infrastructure_heading = "## Infrastructure Retry"
+    if infrastructure_heading in sections:
+        retry_status = field_value(sections, infrastructure_heading, "Infrastructure retry status")
+        if retry_status and retry_status != INFRASTRUCTURE_RETRY_READY_STATUS:
+            errors.append(
+                f"invalid field: {infrastructure_heading} / Infrastructure retry status "
+                f"must be {INFRASTRUCTURE_RETRY_READY_STATUS}"
+            )
+        max_retries = field_value(sections, infrastructure_heading, "Maximum infrastructure retries")
+        if max_retries and max_retries != "1":
+            errors.append(
+                f"invalid field: {infrastructure_heading} / Maximum infrastructure retries must be 1"
+            )
+        for field_name in [
+            "Production frozen during retry",
+            "Requires unchanged manifest commands gates authority",
+            "Requires unchanged production fingerprints",
+        ]:
+            value = validate_yes_no(
+                errors,
+                field_value(sections, infrastructure_heading, field_name),
+                f"{infrastructure_heading} / {field_name}",
+            )
+            if value == "no":
+                errors.append(f"invalid field: {infrastructure_heading} / {field_name} must be yes")
     return errors
 
 
@@ -5881,6 +6182,16 @@ def render_repair_log_control(state_dir: Path) -> None:
         "- Task index: docs/repair-execution-log/task-records/plan-index.md",
         "- One-off task records do not authorize autonomous loops.",
         "- A paused, rollback-only, superseded, or no-further-action task row blocks successor work.",
+        "",
+        "## Lineage And Guard Independence",
+        "",
+        "- Record lineage independent from guard mode: yes",
+        "- Record identity fields: objective, original target error, controlling plan/spec",
+        "- Logging arms guard: no",
+        f"- Guard not required status: {LOOP_GUARD_NOT_REQUIRED_STATUS}",
+        "- Originating bounded record preserved when cycle opens: yes",
+        "- Reciprocal cycle links required: yes",
+        "- Shared index contention blocks work: no",
         "",
         "## Repair Cycle Lane",
         "",

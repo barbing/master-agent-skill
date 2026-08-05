@@ -184,6 +184,11 @@ def governance_control_step() -> tuple[str, int, str]:
         "authorization_invalid",
         "in_root_transition_required",
         "external_mutation_domain_identified",
+        "loop_guard_not_required",
+        "manifest_correction_required",
+        "already_armed",
+        "active_guard_exists",
+        "infrastructure_retry_ready",
         "validation_support_required",
         "loop_type",
         "diagnostic",
@@ -253,6 +258,9 @@ def repair_log_control_step() -> tuple[str, int, str]:
         "state/repair-log-events.jsonl",
         "repair-log-control.md",
         "Repair Log Control",
+        "Record lineage independent from guard mode",
+        "Logging arms guard: no",
+        "loop_guard_not_required",
     ]
     missing_terms = [term for term in required_terms if term not in combined]
     if missing_terms:

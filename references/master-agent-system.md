@@ -416,7 +416,7 @@ Root authorization is non-escalating. A current user request, current goal, or u
 
 Root authorization governs production mutation, not observation. Unless a project policy explicitly forbids it, a sub-agent may read adjacent modules, trace calls, inspect logs and artifacts, run existing cross-module tests, and run approved end-to-end validation without adding those modules to the mutation grant. If diagnosis proves the next implementation owner is outside the root and no mutation occurred there, record `external_mutation_domain_identified`, continue bounded observation, and ask once only if the user chooses implementation in that domain.
 
-Guard status semantics are precise. Use `authorization_invalid` when a candidate source reference, hash, lineage, or approved-plan binding is bad and no out-of-root mutation was observed. Use `evidence_required` when locked validation or an external receipt is missing. Use `in_root_transition_required` when evidence proves a prerequisite outside the active scope but still inside the persistent root. Reserve `authority_required` for observed production owner, file, or material behavior mutation outside the persistent root.
+Guard status semantics are precise. Use `loop_guard_not_required` when the current interaction lacks explicit guard activation. Use `manifest_correction_required` for mechanical candidate defects and `authorization_invalid` when a candidate source reference, hash, lineage, or approved-plan binding is bad and no out-of-root mutation was observed. Use `already_armed` for the exact same manifest and `active_guard_exists` only for a distinct conflicting explicit loop. Use `evidence_required` when locked validation or an external receipt is missing, `infrastructure_retry_ready` for the single allowed unchanged validation rerun, and `in_root_transition_required` when evidence proves a prerequisite outside the active scope but still inside the persistent root. Reserve `authority_required` for observed production owner, file, or material behavior mutation outside the persistent root.
 
 Material behavior domains must be declared in context packets, work orders, and receipts. The built-in domain names are `none`, `owner-internal-behavior`, `pipeline-order`, `batching-or-barrier-placement`, `persistence-or-checkpoint-timing`, `gui-event-timing`, `cancellation-or-failure-semantics`, and `default-or-fallback-behavior`. A packet that says no material behavior changed must declare `none`.
 
@@ -428,7 +428,15 @@ Representative workflow parity is required for readiness claims. Runtime, provid
 
 Acceptance maturity is monotonic by scope. Use `record-acceptance-gate` to record `diagnostic`, `focused_green`, `live_seam_green`, `representative_runtime_green`, `visual_accepted`, and `production_accepted`. A higher gate cannot pass until every lower gate has already passed for the same `scope-id`.
 
-Guarded implementation uses `guard-obligation.md` as the Master-facing packet for schema-v6 guard systems. The packet records `loop_type` as either `implementation` or `validation`, Git-visible progress scope, finite implementation/reassessment/transition budgets, required gate ids, contract docs, structured validation requirements, validation-support roots, and visual-review receipt boundaries. Do not require or manufacture a production edit for a validation-only obligation whose locked evidence can establish completion.
+Guard mode is decided before sub-agent launch. A normal bounded work order is not a guarded loop: set `Guard activation required: no`, `Activation source: none`, `Guard state mutation allowed: no`, and `Missing activation status: loop_guard_not_required`. In that mode the Master may still maintain task records or repair-cycle records, but it must not create guard manifests, guard budgets, successors, disarm ceremonies, or guard-owned acceptance gates.
+
+Guarded implementation uses `guard-obligation.md` as the Master-facing packet for schema-v6 guard systems only when activation is explicit: a current `/goal`, a current user request for autonomous/guarded/repeated repair, or a user-approved plan that names that method. The packet records activation source, `loop_type` as either `implementation` or `validation`, Git-visible progress scope, finite implementation/reassessment/transition budgets, required gate ids, contract docs, structured validation requirements, validation-support roots, manifest-correction policy, one infrastructure-retry allowance, and visual-review receipt boundaries. Do not require or manufacture a production edit for a validation-only obligation whose locked evidence can establish completion.
+
+Guard acceptance gates are not a safety wishlist. Copy only gates required by the current user request, current goal, or approved plan. Use `already_armed` for a repeated preflight of the exact same manifest, and reserve `active_guard_exists` for a distinct explicitly activated loop that conflicts with unfinished guarded work. A later unrelated bounded request passivates the predecessor obligation for that interaction while preserving its state and history.
+
+Candidate-envelope defects are recoverable before production mutation. Use `manifest_correction_required` for mechanical candidate defects and `authorization_invalid` for source-reference, hash, lineage, or approved-plan binding defects; active guard state must remain unchanged. Correct the same draft monotonically and rerun audit/preflight unless the same refusal recurs or the only correction would widen or weaken the contract.
+
+A failed native validation may use exactly one `infrastructure_retry_ready` path only when the failure is proven to stop in a direct harness or support input, production is frozen, the manifest, commands, gates, authority, candidate fingerprint, and production fingerprints are unchanged, and the rerun executes the unchanged validation contract. If the rerun exposes a production defect, return to normal reassessment and owner-scoped correction.
 
 Validation support is evidence maintenance, not production authority. It may cover exact assertion-preserving test, fixture, spec, harness, or validation-artifact files under declared support roots when direct evidence proves the support need. It must preserve or strengthen assertions, freeze production, rerun the locked structured validation step, and never count as implementation progress or acceptance-gate progress by itself.
 
@@ -453,18 +461,19 @@ Use this loop for long-running Codex projects:
 1. Bootstrap or migrate state with `init`, `upgrade-state`, `migrate-state`, and `validate --strict`.
 2. Accept only validated Strategy packets; run `require-strategy-packet-before-work` before issuing Coding, Review, or Policy Review work.
 3. Run `governance-lint` on context packets and work orders before launch.
-4. Fill and lint `guard-obligation.md` before a guarded implementation or validation-only obligation.
-5. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
-6. Run `assess-parallelism` before launching more than one sub-agent.
-7. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
-8. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
-9. Record acceptance maturity with `record-acceptance-gate`; do not claim readiness above the highest passed gate.
-10. Record recoverable guard statuses with `record-governance-status`; do not use `authority_required` for observation-only findings or candidate-envelope defects.
-11. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
-12. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
-13. Run `enforce-master-boundary` before finalizing any Master turn.
-14. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
-15. Record incidents and alert acknowledgements instead of erasing failures.
+4. Decide guard mode in the work order. If activation is absent, record `loop_guard_not_required` and keep the guard passive.
+5. Fill and lint `guard-obligation.md` only for an explicitly guarded implementation or validation-only obligation.
+6. Check `recommend-token-strategy`, `set-budget`, and per-agent heartbeat caps before spawning.
+7. Run `assess-parallelism` before launching more than one sub-agent.
+8. Use `session-create` through `codex-app` confirmations or a tested `provider-command` adapter.
+9. Monitor with `supervise`, `check-heartbeats`, `check-budget`, `audit-agent`, and `session-reconcile`.
+10. Record acceptance maturity with `record-acceptance-gate`; do not claim readiness above the highest passed gate.
+11. Record recoverable guard statuses with `record-governance-status`; do not use `authority_required` for observation-only findings or candidate-envelope defects.
+12. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
+13. Rotate overloaded sessions only through `request-rotation`, `validate-predecessor-state`, and `rotate-session`.
+14. Run `enforce-master-boundary` before finalizing any Master turn.
+15. Run `soak_validate.py --quick` and `release_validate.py` before publishing skill changes.
+16. Record incidents and alert acknowledgements instead of erasing failures.
 
 The operating loop is designed to fail closed. If the Master cannot prove current strategy, provider liveness, boundary compliance, packet completeness, or budget safety, it should stop work and create a remediation packet instead of continuing from chat memory.
 

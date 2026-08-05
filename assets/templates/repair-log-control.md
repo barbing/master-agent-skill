@@ -21,6 +21,16 @@
 - One-off task records do not authorize autonomous loops.
 - A paused, rollback-only, superseded, or no-further-action task row blocks successor work.
 
+## Lineage And Guard Independence
+
+- Record lineage independent from guard mode: yes
+- Record identity fields: objective, original target error, controlling plan/spec
+- Logging arms guard: no
+- Guard not required status: loop_guard_not_required
+- Originating bounded record preserved when cycle opens: yes
+- Reciprocal cycle links required: yes
+- Shared index contention blocks work: no
+
 ## Repair Cycle Lane
 
 - Cycle index: docs/repair-execution-log/plan-index.md

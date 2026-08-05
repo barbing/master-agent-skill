@@ -37,13 +37,16 @@ Use active roles from `role-catalog.md` when launching short-lived sessions. Use
 | Worktrees isolate implementation | Plan and confirm a Worktree before implementation sessions when isolation is needed; do not mutate the user's local checkout or remote branches without an explicit merge/release gate. |
 | Round logs add temporal evidence | When `codex-round-log` is available, bind snapshot manifests to sub-agent receipts; use Git for current boundary enforcement and round logs for who/when evidence. |
 | Repair logs preserve document memory | Use `docs/repair-execution-log/` for bounded task records and repeated repair cycles; require the current row before launching or accepting work when prior document memory exists. |
+| Repair logs do not arm guards | Execution-log lineage is based on objective, original target error, and controlling plan/spec; task records and repair cycles never create autonomous-loop authority. |
+| Guard activation is explicit | Create or mutate guard state only for a current `/goal`, an explicit autonomous/guarded/repeated-repair request, or a user-approved plan that names that method; otherwise the guard result is `loop_guard_not_required`. |
+| Guard gates come from authority | A guarded obligation may include only gates required by the current user request, current goal, or approved plan; do not manufacture broad release, system, historical, or visual revalidation. |
 | Parallelism is conditional | Run multiple sub-agents only when their write sets, artifacts, and acceptance criteria are independent. |
 | Root authority is non-escalating | A plan or repair record may narrow or sequence work, but it cannot widen the original user grant, approved owners, file scopes, or material behavior domains. |
 | Material behavior is declared | Every context packet, work order, and receipt declares whether it touches pipeline order, batching/barriers, persistence/checkpoints, GUI timing, cancellation/failure semantics, or default/fallback behavior. |
 | Heuristics require admission | A heuristic is allowed only when the packet names authorization, target-independent invariant, owning boundary, representative evidence, non-regression coverage, and failure behavior. |
 | Acceptance maturity is monotonic | Do not claim a higher maturity gate until all lower gates are recorded as passed for the same scope. |
 | Observation is not mutation authority | Reading, tracing, existing tests, and approved validation may cross module boundaries without adding mutation owners. |
-| Guard statuses are precise | Use `authorization_invalid`, `evidence_required`, `in_root_transition_required`, and `external_mutation_domain_identified` before escalating to `authority_required`. |
+| Guard statuses are precise | Use `loop_guard_not_required`, `manifest_correction_required`, `authorization_invalid`, `already_armed`, `active_guard_exists`, `evidence_required`, `infrastructure_retry_ready`, `in_root_transition_required`, and `external_mutation_domain_identified` before escalating to `authority_required`. |
 | Authority stops are explicit | Reserve `authority_required` for an observed production mutation outside the root authorization envelope. |
 | Validation support is evidence maintenance | Assertion-preserving validation support may be recorded without widening production authority; it is not implementation progress. |
 | Visual gates are external receipts | The Master records visual review receipt binding and verdict; it does not manage image generation, retention, or inspection methodology. |
@@ -77,19 +80,20 @@ Define custom roles only when a project has a recurring or specialized responsib
 7. When `codex-round-log` is installed for the repository, run `round-log-status` before accepting concurrent implementation receipts and require `record-round-log-evidence` / `require-round-log-evidence` for work orders that demand snapshot evidence.
 8. When the project has `docs/repair-execution-log/`, run `repair-log-status` and `require-current-repair-row` before launching or accepting sub-agent work that depends on prior attempts.
 9. Create a context packet or work order with `new-packet`, fill the root authorization envelope, material behavior domains, representative workflow fields, acceptance gates, repair-log requirements, and heuristic admission fields, then run `governance-lint`.
-10. For guarded implementation or validation-only obligations, fill `guard-obligation.md` with schema-v6 fields, loop type, Git-visible progress scope, structured validation, validation-support roots, and visual receipt boundaries.
-11. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
-12. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
-13. Register the running sub-agent and require heartbeats plus token usage reports.
-14. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, `round-log-status`, `repair-log-status`, and `recommend-token-strategy` until the agent completes, blocks, drifts, needs evidence, needs a same-root transition, identifies an external mutation domain, or needs authority.
-15. Use `record-governance-status` for recoverable guard states such as `authorization_invalid`, `evidence_required`, `in_root_transition_required`, or `external_mutation_domain_identified`.
-16. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
-17. Accept, reject, or request clarification on the return packet.
-18. Record task outcomes or repair attempts with `record-task`, `open-repair-cycle`, or `record-repair-attempt` when the result affects future execution.
-19. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
-20. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
-21. Update the master ledger and event log only after acceptance.
-22. Derive the next action from the updated ledger and repair-log current row, not from conversational momentum.
+10. Decide guard mode in the work order. If explicit autonomous-loop activation is absent, record `loop_guard_not_required` and do not create guard manifests, guard budgets, successors, disarm ceremonies, or guard-owned gates.
+11. For explicitly guarded implementation or validation-only obligations, fill `guard-obligation.md` with guard activation source, schema-v6 fields, loop type, Git-visible progress scope, authority-derived gate ids, structured validation, validation-support roots, manifest-correction policy, infrastructure-retry policy, and visual receipt boundaries.
+12. Run `record-acceptance-gate` as gates pass, preserving monotonic maturity for the task scope.
+13. Run `recommend-token-strategy` before launching or continuing a sub-agent whose next step has a material token cost.
+14. Register the running sub-agent and require heartbeats plus token usage reports.
+15. Monitor with `supervise`, `check-heartbeats`, `watch-heartbeats`, `check-budget`, `worktree-reconcile`, `round-log-status`, `repair-log-status`, and `recommend-token-strategy` until the agent completes, blocks, drifts, needs evidence, needs a same-root transition, identifies an external mutation domain, or needs authority.
+16. Use `record-governance-status` for recoverable guard states such as `loop_guard_not_required`, `manifest_correction_required`, `authorization_invalid`, `already_armed`, `active_guard_exists`, `evidence_required`, `infrastructure_retry_ready`, `in_root_transition_required`, or `external_mutation_domain_identified`.
+17. Use `record-authority-required` only when observed production mutation exceeds the root authorization envelope.
+18. Accept, reject, or request clarification on the return packet.
+19. Record task outcomes or repair attempts with `record-task`, `open-repair-cycle`, or `record-repair-attempt` when the result affects future execution.
+20. Record material user corrections, failed reviews, and repeated agent mistakes with `record-learning-correction`.
+21. Periodically start a learning cycle, lint proposals, accept only reviewed learning updates, and track recurrence.
+22. Update the master ledger and event log only after acceptance.
+23. Derive the next action from the updated ledger and repair-log current row, not from conversational momentum.
 
 ## Agent Selection
 

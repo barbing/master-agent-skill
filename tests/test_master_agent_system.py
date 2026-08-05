@@ -4648,6 +4648,17 @@ class MasterAgentToolTests(unittest.TestCase):
                     "- Lower gates satisfied: yes",
                     "- Evidence artifact: test evidence",
                     "",
+                    "## Guard Mode",
+                    "",
+                    "- Guard activation required: no",
+                    "- Activation source: none",
+                    "- Explicit autonomous loop requested: no",
+                    "- Guard state mutation allowed: no",
+                    "- Missing activation status: loop_guard_not_required",
+                    "- Required gates source: current-user-request",
+                    "- Broad extra revalidation allowed: no",
+                    "- Execution-log lineage independent: yes",
+                    "",
                     "## Token Budget",
                     "",
                     "- Token budget: " + token_budget,
@@ -4683,6 +4694,18 @@ class MasterAgentToolTests(unittest.TestCase):
         budget_reset: str = "no",
         shell_string_allowed: str = "no",
         assertion_policy: str = "preserve",
+        guard_required: str = "yes",
+        activation_source: str = "current-user-request",
+        explicit_loop: str = "yes",
+        guard_state_mutation: str = "yes",
+        missing_activation_status: str = "loop_guard_not_required",
+        same_manifest_status: str = "already_armed",
+        active_loop_status: str = "active_guard_exists",
+        required_gates_source: str = "current-user-request",
+        broad_extra_revalidation: str = "no",
+        manifest_correction_status: str = "manifest_correction_required",
+        infrastructure_retry_status: str = "infrastructure_retry_ready",
+        max_infrastructure_retries: str = "1",
     ) -> None:
         path.write_text(
             "\n".join(
@@ -4707,6 +4730,17 @@ class MasterAgentToolTests(unittest.TestCase):
                     "- External mutation domain status: external_mutation_domain_identified",
                     "- Authority violation status: authority_required",
                     "",
+                    "## Guard Activation",
+                    "",
+                    f"- Guard activation required: {guard_required}",
+                    f"- Activation source: {activation_source}",
+                    f"- Explicit autonomous loop requested: {explicit_loop}",
+                    f"- Guard state mutation allowed: {guard_state_mutation}",
+                    "- Unrelated bounded requests passivate predecessor: yes",
+                    f"- Missing activation status: {missing_activation_status}",
+                    f"- Same manifest status: {same_manifest_status}",
+                    f"- Distinct active-loop conflict status: {active_loop_status}",
+                    "",
                     "## Obligation Contract",
                     "",
                     "- Schema version: 6",
@@ -4716,6 +4750,8 @@ class MasterAgentToolTests(unittest.TestCase):
                     "- Completion maturity: diagnostic",
                     "- Required gate ids: gate-diagnostic",
                     "- Contract docs: docs/plan.md",
+                    f"- Required gates source: {required_gates_source}",
+                    f"- Broad extra revalidation allowed: {broad_extra_revalidation}",
                     "",
                     "## Loop Budget",
                     "",
@@ -4756,9 +4792,27 @@ class MasterAgentToolTests(unittest.TestCase):
                     "## Status Semantics",
                     "",
                     "- Authorization invalid status: authorization_invalid",
+                    f"- Manifest correction status: {manifest_correction_status}",
                     "- In-root transition status: in_root_transition_required",
                     "- External mutation domain status: external_mutation_domain_identified",
+                    f"- Infrastructure retry status: {infrastructure_retry_status}",
                     "- Authority required status: authority_required",
+                    "",
+                    "## Manifest Correction Policy",
+                    "",
+                    f"- Correctable defect status: {manifest_correction_status}",
+                    "- Authorization reference defect status: authorization_invalid",
+                    "- Active state changed by correction refusal: no",
+                    "- Correction may widen contract: no",
+                    "- Same refusal stop required: yes",
+                    "",
+                    "## Infrastructure Retry",
+                    "",
+                    f"- Infrastructure retry status: {infrastructure_retry_status}",
+                    f"- Maximum infrastructure retries: {max_infrastructure_retries}",
+                    "- Production frozen during retry: yes",
+                    "- Requires unchanged manifest commands gates authority: yes",
+                    "- Requires unchanged production fingerprints: yes",
                 ]
             )
             + "\n",
@@ -4966,6 +5020,92 @@ class MasterAgentToolTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn("validation loop type requires validation-only closeout allowed", result.stderr)
+
+        missing_activation = self.tmp / "missing-activation.md"
+        self.write_guard_obligation(missing_activation, explicit_loop="no")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                missing_activation,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("guard-required obligation needs explicit autonomous loop requested", result.stderr)
+
+        wrong_status = self.tmp / "wrong-guard-status.md"
+        self.write_guard_obligation(wrong_status, missing_activation_status="continue")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                wrong_status,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Missing activation status must be loop_guard_not_required", result.stderr)
+
+        broad_gate = self.tmp / "broad-gate.md"
+        self.write_guard_obligation(broad_gate, broad_extra_revalidation="yes")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                broad_gate,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Broad extra revalidation allowed must be no", result.stderr)
+
+        retry_budget = self.tmp / "retry-budget.md"
+        self.write_guard_obligation(retry_budget, max_infrastructure_retries="2")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                retry_budget,
+                "--packet-type",
+                "guard-obligation",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Maximum infrastructure retries must be 1", result.stderr)
+
+    def test_governance_lint_rejects_work_order_guard_state_without_activation(self):
+        order = self.tmp / "work-order-guard-state.md"
+        self.write_work_order(order, "src/parser", "artifacts/parser")
+        text = order.read_text(encoding="utf-8").replace(
+            "- Guard state mutation allowed: no",
+            "- Guard state mutation allowed: yes",
+        )
+        order.write_text(text, encoding="utf-8")
+        result = run_cmd(
+            [
+                TOOL,
+                "governance-lint",
+                "--packet",
+                order,
+                "--packet-type",
+                "work-order",
+            ],
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("guard-not-required work cannot mutate guard state", result.stderr)
 
     def test_governance_lint_enforces_required_round_log_receipt_evidence(self):
         receipt = self.tmp / "coding-receipt.md"

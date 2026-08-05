@@ -5,7 +5,7 @@
 - Agent id:
 - Role:
 - Task id:
-- State: starting | active | validating | blocked | authorization_invalid | evidence_required | attempt_recording_required | validation_support_required | in_root_transition_required | external_mutation_domain_identified | authority_required | implementation_frozen_evidence_pending | implementation_budget_exhausted | complete | stopping
+- State: starting | active | validating | blocked | loop_guard_not_required | manifest_correction_required | authorization_invalid | already_armed | active_guard_exists | evidence_required | attempt_recording_required | validation_support_required | infrastructure_retry_ready | in_root_transition_required | external_mutation_domain_identified | authority_required | implementation_frozen_evidence_pending | implementation_budget_exhausted | complete | stopping
 - Confidence: low | medium | high
 
 ## Progress

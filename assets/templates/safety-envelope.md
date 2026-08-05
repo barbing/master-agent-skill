@@ -15,6 +15,7 @@
 - record-governance-status
 - record-authority-required
 - record-acceptance-gate
+- record-loop-guard-not-required
 - round-log-status
 - record-round-log-evidence
 - require-round-log-evidence
@@ -46,6 +47,11 @@
 - round-log-restore
 - use-repair-log-as-root-authority
 - continue-from-blocked-repair-row
+- arm-guard-without-explicit-activation
+- create-guard-owned-gates-for-bounded-task
+- use-repair-cycle-as-loop-authority
+- add-broad-extra-revalidation-gates
+- rerun-infrastructure-retry-more-than-once
 
 ## Budget And Role Limits
 

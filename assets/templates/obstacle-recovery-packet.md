@@ -10,7 +10,7 @@
 
 ## Obstacle Recovery
 
-- Status requested: continue | reassessment_required | evidence_required | in_root_transition_required | external_mutation_domain_identified | blocked | authority_required
+- Status requested: continue | loop_guard_not_required | manifest_correction_required | authorization_invalid | already_armed | active_guard_exists | reassessment_required | evidence_required | infrastructure_retry_ready | in_root_transition_required | external_mutation_domain_identified | blocked | authority_required
 - First failing boundary:
 - Safe diagnostics attempted:
 - In-scope alternatives attempted:
