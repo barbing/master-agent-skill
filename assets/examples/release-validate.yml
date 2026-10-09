@@ -1,0 +1,43 @@
+# Source example. Copy to .github/workflows/release-validate.yml to activate.
+# Action usage: https://github.com/actions/checkout and https://github.com/actions/setup-python
+name: release-validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-validate:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Prepare legacy skill-validation prerequisites
+        shell: bash
+        run: |
+          python -m pip install 'PyYAML==6.0.3'
+          mkdir -p "$HOME/.codex/skills/.system/skill-creator/scripts"
+          curl --fail --silent --show-error --location \
+            'https://raw.githubusercontent.com/openai/skills/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-creator/scripts/quick_validate.py' \
+            --output "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py"
+      - name: Validate source release
+        shell: bash
+        run: |
+          python scripts/release_validate.py \
+            --quick-validate "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py"
+      - name: Rerun module-owner acceptance tests
+        run: python -B -m unittest discover -s tests -p 'owned_*_test.py' -v

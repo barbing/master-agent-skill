@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -451,7 +453,11 @@ def run_soak(cycles: int, quick: bool) -> None:
         state_dir = project / "docs" / "master-agent"
         packets = state_dir / "packets"
         provider_state = state_dir / "state" / "provider-sessions.json"
-        provider_command = f"{sys.executable} {PROVIDER} --state-file {provider_state}"
+        provider_argv = [sys.executable, str(PROVIDER), "--state-file", str(provider_state)]
+        provider_command = (
+            subprocess.list2cmdline(provider_argv) if os.name == "nt"
+            else shlex.join(provider_argv)
+        )
 
         subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True, text=True)
 

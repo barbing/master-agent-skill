@@ -1,12 +1,14 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,6 +20,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from state_io import append_jsonl_locked, atomic_write_json  # noqa: E402
+from master_agent_tool import run_session_provider_command  # noqa: E402
 
 
 def run_cmd(args, cwd=ROOT, check=True, env=None):
@@ -33,6 +36,11 @@ def run_cmd(args, cwd=ROOT, check=True, env=None):
             f"command failed: {args}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     return result
+
+
+def provider_command_from_argv(args):
+    argv = list(map(str, args))
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
 def write_live_provider_script(path: Path, state_path: Path) -> None:
@@ -3021,14 +3029,17 @@ class MasterAgentToolTests(unittest.TestCase):
             runtime_path = self.state_dir / "state" / "runtime.json"
             if runtime_path.exists():
                 runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-                pid = runtime.get("pid")
-                if pid:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid), "/F"],
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                    )
+                if runtime.get("spawned"):
+                    supervisor_id = runtime["supervisor_id"]
+                    deadline = time.monotonic() + 10
+                    while runtime.get("supervisor_state") != "idle":
+                        self.assertEqual(runtime.get("supervisor_id"), supervisor_id)
+                        if time.monotonic() >= deadline:
+                            self.fail(f"Spawned supervisor did not acknowledge graceful stop: {runtime}")
+                        time.sleep(0.05)
+                        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+                    self.assertEqual(runtime.get("supervisor_id"), supervisor_id)
+                    self.assertTrue(runtime.get("stop_requested"))
 
     def test_supervisor_stop_sets_stop_requested(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -3265,7 +3276,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 "--provider",
                 "codex",
                 "--provider-command",
-                f"{PYTHON} {provider_script}",
+                provider_command_from_argv([PYTHON, provider_script]),
             ]
         )
         self.assertIn("Created session codex-session-1", result.stdout)
@@ -3287,7 +3298,7 @@ class MasterAgentToolTests(unittest.TestCase):
         provider_state = self.tmp / "provider-live.json"
         provider_script = self.tmp / "provider-live.py"
         write_live_provider_script(provider_script, provider_state)
-        provider_command = f"{PYTHON} {provider_script}"
+        provider_command = provider_command_from_argv([PYTHON, provider_script])
 
         run_cmd(
             [
@@ -3375,10 +3386,13 @@ class MasterAgentToolTests(unittest.TestCase):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
         context = self.tmp / "context-packet.md"
         context.write_text("# Context Packet\n", encoding="utf-8")
-        provider_state = self.state_dir / "state" / "provider-sessions.json"
-        provider_command = (
-            f"{PYTHON} {ROOT / 'scripts' / 'file_session_provider.py'} "
-            f"--state-file {provider_state}"
+        provider_dir = self.tmp / "provider's tools & files"
+        provider_dir.mkdir()
+        provider_script = provider_dir / "file session provider.py"
+        shutil.copy2(ROOT / "scripts" / "file_session_provider.py", provider_script)
+        provider_state = self.state_dir / "state" / "provider's sessions.json"
+        provider_command = provider_command_from_argv(
+            [PYTHON, provider_script, "--state-file", provider_state]
         )
 
         create = run_cmd(
@@ -3501,6 +3515,44 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_live_provider_command_does_not_use_shell_execution(self):
         source = (ROOT / "scripts" / "master_agent_tool.py").read_text(encoding="utf-8")
         self.assertNotIn("shell=True", source)
+
+    def test_provider_command_windows_preserves_native_quoting_without_shell(self):
+        argv = [r"C:\Program Files\Python\python.exe", r"C:\agent's files\provider.py",
+                "--state-file", r"C:\state & files\sessions.json"]
+        command = subprocess.list2cmdline(argv)
+        request = {"event": "session-read", "agent_id": "quoted-provider"}
+        result = subprocess.CompletedProcess(command, 0, '{"status":"active"}', "")
+        with mock.patch("master_agent_tool.os.name", "nt"), \
+                mock.patch("master_agent_tool.subprocess.run", return_value=result) as run:
+            payload, error = run_session_provider_command(command, request, 7)
+        self.assertEqual(payload, {"status": "active"})
+        self.assertIsNone(error)
+        run.assert_called_once_with(
+            command, input=json.dumps(request, sort_keys=True) + "\n",
+            text=True, capture_output=True, timeout=7, shell=False,
+        )
+
+    def test_provider_command_posix_preserves_arguments_and_rejects_invalid_input(self):
+        argv = ["/python tools/python", "/agent's files/provider.py", "--state-file",
+                "/state & files/$literal.json"]
+        command = shlex.join(argv)
+        result = subprocess.CompletedProcess(argv, 0, '{"status":"active"}', "")
+        with mock.patch("master_agent_tool.os.name", "posix"), \
+                mock.patch("master_agent_tool.subprocess.run", return_value=result) as run:
+            payload, error = run_session_provider_command(command, {}, 7)
+        self.assertEqual(payload, {"status": "active"})
+        self.assertIsNone(error)
+        run.assert_called_once_with(
+            argv, input="{}\n", text=True, capture_output=True, timeout=7, shell=False,
+        )
+        for command, detail in [("  ", "empty"), ('python "unterminated', "parsed")]:
+            with self.subTest(command=command), \
+                    mock.patch("master_agent_tool.os.name", "posix"), \
+                    mock.patch("master_agent_tool.subprocess.run") as run:
+                payload, error = run_session_provider_command(command, {}, 7)
+            self.assertIsNone(payload)
+            self.assertIn(detail, error)
+            run.assert_not_called()
 
     def test_session_send_and_read_are_logged(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -6012,12 +6064,14 @@ class MasterAgentToolTests(unittest.TestCase):
 
     def test_operating_system_hardening_docs_and_examples_exist(self):
         provider_reference = ROOT / "references" / "provider-command-adapter.md"
-        workflow = ROOT / ".github" / "workflows" / "release-validate.yml"
+        workflow = ROOT / "assets" / "examples" / "release-validate.yml"
         pre_commit = ROOT / "assets" / "examples" / "pre-commit-master-boundary.ps1"
         worktree_control = ROOT / "assets" / "templates" / "worktree-control.md"
 
         self.assertIn("Provider-Command Adapter Contract", provider_reference.read_text(encoding="utf-8"))
         self.assertIn("release-validate", workflow.read_text(encoding="utf-8"))
+        self.assertIn("scripts/release_validate.py", workflow.read_text(encoding="utf-8"))
+        self.assertIn("owned_*_test.py", workflow.read_text(encoding="utf-8"))
         self.assertIn("enforce-master-boundary", pre_commit.read_text(encoding="utf-8"))
         self.assertIn("Worktree Control", worktree_control.read_text(encoding="utf-8"))
 

@@ -4056,7 +4056,9 @@ def run_session_provider_command(
     timeout_seconds: float,
 ) -> tuple[dict | None, str | None]:
     try:
-        argv = shlex.split(command, posix=os.name != "nt")
+        # Windows CreateProcess consumes its native command line directly.
+        # shlex's non-POSIX mode retains quotes and would pass them as data.
+        argv = command.strip() if os.name == "nt" else shlex.split(command)
     except ValueError as exc:
         return None, f"Provider command could not be parsed: {exc}"
     if not argv:
@@ -4068,6 +4070,7 @@ def run_session_provider_command(
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
+            shell=False,
         )
     except subprocess.TimeoutExpired:
         return None, f"Provider command timed out after {timeout_seconds:g}s"
