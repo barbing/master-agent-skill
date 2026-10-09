@@ -1,23 +1,38 @@
 """Automatic module submission/Master review/correction, with persistent owners.
 
 The control host is trusted. Models operate on isolated writable module copies;
-only verified immutable artifacts can be reviewed/integrated. This first slice
+only verified immutable artifacts can be reviewed/integrated. This slice
 produces an integration artifact, never deploys or mutates Git metadata.
+
+Scheduling is event driven: owner turns, Master reviews and integration run as
+independent tasks, so a slow owner never delays another module's review and a
+blocked module stops only its dependents. A native turn that reaches its
+deadline or the token envelope, fails, or loses its transport is interrupted;
+once the owned process exit is observed it is settled, its owned files are
+checkpointed and the same owner continues in the same context.
 """
 from __future__ import annotations
 
+from contextlib import closing
+
 import asyncio
+import errno
 import json
 import os
 import shutil
+import subprocess
+import time
 import uuid
 from pathlib import Path
 
 from .artifacts import capture, context_hashes, file_names, owned_path, verify
-from .contracts import (BudgetError, ConflictError, ContractError, ProjectCancelled, digest, relative_path)
-from .native import ModelUnavailable, NativeActor, NativeRejected, JsonRpcClient
+from .contracts import (AuthorityError, BudgetError, ConflictError, ContractError, DispatchRejected,
+                        EnvironmentFailure, ProjectCancelled, ScopeViolation, TurnStopped, UnknownOutcome,
+                        digest, relative_path)
+from .native import ModelUnavailable, NativeActor, NativeRejected, JsonRpcClient, read_turn
+from .claude_native import ClaudeActor, claude_preflight, claude_trace_commands
 from .sandbox import check_scope
-from .store import Store
+from .store import ACTIVE_STATUSES, DISPATCHABLE_MODULE_STATES, Store
 from .validation import validate
 from .lease import project_lease
 from .evidence import command_observation, seal_review_evidence, verify_review_evidence
@@ -34,11 +49,37 @@ CANDIDATE_REVIEW_OUTPUT = {"type": "object", "properties": {
     **REVIEW_OUTPUT['properties'],
     'failure_kind': {'type': 'string', 'enum': ['none', 'implementation', 'evidence', 'uncertain_execution']}},
     'required': ['decision', 'rationale', 'failure_kind'], 'additionalProperties': False}
+BLOCKING_ISSUE = {"type": "object", "properties": {
+    "obligation": {"type": "string"}, "evidence": {"type": "string"}, "required_change": {"type": "string"}},
+    "required": ["obligation", "evidence", "required_change"], "additionalProperties": False}
+PREVIOUS_ISSUE = {"type": "object", "properties": {
+    "issue": {"type": "string"}, "status": {"type": "string", "enum": ["resolved", "unresolved"]}},
+    "required": ["issue", "status"], "additionalProperties": False}
+STRUCTURED_REVIEW_OUTPUT = {"type": "object", "properties": {
+    **CANDIDATE_REVIEW_OUTPUT['properties'],
+    "blocking_issues": {"type": "array", "items": BLOCKING_ISSUE},
+    "advisories": {"type": "array", "items": {"type": "string"}},
+    "previous_issues": {"type": "array", "items": PREVIOUS_ISSUE}},
+    "required": ["decision", "rationale", "failure_kind", "blocking_issues", "advisories", "previous_issues"],
+    "additionalProperties": False}
+OBLIGATION_CATEGORIES = ("objective", "module", "interface", "check", "owner_tests", "scope", "regression", "integration")
+SCOPE_ERRNOS = {errno.ELOOP, errno.EMLINK}
+
+
+def continuation_instructions(reason):
+    why = {"deadline": "reached its admitted time limit and was interrupted",
+           "budget": "was interrupted because the project's token envelope was reached",
+           "native_failed": "ended in the native runtime before completion",
+           "transport_lost": "lost its connection to the native runtime",
+           "receipt_missing": "ended without the required structured submission"}.get(reason, "stopped")
+    return (f"Your previous turn {why}. Your module files at that point are preserved in your new workspace. "
+            "Continue the same module work from where you stopped, re-run your checks, and return the "
+            "structured submission when the module is complete.")
 
 
 def copy_public_project(source: Path, target: Path):
-    """Copy actual source/requirements, not credentials, Git state or runtime logs."""
-    excluded = {".git", ".codex", ".agents", ".aws", ".ssh", ".codex-round-log",
+    """Copy actual source/requirements, not credentials, Git state, agent configuration or runtime logs."""
+    excluded = {".git", ".codex", ".agents", ".aws", ".ssh", ".codex-round-log", ".claude",
                 "__pycache__", ".pytest_cache", "node_modules", ".venv"}
     target.mkdir(parents=True, exist_ok=True)
     for directory, dirs, files in os.walk(source, followlinks=False):
@@ -69,23 +110,69 @@ def overlay_candidate(directory, snapshot, manifest):
         shutil.copyfile(snapshot / item["path"], target)
 
 
+def _cli_version(cli):
+    try:
+        result = subprocess.run([cli, "--version"], text=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (result.stdout or result.stderr).strip().splitlines()[-1][:200] if result.returncode == 0 else None
+
+
 class Controller:
-    def __init__(self, store: Store, project_id: str, *, cli="codex", actor_factory=NativeActor):
+    def __init__(self, store: Store, project_id: str, *, cli="codex", actor_factory=None, claude_cli=None):
         self.store = store
         self.project_id = project_id
-        self.spec = store.project(project_id)["contract"]
+        project = store.project(project_id)
+        self.spec = project["contract"]
+        self.policy = project["policy"]
         self.runtime_root = store.path.parent
         self.state_root = self.runtime_root / "projects" / project_id
         self.public = self.state_root / "public"
         self.workspaces = self.state_root / "workspaces"
         self.context = self.public / "base"
         self.snapshots = self.public / "candidates"
+        self.checkpoints = self.public / "checkpoints"
         self.evidence = self.public / "validation"
+        self.traces = self.state_root / "native-traces"
         self.cli = cli
+        self.claude_cli = claude_cli or "claude"
+        # None (or NativeActor) routes each actor to its policy provider. Any
+        # other factory is a synthetic test double used for every actor.
         self.actor_factory = actor_factory
         self.live = {}
         self.master_principal = None
-        self.workspace_context={}
+        self.workspace_context = {}
+        self.failed_keys = set()
+        self.integration_retry_after = None
+        self._versions = {}
+        dependents = {module.key: set() for module in self.spec.modules}
+        for module in self.spec.modules:
+            for dependency in module.dependencies:
+                dependents[dependency].add(module.key)
+        def closure(key, seen=None):
+            seen = set() if seen is None else seen
+            for child in dependents[key]:
+                if child not in seen:
+                    seen.add(child)
+                    closure(child, seen)
+            return seen
+        self.critical_weight = {key: len(closure(key)) for key in dependents}
+
+    # ---- Runtime routing -------------------------------------------------
+
+    def synthetic(self):
+        return self.actor_factory is not None and self.actor_factory is not NativeActor
+
+    def runtime_for(self, record):
+        return self.policy.runtime_for(self.spec, record["module_key"])
+
+    def factory_for(self, record):
+        if self.synthetic():
+            return self.actor_factory
+        return ClaudeActor if self.runtime_for(record).provider == "claude" else NativeActor
+
+    def deadline(self, kind):
+        return self.policy.turn_timeout(self.spec, kind)
 
     def prepare(self):
         if not self.spec.integration_validation or any(not m.validation for m in self.spec.modules):
@@ -96,9 +183,8 @@ class Controller:
             staging = self.public / ("base-" + uuid.uuid4().hex)
             copy_public_project(Path(self.spec.root), staging)
             staging.rename(self.context)
-        self.snapshots.mkdir(parents=True, exist_ok=True)
-        self.evidence.mkdir(parents=True, exist_ok=True)
-        self.workspaces.mkdir(parents=True, exist_ok=True)
+        for directory in (self.snapshots, self.checkpoints, self.evidence, self.workspaces, self.traces):
+            directory.mkdir(parents=True, exist_ok=True)
 
     def instructions(self, kind, module=None):
         common = ("Use only the admitted local project scope. No Git staging/commits/policy changes, "
@@ -114,15 +200,25 @@ class Controller:
         return common + (f"You are the independent owner of module {module.key}. "
             f"Complete planning, implementation, testing and correction in this session. Objective: {module.objective}. "
             f"Only produce files under these project-relative paths: {list(module.paths)}. "
+            "Agent configuration and instruction files (.claude/, CLAUDE.md, .codex/, .agents/) are never deliverables. "
             "Use the readonly public project context for relevant source/requirements. "
             "Keep your internal planning in this session; do not create role packets or extra managed personas. "
             "Return an honest submitted/blocked summary; the Master owns acceptance.")
+
+    def module_row(self, key):
+        return next(m for m in self.store.modules(self.project_id) if m["key"] == key)
+
+    def note(self, kind, payload):
+        with self.store.transaction() as con:
+            self.store.event(con, self.project_id, kind, payload)
 
     async def open_actor(self, actor_id):
         if actor_id in self.live:
             return self.live[actor_id]
         record = self.store.actor(actor_id)
         module = next((m for m in self.spec.modules if m.key == record["module_key"]), None)
+        runtime = self.runtime_for(record)
+        factory = self.factory_for(record)
         # A resumed native conversation gets a fresh write namespace. A delayed
         # process from an earlier activation has no grant to the next workspace.
         workspace = self.workspaces / (record["module_key"] or "master")
@@ -132,27 +228,46 @@ class Controller:
         if module:
             inputs=self.store.inputs(self.project_id,module.key)
             copy_public_project(self.input_context(module,inputs),workspace)
-            row = next(m for m in self.store.modules(self.project_id) if m["key"] == module.key)
-            if row["current_candidate"]:
+            row = self.module_row(module.key)
+            if row.get("checkpoint"):
+                # A checkpoint already contains every owned file at the stop,
+                # including the previous candidate's content.
+                manifest = verify(Path(row["checkpoint"]), module.paths, expected_hash=row["checkpoint_hash"])
+                overlay_candidate(workspace, Path(row["checkpoint"]), manifest)
+            elif row["current_candidate"]:
                 previous = self.store.candidate(row["current_candidate"])
                 manifest = verify(Path(previous["snapshot"]), module.paths, expected_hash=previous["tree_hash"])
                 overlay_candidate(workspace,Path(previous['snapshot']),manifest)
+            # Admitted files may sit in directories the project does not have
+            # yet. Native sandboxes grant writes to the exact admitted paths,
+            # which cannot create a missing parent, so the host creates them.
+            for relative in module.paths:
+                (workspace / relative).parent.mkdir(parents=True, exist_ok=True)
             self.workspace_context[actor_id]=context_hashes(workspace,module.paths)
-        actor = self.actor_factory(actor_id, workspace, self.public, self.runtime_root,
-            kind=record["kind"], cli=self.cli, model=self.spec.model, effort=self.spec.effort,
-            timeout=self.spec.turn_timeout_seconds,write_paths=module.paths if module else None,
-            runtime_executables=tuple(sorted({step.argv[0] for item in self.spec.modules for step in item.validation}
-                                            |{step.argv[0] for item in self.spec.modules for step in item.test_validation}
-                                            |{step.argv[0] for step in self.spec.integration_validation})))
-        binding = self.store.binding_intent(actor_id, {"existing_thread": record["thread_id"], "workspace": str(workspace)})
-        if self.actor_factory is NativeActor:
+        executables = tuple(sorted({step.argv[0] for item in self.spec.modules for step in item.validation}
+                                   |{step.argv[0] for item in self.spec.modules for step in item.test_validation}
+                                   |{step.argv[0] for step in self.spec.integration_validation}))
+        backstop = self.deadline(record["kind"]) + self.policy.interrupt_grace_seconds + 120
+        common = dict(kind=record["kind"], model=runtime.model, effort=runtime.effort, timeout=backstop,
+                      write_paths=module.paths if module else None, runtime_executables=executables)
+        if factory is ClaudeActor:
+            actor = ClaudeActor(actor_id, workspace, self.public, self.runtime_root, cli=self.claude_cli,
+                                trace_dir=self.traces, **common)
+        else:
+            actor = factory(actor_id, workspace, self.public, self.runtime_root, cli=self.cli, **common)
+        binding = self.store.binding_intent(actor_id, {"existing_thread": record["thread_id"], "workspace": str(workspace),
+                                                       "provider": runtime.provider})
+        if factory is NativeActor or factory is ClaudeActor:
             # Configuration text is not enforcement evidence. Refuse this
             # binding before any native/model session if the backend broadens
             # declared writes (including platform-added temporary access).
             try:
-                await asyncio.to_thread(check_scope,self.cli,actor.profile,
-                    actor.config["permissions"][actor.profile],workspace/'.tmp' if module else workspace,
-                    self.evidence / ("scope-" + binding + ".json"),writable=record["kind"]=="module")
+                if factory is NativeActor:
+                    await asyncio.to_thread(check_scope,self.cli,actor.profile,
+                        actor.config["permissions"][actor.profile],workspace/'.tmp' if module else workspace,
+                        self.evidence / ("scope-" + binding + ".json"),writable=record["kind"]=="module")
+                else:
+                    claude_preflight(actor, self.evidence / ("scope-" + binding + ".json"))
             except BaseException:
                 self.store.settle(binding,state="failed",evidence="scope preflight refused; native root/turn was never requested")
                 raise
@@ -176,42 +291,81 @@ class Controller:
             self.store.mark_unknown(binding, str(error))
             await actor.close()
             raise
+        if not self.synthetic():
+            cli = self.claude_cli if factory is ClaudeActor else self.cli
+            if cli not in self._versions:
+                self._versions[cli] = await asyncio.to_thread(_cli_version, cli)
+            effective = actor.effective if isinstance(getattr(actor, "effective", None), dict) else {}
+            self.store.record_actor_runtime(actor_id, {"provider": runtime.provider, "cli": cli,
+                "cli_version": self._versions[cli], "requested_model": runtime.model,
+                "requested_effort": runtime.effort, "effective": effective})
         self.live[actor_id] = (actor, principal)
         return actor, principal
 
+    # ---- Master admission ------------------------------------------------
+
     async def ensure_master(self):
         actor_id = f"{self.project_id}:master"
-        actor, principal = await self.open_actor(actor_id)
-        self.master_principal = principal
-        with self.store.connect() as con:
-            admission=con.execute("SELECT 1 FROM operation WHERE actor_id=? AND kind!='binding'",(actor_id,)).fetchone()
-            verdict=con.execute("SELECT payload FROM event WHERE project_id=? AND kind='master-project-admission' ORDER BY seq DESC LIMIT 1",(self.project_id,)).fetchone()
-        if verdict and json.loads(verdict['payload'])['decision']!='approve':
-            raise ContractError('Master admission still requires revision; rejected admission cannot be bypassed by restarting')
-        if not admission:
-            message=(f'Review initial project admission: {self.spec.objective}\n'
-                     'Phase: admit future engineering work, not accept completed code. '
-                     'The requested functions, behaviors and planned owner test files may be absent or failing in the baseline; '
-                     'those are the admitted owners\' work, not reasons to reject dispatch. '
-                     'Approve when scope, authority, required interfaces, independent acceptance and resources form a consistent feasible mandate. '
-                     'Reject only a real contract contradiction, unavailable required resource or out-of-authority effect; '
-                     'do not demand completion before assigning the implementation.\n'
-                     f'Readonly actual project source and acceptance: {self.context}\n'
-                     f'Owner/module scopes: {[(m.key,m.paths,m.dependencies) for m in self.spec.modules]}\n'
-                     f'Fixed and owner-test validation: {[(m.key, [list(s.argv) for s in (*m.validation, *m.test_validation)], list(m.test_paths)) for m in self.spec.modules]}\n'
-                     'Your current working directory contains no project source. Use the readable context path above. '
-                     'Confirm the supplied bounded module mandates and fixed independent acceptance are consistent. '
-                     'The host owns governance logs, scope/resource admission and dispatch; do not create packets, change criteria or write production. '
-                     'This is actual project management context for later review, not an instruction to implement the modules. '
-                     'Return approve/request_changes with a concise substantive rationale.')
-            operation=self.store.dispatch(principal,actor_id,message,kind='admission')
-            result=await self.run_native_operation(actor,principal,operation,message,REVIEW_OUTPUT)
-            decision=json.loads(result['text'])
-            self.store.settle(operation,evidence='Master project admission reviewed in readonly scope; native context has a persisted turn')
-            with self.store.transaction() as con:
-                self.store.event(con,self.project_id,'master-project-admission',{'decision':decision['decision'],'rationale':decision['rationale'],'operation':operation})
-            if decision['decision']!='approve':raise ContractError('Master admission needs revision: '+decision['rationale'])
-        return actor
+        failures = 0
+        while True:
+            actor, principal = await self.open_actor(actor_id)
+            self.master_principal = principal
+            state = self.store.admission_state(self.project_id)
+            if state == "admitted":
+                return actor
+            if state == "rejected":
+                raise ContractError('Master admission still requires revision; rejected admission cannot be bypassed by restarting. '
+                                    'An operator may rerun or override it with the admission command.')
+            if not self.policy.admission_review:
+                self.store.record_admission(self.project_id, decision="approve", source="runtime_policy",
+                    rationale="Master admission turn disabled by runtime policy; the host validated the contract")
+                return actor
+            if await self.run_admission(actor, principal):
+                return actor
+            # The turn stopped, was refused or returned no valid decision:
+            # nothing is admitted. Retry within the bound, then stop the run.
+            failures += 1
+            if failures > self.policy.max_transient_retries:
+                raise ContractError(f'Master admission returned no decision in {failures} attempts; no module work was dispatched. '
+                                    'Inspect the native runtime, then run again; a new run asks for admission again.')
+            await self.backoff(self.policy.transient_backoff_seconds * 2 ** (failures - 1))
+
+    async def backoff(self, seconds):
+        """Wait before a bounded retry while still honouring a project stop."""
+        until = time.monotonic() + seconds
+        while True:
+            if self.store.project(self.project_id)["state"] != "active":
+                raise ProjectCancelled("Project stop acknowledged during retry backoff; no new work admitted")
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, .5))
+
+    async def run_admission(self, actor, principal):
+        message=(f'Review initial project admission: {self.spec.objective}\n'
+                 'Phase: admit future engineering work, not accept completed code. '
+                 'The requested functions, behaviors and planned owner test files may be absent or failing in the baseline; '
+                 'those are the admitted owners\' work, not reasons to reject dispatch. '
+                 'Approve when scope, authority, required interfaces, independent acceptance and resources form a consistent feasible mandate. '
+                 'Reject only a real contract contradiction, unavailable required resource or out-of-authority effect; '
+                 'do not demand completion before assigning the implementation.\n'
+                 f'Readonly actual project source and acceptance: {self.context}\n'
+                 f'Owner/module scopes: {[(m.key,m.paths,m.dependencies) for m in self.spec.modules]}\n'
+                 f'Fixed and owner-test validation: {[(m.key, [list(s.argv) for s in (*m.validation, *m.test_validation)], list(m.test_paths)) for m in self.spec.modules]}\n'
+                 'Your current working directory contains no project source. Use the readable context path above. '
+                 'Confirm the supplied bounded module mandates and fixed independent acceptance are consistent. '
+                 'The host owns governance logs, scope/resource admission and dispatch; do not create packets, change criteria or write production. '
+                 'This is actual project management context for later review, not an instruction to implement the modules. '
+                 'Return approve/request_changes with a concise substantive rationale.')
+        decision, operation = await self.master_decision(actor, principal, message, REVIEW_OUTPUT, kind='admission')
+        if decision is None:
+            return False
+        self.store.record_admission(self.project_id, decision=decision['decision'], rationale=decision['rationale'],
+                                    operation=operation)
+        if decision['decision']!='approve':raise ContractError('Master admission needs revision: '+decision['rationale'])
+        return True
+
+    # ---- Inputs and owner messages ----------------------------------------
 
     def input_context(self, module, inputs):
         """A coherent readonly source view, including accepted dependency code."""
@@ -239,37 +393,127 @@ class Controller:
                 snapshot = Path(candidate["snapshot"])
                 manifest = verify(snapshot,by_key[key].paths,expected_hash=candidate["tree_hash"])
                 overlay_candidate(staging,snapshot,manifest)
-            staging.rename(directory)
+            try:
+                staging.rename(directory)
+            except OSError:
+                # Another concurrent owner built the same immutable view first.
+                if not directory.exists():
+                    raise
+                shutil.rmtree(staging, ignore_errors=True)
         return directory
 
-    def operation_message(self, module, inputs, input_context):
+    def presubmission_commands(self, module, input_context, workspace, provider):
+        context = workspace if provider == "claude" else input_context
+        return [[part.replace("{candidate}", str(workspace)).replace("{context}", str(context)) for part in step.argv]
+                for step in (*module.validation, *module.test_validation)]
+
+    def operation_message(self, module, inputs, input_context, workspace=None, provider="codex"):
         owned = self.store.pending_messages(f"{self.project_id}:module:{module.key}")
-        corrections = [json.loads(x["payload"]).get("instructions", "") for x in owned if x["kind"] == "correction"]
-        return (f"Project objective: {self.spec.objective}\n"
-                f"Complete module {module.key}: {module.objective}\n"
-                f"Readonly source and requirements with accepted dependency versions: {input_context}\n"
-                f"Accepted input bindings: {json.dumps(inputs)}\n"
-                f"Actual accepted dependency source: {json.dumps({k: self.store.candidate(v['candidate'])['snapshot'] for k,v in inputs.items()})}\n"
-                f"Write only admitted module paths in your current workspace: {list(module.paths)}\n"
-                f"Latest corrections: {json.dumps(corrections)}\n"
-                f"Admitted owner test files to deliver: {list(module.test_paths)}\n"
-                f"Fixed acceptance and owner-test rerun commands: {[list(s.argv) for s in (*module.validation, *module.test_validation)]}\n"
-                "Include runnable meaningful tests in the admitted test files; private scratch is not a deliverable. "
-                "The host records executed commands and independently reruns admitted checks against your sealed code/test version. "
-                "Use the admitted project view; do not inspect unrelated memories, sessions or original checkouts. "
-                "Inspect actual repository requirements and validate the complete requested behavior. "
-                "Do not stop early at a partial implementation. Return only the constrained JSON submission.")
+        payloads = [(x["kind"], json.loads(x["payload"])) for x in owned]
+        corrections = [p.get("instructions", "") for kind, p in payloads if kind == "correction"]
+        continuations = [p.get("instructions", "") for kind, p in payloads if kind == "continuation"]
+        blocking = [issue for kind, p in payloads if kind == "correction" for issue in p.get("blocking_issues", [])]
+        advisories = [item for kind, p in payloads if kind == "correction" for item in p.get("advisories", [])]
+        message = (f"Project objective: {self.spec.objective}\n"
+                   f"Complete module {module.key}: {module.objective}\n"
+                   f"Readonly source and requirements with accepted dependency versions: {input_context}\n"
+                   f"Accepted input bindings: {json.dumps(inputs)}\n"
+                   f"Actual accepted dependency source: {json.dumps({k: self.store.candidate(v['candidate'])['snapshot'] for k,v in inputs.items()})}\n"
+                   f"Write only admitted module paths in your current workspace: {list(module.paths)}\n"
+                   f"Latest corrections: {json.dumps(corrections)}\n")
+        if continuations:
+            message += f"Continuation: {continuations[-1]}\n"
+        if blocking:
+            message += ("Blocking issues the Master will verify on resubmission: "
+                        + json.dumps(blocking) + "\n")
+        if advisories:
+            message += ("Non-blocking advisories (optional; they do not affect acceptance): "
+                        + json.dumps(advisories) + "\n")
+        message += (f"Admitted owner test files to deliver: {list(module.test_paths)}\n"
+                    f"Fixed acceptance and owner-test rerun commands: {[list(s.argv) for s in (*module.validation, *module.test_validation)]}\n")
+        if workspace is not None:
+            message += ("Before submitting, run these exact commands from your workspace; the host reruns the same checks "
+                        f"against your sealed files: {json.dumps(self.presubmission_commands(module, input_context, workspace, provider))}\n")
+        if provider == "claude":
+            message += ("Your workspace already contains this complete coherent project view, including accepted "
+                        "dependency code; read files there.\n")
+        message += ("Include runnable meaningful tests in the admitted test files; private scratch is not a deliverable. "
+                    "The host records executed commands and independently reruns admitted checks against your sealed code/test version. "
+                    "Use the admitted project view; do not inspect unrelated memories, sessions or original checkouts. "
+                    "Inspect actual repository requirements and validate the complete requested behavior. "
+                    "Do not stop early at a partial implementation. Return only the constrained JSON submission.")
+        return message
+
+    # ---- Native turns ----------------------------------------------------
+
+    async def safe_close(self, actor):
+        try:
+            result = await actor.close()
+        except Exception:
+            return {"process_exited": False}
+        return result if isinstance(result, dict) else {"process_exited": False}
+
+    async def stop_turn(self, actor, turn, waiting, reason, actor_id):
+        grace = self.policy.interrupt_grace_seconds
+        try:
+            await asyncio.wait_for(actor.interrupt(turn), timeout=min(grace, 30))
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(waiting), timeout=grace)
+            return  # The turn reached a terminal result within the grace period.
+        except Exception:
+            pass
+        shutdown = await self.safe_close(actor)
+        self.live.pop(actor_id, None)
+        if shutdown.get("process_exited"):
+            raise TurnStopped(reason, f"interrupt sent after {reason}; owned native service exited")
+        raise UnknownOutcome(f"{reason}: owned native service did not exit after interrupt")
 
     async def run_native_operation(self, actor, principal, operation, message, schema):
-        before=len(getattr(actor,'events',[]))
+        before=len(getattr(actor,'events',[]) or [])
+        kind = "master" if principal.actor_id.endswith(":master") else "module"
+        limit = self.deadline(kind)
+        budget = {"exceeded": False}
         try:
-            turn = await actor.start_turn(message, output_schema=schema, client_message_id=operation)
-            self.store.mark_started(operation, turn)
-            def observe_usage(total):
-                self.store.record_usage(principal.actor_id,total)
+            try:
+                turn = await actor.start_turn(message, output_schema=schema, client_message_id=operation)
+            except NativeRejected as error:
+                # A JSON-RPC error reply or refused launch is definitive: no turn exists.
+                raise DispatchRejected(str(error)) from error
+            try:
+                self.store.mark_started(operation, turn)
+            except ConflictError:
+                if self.store.project(self.project_id)["state"] not in ("cancelling", "cancelled"):
+                    raise
+                # A stop landed between dispatch and the start acknowledgement.
+                # Record the turn so reconcile can read it, then stop it like
+                # any other turn instead of leaving it running unrecorded.
+                self.store.note_remote_turn(operation, turn)
+                try:
+                    await asyncio.wait_for(actor.interrupt(turn), timeout=min(self.policy.interrupt_grace_seconds, 30))
+                except Exception:
+                    pass
+                shutdown = await self.safe_close(actor)
+                self.live.pop(principal.actor_id, None)
+                if not shutdown.get("process_exited"):
+                    raise UnknownOutcome("A stop arrived before the start acknowledgement and the owned native service did not exit")
+                self.store.settle(operation, state="cancelled",
+                    evidence=f"stop arrived before native turn {turn} was acknowledged; interrupt sent and owned service exited")
+                raise ProjectCancelled("Project stop acknowledged; the just-started turn was interrupted")
+            effective = getattr(actor, "effective", None)
+            model = effective.get("model") if isinstance(effective, dict) else None
+            price = self.policy.price(model)
+            def observe_usage(total, detail=None, cost_usd=None, cost_pending=False):
+                self.store.record_usage(principal.actor_id, total, detail, cost_usd=cost_usd, price=price,
+                                        cost_pending=cost_pending)
                 if self.store.project(self.project_id)["spent"] >= self.spec.token_budget:
-                    raise BudgetError("Observed usage reached the soft token envelope; stop and retain unresolved liability")
+                    budget["exceeded"] = True
+            if isinstance(actor, ClaudeActor):
+                record = self.store.actor(principal.actor_id)
+                actor.set_usage_base(record["last_usage"], json.loads(record.get("last_usage_detail") or "{}"))
             waiting=asyncio.create_task(actor.await_turn(turn,on_usage=observe_usage))
+            started = time.monotonic()
             try:
                 while not waiting.done():
                     done,_=await asyncio.wait((waiting,),timeout=.5)
@@ -280,77 +524,171 @@ class Controller:
                         if shutdown.get('process_exited'):
                             self.store.settle(operation,state='cancelled',evidence='interrupt acknowledged; owned service exited; old workspace fenced')
                         raise ProjectCancelled('Project stop acknowledged; no new work admitted')
+                    reason = "budget" if budget["exceeded"] else ("deadline" if time.monotonic() - started >= limit else None)
+                    if reason:
+                        await self.stop_turn(actor, turn, waiting, reason, principal.actor_id)
                 result=await waiting
             finally:
                 if not waiting.done():waiting.cancel()
                 await asyncio.gather(waiting,return_exceptions=True)
             return result
+        except (ProjectCancelled, TurnStopped, DispatchRejected):
+            raise
+        except NativeRejected as error:
+            # A terminal failed/interrupted turn is definitive; settle after exit.
+            shutdown = await self.safe_close(actor)
+            self.live.pop(principal.actor_id, None)
+            if shutdown.get("process_exited"):
+                raise TurnStopped("native_failed", str(error)) from error
+            self.store.mark_unknown(operation, str(error))
+            raise
+        except AuthorityError as error:
+            # The native runtime contradicted the admitted configuration.
+            shutdown = await self.safe_close(actor)
+            self.live.pop(principal.actor_id, None)
+            if shutdown.get("process_exited"):
+                self.store.settle(operation, state="failed", evidence="native runtime conformance refused: " + str(error))
+            else:
+                self.store.mark_unknown(operation, str(error))
+            raise EnvironmentFailure(f"Native runtime conformance refused: {error}") from error
+        except (UnknownOutcome, OSError, ConnectionError, ValueError) as error:
+            self.store.mark_unknown(operation, str(error))
+            shutdown = await self.safe_close(actor)
+            self.live.pop(principal.actor_id, None)
+            if shutdown.get("process_exited"):
+                self.store.note_exit_observed(operation)
+                raise TurnStopped("transport_lost", str(error)) from error
+            raise
         except BaseException as error:
             self.store.mark_unknown(operation, str(error))
             raise
         finally:
-            trace=self.state_root/'native-traces';trace.mkdir(parents=True,exist_ok=True)
-            (trace/(operation+'.json')).write_text(json.dumps({'actor':principal.actor_id,
-                'thread_id':principal.thread_id,'effective':getattr(actor,'effective',None),
-                'events':getattr(actor,'events',[])[before:]},indent=2)+'\n')
+            events = getattr(actor,'events',[]) or []
+            effective = getattr(actor,'effective',None)
+            compactions = getattr(actor, "compactions", 0)
+            self.traces.mkdir(parents=True,exist_ok=True)
+            (self.traces/(operation+'.json')).write_text(json.dumps({'actor':principal.actor_id,
+                'thread_id':principal.thread_id,'effective':effective if isinstance(effective, dict) else None,
+                'compactions': compactions if isinstance(compactions, int) else 0,
+                'events':events[before:] if isinstance(events, list) else []},indent=2)+'\n')
+
+    def capture_checkpoint(self, workspace, module, operation, inputs, context, mandate_revision):
+        try:
+            return capture(Path(workspace), self.checkpoints, module.paths,
+                bindings={"kind": "checkpoint", "operation": operation, "module": module.key, "inputs": inputs,
+                          "mandate_revision": mandate_revision, "project_spec": self.spec.fingerprint,
+                          "input_context": str(context)},
+                baseline_files=[name for name in file_names(self.context) if owned_path(name, module.paths)],
+                ignore_unowned=True)
+        except (ContractError, ConflictError, OSError) as error:
+            self.note("checkpoint-skipped", {"module": module.key, "operation": operation,
+                                             "reason": f"{type(error).__name__}: {error}"})
+            return None
 
     async def execute_module(self, module):
         actor_id = f"{self.project_id}:module:{module.key}"
         actor, principal = await self.open_actor(actor_id)
+        runtime = self.runtime_for(self.store.actor(actor_id))
         inputs = self.store.inputs(self.project_id, module.key)
         context = self.input_context(module,inputs)
-        message = self.operation_message(module, inputs,context)
+        message = self.operation_message(module, inputs, context, getattr(actor, "workspace", None), runtime.provider)
         operation = self.store.dispatch(self.master_principal, actor_id, message)
         admitted = json.loads(self.store.operation(operation)["payload"])
         if admitted["inputs"] != inputs:
             raise ConflictError("Input binding changed before native execution")
         try:
             result = await self.run_native_operation(actor, principal, operation, message, MODULE_OUTPUT)
-            output = json.loads(result["text"])
-            shutdown = await actor.close()
+        except TurnStopped as stop:
             self.live.pop(actor_id, None)
-            if not shutdown["process_exited"]:
-                raise ConflictError("Native service has not actually exited")
-            # Snapshot/publish effects are fenced away from the producer's own
-            # writable namespace. Escaped-process quiescence is not certified.
-            self.store.settle(operation, state="done" if output["status"] == "submitted" else "failed",
-                evidence="native turn completed; owned service exited; isolated workspace cannot write sealed/integration targets")
-            if output["status"] != "submitted":
-                return None
+            checkpoint = self.capture_checkpoint(actor.workspace, module, operation, inputs, context, admitted["module_revision"])
+            self.store.settle_interrupted(operation, reason=stop.reason, checkpoint=checkpoint,
+                evidence=f"{stop}; isolated workspace fenced from later activations",
+                instructions=continuation_instructions(stop.reason),
+                max_continuations=self.policy.max_continuations, consume=stop.reason != "budget")
+            if stop.reason == "budget":
+                raise BudgetError("Observed usage reached the soft token envelope; interrupted owner work was checkpointed")
+            return None
+        except DispatchRejected as rejected:
+            self.live.pop(actor_id, None)
+            await self.safe_close(actor)
+            self.store.release_rejected_dispatch(operation, reason=str(rejected),
+                max_retries=self.policy.max_transient_retries, backoff_seconds=self.policy.transient_backoff_seconds)
+            return None
+        except BaseException:
+            await self.safe_close(actor)
+            self.live.pop(actor_id, None)
+            raise
+        try:
+            output = json.loads(result["text"])
+        except (TypeError, ValueError, KeyError):
+            output = None
+        valid = isinstance(output, dict) and output.get("status") in ("submitted", "blocked")
+        shutdown = await actor.close()
+        self.live.pop(actor_id, None)
+        if not shutdown["process_exited"]:
+            raise ConflictError("Native service has not actually exited")
+        if not valid:
+            checkpoint = self.capture_checkpoint(actor.workspace, module, operation, inputs, context, admitted["module_revision"])
+            self.store.settle_interrupted(operation, reason="receipt_missing", checkpoint=checkpoint,
+                evidence="completed native turn returned no valid structured submission; owned service exited; workspace fenced",
+                instructions=continuation_instructions("receipt_missing"), max_continuations=self.policy.max_continuations)
+            return None
+        # Snapshot/publish effects are fenced away from the producer's own
+        # writable namespace. Escaped-process quiescence is not certified.
+        self.store.settle(operation, state="done" if output["status"] == "submitted" else "failed",
+            evidence="native turn completed; owned service exited; isolated workspace cannot write sealed/integration targets")
+        if output["status"] != "submitted":
+            self.store.annotate_module(self.project_id, module.key, failure_kind="owner_blocked",
+                reason=(output.get("summary") or "") + (" Issues: " + "; ".join(output.get("issues") or []) if output.get("issues") else ""),
+                action="master_or_operator_decision_then_rearm")
+            return None
+        try:
             artifact = capture(actor.workspace, self.snapshots, module.paths,
                 bindings={"operation": operation, "module": module.key, "inputs": inputs,
                           "mandate_revision": admitted["module_revision"], "project_spec": self.spec.fingerprint,
                           "input_context":str(context)},
                 baseline_files=[name for name in file_names(self.context) if owned_path(name,module.paths)],
                 context_inputs=self.workspace_context[actor_id])
-            candidate_id = uuid.uuid4().hex
-            checks = await self.validate_module(module, Path(artifact['path']), context, self.evidence / candidate_id)
-            verify(Path(artifact["path"]), module.paths, expected_hash=artifact["tree_hash"])
-            self.store.submit(principal, candidate_id, tree_hash=artifact["tree_hash"], snapshot=artifact["path"],
-                inputs=inputs, validation=checks, summary=output["summary"], operation_id=operation)
-            commands = list(getattr(actor, 'command_receipts', {}).values())
-            await self.attach_candidate_evidence(candidate_id, commands=commands)
-            for item in self.store.pending_messages(actor_id):
-                if item["kind"] == "correction":
-                    self.store.acknowledge(principal, item["id"])
-            return candidate_id
-        except BaseException:
-            await actor.close()
-            self.live.pop(actor_id, None)
-            raise
+        except (ScopeViolation, OSError) as violation:
+            if isinstance(violation, OSError) and not isinstance(violation, ScopeViolation) \
+                    and violation.errno not in SCOPE_ERRNOS:
+                raise
+            checkpoint = self.capture_checkpoint(actor.workspace, module, operation, inputs, context, admitted["module_revision"])
+            self.store.reject_unsubmittable(operation, checkpoint=checkpoint,
+                max_revision_rounds=self.spec.max_revision_rounds,
+                reason=(f"Your submission could not be sealed: {violation}. Only ordinary files under {list(module.paths)} "
+                        "are deliverable; remove or move other changes (agent configuration, files outside your paths, "
+                        "symlinks) and resubmit. Your owned files were preserved."))
+            return None
+        candidate_id = uuid.uuid4().hex
+        checks = await self.validate_module(module, Path(artifact['path']), context, self.evidence / candidate_id)
+        verify(Path(artifact["path"]), module.paths, expected_hash=artifact["tree_hash"])
+        self.store.submit(principal, candidate_id, tree_hash=artifact["tree_hash"], snapshot=artifact["path"],
+            inputs=inputs, validation=checks, summary=output["summary"], operation_id=operation)
+        commands = list(getattr(actor, 'command_receipts', {}).values())
+        await self.attach_candidate_evidence(candidate_id, commands=commands)
+        for item in self.store.pending_messages(actor_id):
+            if item["kind"] in ("correction", "continuation"):
+                self.store.acknowledge(principal, item["id"])
+        return candidate_id
 
     async def validate_module(self, module, snapshot, context, destination):
-        fixed = await asyncio.to_thread(validate, module.validation, snapshot, context, destination / 'fixed', cli=self.cli)
-        for check in fixed: check['kind'] = 'fixed'
-        owned = []
-        if module.test_validation:
-            owned = await asyncio.to_thread(validate, module.test_validation, snapshot, context, destination / 'owner-tests', cli=self.cli)
-            for check in owned: check['kind'] = 'owner_test'
-            missing = [name for name in module.test_paths if not (snapshot / name).is_file()]
-            if missing:
-                for check in owned:
-                    check['status'] = 'failed'; check['missing_test_files'] = missing
+        try:
+            fixed = await asyncio.to_thread(validate, module.validation, snapshot, context, destination / 'fixed', cli=self.cli)
+            for check in fixed: check['kind'] = 'fixed'
+            owned = []
+            if module.test_validation:
+                owned = await asyncio.to_thread(validate, module.test_validation, snapshot, context, destination / 'owner-tests', cli=self.cli)
+                for check in owned: check['kind'] = 'owner_test'
+        except ContractError as error:
+            raise EnvironmentFailure(f"Validator environment failed; no owner defect is implied: {error}") from error
+        missing = [name for name in module.test_paths if not (snapshot / name).is_file()]
+        if missing:
+            for check in owned:
+                check['status'] = 'failed'; check['missing_test_files'] = missing
         return fixed + owned
+
+    # ---- Evidence --------------------------------------------------------
 
     def candidate_evidence_bindings(self, candidate, manifest):
         operation = self.store.operation(manifest['bindings']['operation'])
@@ -363,25 +701,27 @@ class Controller:
                 'operation_id': operation['id'], 'thread_id': owner['thread_id'], 'turn_id': operation['remote_id']}
 
     async def collect_candidate_commands(self, bindings):
-        # Persisted history is a read-only native API. No owner resume, new
-        # inference, write grant or silently replaced conversation is needed.
-        if self.actor_factory is not NativeActor:
+        # Persisted history is read without owner resume, new inference, write
+        # grants or a silently replaced conversation.
+        if self.synthetic():
             return [], 'synthetic unit actor; native transport not certified'
+        owner = self.store.actor(self.store.operation(bindings['operation_id'])['actor_id'])
+        if self.runtime_for(owner).provider == 'claude':
+            return claude_trace_commands(self.traces / (bindings['operation_id'] + '.stream.jsonl'),
+                                         thread_id=bindings['thread_id'], turn_id=bindings['turn_id'])
         client = JsonRpcClient((self.cli, 'app-server', '--stdio'))
         try:
             await client.start(); await client.initialize()
-            reply = await client.call('thread/read', {'threadId': bindings['thread_id'], 'includeTurns': True})
-            thread = reply['thread']
-            if thread['id'] != bindings['thread_id']:
+            thread, turn, source = await read_turn(client, bindings['thread_id'], bindings['turn_id'])
+            if thread.get('id') != bindings['thread_id']:
                 raise ConflictError('Evidence collection returned another native root')
-            turn = next((row for row in thread.get('turns', []) if row['id'] == bindings['turn_id']), None)
             if not turn or turn.get('status') != 'completed':
-                return [], 'acknowledged completed native turn unavailable in stored history'
+                return [], f'acknowledged completed native turn unavailable in stored history ({source})'
             commands = [command_observation(item, thread_id=thread['id'], turn_id=turn['id'])
                         for item in turn.get('items', []) if item.get('type') == 'commandExecution'
                         and item.get('status') in {'completed', 'failed', 'declined'}]
             return commands, None
-        except (NativeRejected, OSError) as error:
+        except (NativeRejected, UnknownOutcome, OSError) as error:
             return [], f'Native evidence read failed: {type(error).__name__}: {error}'
         finally:
             await client.close()
@@ -408,6 +748,100 @@ class Controller:
                                   evidence_hash=evidence['hash'], validation=checks, recovered=recovered)
         return evidence
 
+    # ---- Master decisions --------------------------------------------------
+
+    async def master_decision(self, actor, principal, message, schema, *, kind, module_key=None):
+        """One Master turn. Returns (decision, operation) or (None, operation) when unavailable."""
+        operation = self.store.dispatch(principal, principal.actor_id, message, kind=kind)
+        try:
+            result = await self.run_native_operation(actor, principal, operation, message, schema)
+        except TurnStopped as stop:
+            self.live.pop(principal.actor_id, None)
+            self.store.settle(operation, state="failed",
+                evidence=f"Master {kind} turn stopped ({stop}); readonly actor has no write effects")
+            if module_key:
+                self.store.note_review_unavailable(self.project_id, module_key, reason=str(stop),
+                    max_retries=self.policy.max_transient_retries, backoff_seconds=self.policy.transient_backoff_seconds)
+            if stop.reason == "budget":
+                raise BudgetError("Observed usage reached the soft token envelope during a Master turn")
+            return None, operation
+        except DispatchRejected as rejected:
+            self.store.release_rejected_dispatch(operation, reason=str(rejected))
+            if module_key:
+                self.store.note_review_unavailable(self.project_id, module_key, reason=str(rejected),
+                    max_retries=self.policy.max_transient_retries, backoff_seconds=self.policy.transient_backoff_seconds)
+            return None, operation
+        try:
+            decision = json.loads(result["text"])
+        except (TypeError, ValueError, KeyError):
+            decision = None
+        if not isinstance(decision, dict) or decision.get("decision") not in ("approve", "request_changes") \
+                or not isinstance(decision.get("rationale"), str):
+            self.store.settle(operation, state="failed", evidence=f"Master {kind} turn completed without a valid structured decision")
+            if module_key:
+                self.store.note_review_unavailable(self.project_id, module_key, reason="no valid structured decision",
+                    max_retries=self.policy.max_transient_retries, backoff_seconds=self.policy.transient_backoff_seconds)
+            return None, operation
+        evidence = {"admission": "Master project admission reviewed in readonly scope; native context has a persisted turn",
+                    "integration-review": "Master whole-project review turn completed in readonly scope"}.get(
+                    kind, "Master native turn completed under readonly source scope")
+        self.store.settle(operation, evidence=evidence)
+        return decision, operation
+
+    def review_structure_problem(self, decision):
+        if not self.policy.structured_review or "blocking_issues" not in decision:
+            return None  # legacy or schema-less output: the Master's decision stands
+        issues = decision.get("blocking_issues") or []
+        if not isinstance(issues, list) or any(not isinstance(issue, dict) for issue in issues):
+            return "blocking_issues must be a list of objects"
+        if decision["decision"] == "approve" and issues:
+            return "an approval listed blocking issues"
+        if decision["decision"] == "request_changes" and decision.get("failure_kind", "implementation") == "implementation" and not issues:
+            return "an implementation change request listed no blocking issue"
+        unknown = [issue.get("obligation", "") for issue in issues
+                   if not str(issue.get("obligation", "")).strip().lower().startswith(OBLIGATION_CATEGORIES)]
+        if unknown:
+            return "blocking issues must cite an admitted obligation, not " + ", ".join(map(repr, unknown[:3]))
+        return None
+
+    def obligation_catalog(self, module):
+        checks = [f"check:{index} {' '.join(step.argv)}" for index, step in enumerate((*module.validation, *module.test_validation))]
+        return ("Admitted obligations you may cite: objective (the project objective); module (this module's objective); "
+                f"{'; '.join(checks)}; owner_tests (admitted owner test files must be meaningful and runnable); "
+                "scope (only admitted paths change); regression (existing behavior is preserved); "
+                "interface (contracts that dependent modules consume); integration (whole-project composition).")
+
+    async def fail_fast_review(self, candidate, module):
+        principal = self.master_principal
+        failing = [(index, check) for index, check in enumerate(candidate["validation"]) if check.get("status") != "passed"]
+        issues = []
+        for index, check in failing:
+            tail = ""
+            if check.get("log") and Path(check["log"]).is_file():
+                tail = "\n".join(Path(check["log"]).read_text(errors="replace").splitlines()[-40:])
+            issues.append({"obligation": f"check:{index}", "evidence": tail or json.dumps(check)[:2000],
+                           "required_change": "Make this admitted check pass against your sealed files."})
+        rationale = ("Host fail-fast: admitted checks failed on the sealed candidate, so no Master turn was spent. "
+                     f"Failing checks: {[index for index, _ in failing]}.")
+        details = {"source": "host_fail_fast", "blocking_issues": issues, "advisories": []}
+        self.store.review(principal, candidate["id"], "request_changes", rationale,
+                          verified_tree_hash=candidate["tree_hash"], failure_kind="implementation", details=details)
+        for item in self.store.pending_messages(principal.actor_id):
+            if json.loads(item["payload"]).get("candidate_id") == candidate["id"]:
+                self.store.acknowledge(principal, item["id"])
+        return {"decision": "request_changes", "rationale": rationale, "failure_kind": "implementation", **details}
+
+    def previous_issues(self, module_key):
+        con = self.store.connect()
+        try:
+            row = con.execute("SELECT r.details FROM review r JOIN candidate c ON c.id=r.candidate_id "
+                              "WHERE c.project_id=? AND c.module_key=? AND r.details IS NOT NULL ORDER BY r.at DESC LIMIT 1",
+                              (self.project_id, module_key)).fetchone()
+        finally:
+            con.close()
+        details = json.loads(row["details"]) if row else {}
+        return details.get("blocking_issues") or []
+
     async def review_candidate(self, candidate_id):
         actor = await self.ensure_master()
         principal = self.master_principal
@@ -420,6 +854,9 @@ class Controller:
         bindings = self.candidate_evidence_bindings(candidate, manifest)
         evidence = verify_review_evidence(Path(candidate['evidence']),
             expected_hash=candidate['evidence_hash'], bindings=bindings)
+        if self.policy.fail_fast_failed_checks and any(x.get("status") != "passed" for x in candidate["validation"]):
+            return await self.fail_fast_review(candidate, module)
+        previous = self.previous_issues(module.key) if self.policy.structured_review else []
         message = (f"Project objective: {self.spec.objective}\nReview module {module.key}: {module.objective}\n"
             f"Readonly actual candidate: {candidate['snapshot']}\nReadonly original project: {self.context}\n"
             f"Readonly dependency view used for this work: {manifest['bindings'].get('input_context')}\n"
@@ -435,27 +872,58 @@ class Controller:
             "it cannot add a test case or change code. Ask the existing owner for code/test changes when required. "
             "Inspect the actual files/interfaces and check requested completeness. "
             "Approve only a correct complete candidate whose actual validation passed. Otherwise request specific changes.")
-        operation = self.store.dispatch(principal, principal.actor_id, message, kind="review")
-        try:
-            result = await self.run_native_operation(actor, principal, operation, message, CANDIDATE_REVIEW_OUTPUT)
-            decision = json.loads(result["text"])
-            self.store.settle(operation, evidence="Master native turn completed under readonly source scope")
-            verify(Path(candidate["snapshot"]), module.paths, expected_hash=candidate["tree_hash"])
-            verify_review_evidence(Path(candidate['evidence']), expected_hash=candidate['evidence_hash'], bindings=bindings)
-            if any(x["status"] != "passed" for x in candidate["validation"]):
-                decision["decision"] = "request_changes"
-                decision['failure_kind'] = 'implementation'
-                decision["rationale"] += "\nActual validation failed; repair the recorded failure before resubmission."
-            self.store.review(principal, candidate_id, decision["decision"], decision["rationale"],
-                              verified_tree_hash=candidate["tree_hash"],
-                              failure_kind=decision.get('failure_kind', 'implementation'))
-            for item in self.store.pending_messages(principal.actor_id):
-                if json.loads(item["payload"]).get("candidate_id") == candidate_id:
-                    self.store.acknowledge(principal, item["id"])
-            return decision
-        except BaseException:
-            self.store.mark_unknown(operation, "Master review operation needs reconciliation")
-            raise
+        schema = CANDIDATE_REVIEW_OUTPUT
+        if self.policy.structured_review:
+            schema = STRUCTURED_REVIEW_OUTPUT
+            message += ("\n" + self.obligation_catalog(module) + " List each blocking defect with the obligation it "
+                        "violates, concrete evidence (file and line, or check log) and the required change. Improvements "
+                        "that no admitted obligation requires go in advisories; they never block acceptance or consume a revision.")
+            if previous:
+                message += (" Your previous blocking issues for this module were: " + json.dumps(previous)
+                            + ". Report each as resolved or unresolved in previous_issues. Raise new blocking issues only "
+                            "for defects against admitted obligations that you can evidence in this candidate.")
+        decision, operation = await self.master_decision(actor, principal, message, schema, kind="review", module_key=module.key)
+        if decision is None:
+            return None
+        problem = self.review_structure_problem(decision)
+        if problem:
+            self.note("master-review-restructure-requested", {"candidate": candidate_id, "problem": problem, "operation": operation})
+            retry, _ = await self.master_decision(actor, principal,
+                (f"Your review decision for module {module.key} candidate {candidate_id} is not actionable: {problem}. "
+                 "Re-evaluate the same sealed candidate and answer again with the same schema. A request for implementation "
+                 "changes lists each blocking issue with the admitted obligation it violates, concrete evidence and the required "
+                 "change; improvements no obligation requires are advisories; an approval lists no blocking issues."),
+                schema, kind="review", module_key=module.key)
+            if retry is None:
+                return None
+            decision = retry
+            problem = self.review_structure_problem(decision)
+        verify(Path(candidate["snapshot"]), module.paths, expected_hash=candidate["tree_hash"])
+        verify_review_evidence(Path(candidate['evidence']), expected_hash=candidate['evidence_hash'], bindings=bindings)
+        if any(x["status"] != "passed" for x in candidate["validation"]):
+            decision["decision"] = "request_changes"
+            decision['failure_kind'] = 'implementation'
+            decision["rationale"] += "\nActual validation failed; repair the recorded failure before resubmission."
+        details = None
+        if "blocking_issues" in decision:
+            details = {"source": "master", "blocking_issues": decision.get("blocking_issues") or [],
+                       "advisories": decision.get("advisories") or [],
+                       "previous_issues": decision.get("previous_issues") or []}
+            if problem:
+                details["structure_problem"] = problem
+        self.store.review(principal, candidate_id, decision["decision"], decision["rationale"],
+                          verified_tree_hash=candidate["tree_hash"],
+                          failure_kind=decision.get('failure_kind', 'implementation'), details=details)
+        self.store.clear_review_retry(self.project_id, module.key)
+        for item in self.store.pending_messages(principal.actor_id):
+            if json.loads(item["payload"]).get("candidate_id") == candidate_id:
+                self.store.acknowledge(principal, item["id"])
+        return decision
+
+    async def recover_evidence_and_review(self, key):
+        row = self.module_row(key)
+        await self.attach_candidate_evidence(row['current_candidate'], recovered=True)
+        return await self.review_candidate(row['current_candidate'])
 
     async def review_integration(self, directory, checks, module_keys):
         actor = await self.ensure_master()
@@ -468,16 +936,21 @@ class Controller:
                    "uncertain_execution for unresolved execution, and none for approval. "
                    "Inspect actual interfaces and completeness. Approve only correct whole-project work. "
                    "Otherwise identify responsible module keys and specific changes, without asking the user to relay them.")
-        schema = {"type":"object","properties": {
+        properties = {
             "decision":{"type":"string","enum":["approve","request_changes"]},
             "rationale":{"type":"string"},
             'failure_kind': {'type':'string','enum':['none','implementation','evidence','uncertain_execution']},
-            "affected_modules":{"type":"array","items":{"type":"string","enum":module_keys}}},
-            "required":["decision","rationale","affected_modules",'failure_kind'],"additionalProperties":False}
-        operation = self.store.dispatch(principal, principal.actor_id, message, kind="integration-review")
-        result = await self.run_native_operation(actor, principal, operation, message, schema)
-        self.store.settle(operation, evidence="Master whole-project review turn completed in readonly scope")
-        return json.loads(result["text"])
+            "affected_modules":{"type":"array","items":{"type":"string","enum":module_keys}}}
+        required = ["decision","rationale","affected_modules",'failure_kind']
+        if self.policy.structured_review:
+            properties.update(blocking_issues={"type": "array", "items": BLOCKING_ISSUE},
+                              advisories={"type": "array", "items": {"type": "string"}})
+            required += ["blocking_issues", "advisories"]
+            message += (" List each blocking defect with the obligation it violates (objective, module, interface, check, "
+                        "regression, integration), evidence and the required change; non-blocking improvements are advisories.")
+        schema = {"type":"object","properties": properties, "required": required, "additionalProperties": False}
+        decision, _ = await self.master_decision(actor, principal, message, schema, kind="integration-review")
+        return decision
 
     async def integrate(self):
         modules = self.store.modules(self.project_id)
@@ -492,13 +965,16 @@ class Controller:
             artifact = verify(Path(candidate["snapshot"]), module.paths, expected_hash=candidate["tree_hash"])
             overlay_candidate(directory,Path(candidate["snapshot"]),artifact)
             manifest[row["key"]] = {"candidate": row["accepted_candidate"], "revision": row["revision"]}
-        checks = await asyncio.to_thread(validate, self.spec.integration_validation, directory,
-                                         self.context, self.evidence / directory.name, cli=self.cli)
+        try:
+            checks = await asyncio.to_thread(validate, self.spec.integration_validation, directory,
+                                             self.context, self.evidence / directory.name, cli=self.cli)
+        except ContractError as error:
+            raise EnvironmentFailure(f"Integration validator environment failed: {error}") from error
         decision = await self.review_integration(directory, checks, list(manifest))
         # A missing receipt is repaired on the same composed tree; it does not
         # invalidate owners or consume a code-revision allowance. All evidence
         # retries stay journaled and bounded, with incurred usage retained.
-        while decision['decision'] != 'approve' and decision.get('failure_kind') == 'evidence' and all(check['status'] == 'passed' for check in checks):
+        while decision is not None and decision['decision'] != 'approve' and decision.get('failure_kind') == 'evidence' and all(check['status'] == 'passed' for check in checks):
             with self.store.transaction() as con:
                 count = con.execute("SELECT count(*) FROM event WHERE project_id=? AND kind='integration-evidence-requested'", (self.project_id,)).fetchone()[0]
                 self.store.event(con, self.project_id, 'integration-evidence-requested', {'rationale':decision['rationale'], 'attempt':count + 1})
@@ -512,11 +988,18 @@ class Controller:
             checks = await asyncio.to_thread(validate, self.spec.integration_validation, directory,
                 self.context, self.evidence / (directory.name + '-evidence-' + str(count + 1)), cli=self.cli)
             decision = await self.review_integration(directory, checks, list(manifest))
+        if decision is None:
+            with self.store.transaction() as con:
+                count = con.execute("SELECT count(*) FROM event WHERE project_id=? AND kind='integration-review-unavailable'", (self.project_id,)).fetchone()[0] + 1
+                self.store.event(con, self.project_id, 'integration-review-unavailable', {'attempt': count, 'path': str(directory)})
+            state = 'integration_failed' if count > self.policy.max_transient_retries else 'integration_review_unavailable'
+            return {"path": str(directory), "modules": manifest, "validation": checks, "master_review": None,
+                    "state": state, "original_project_mutated": False}
         approved = decision["decision"] == "approve" and all(x["status"] == "passed" for x in checks)
         recorded_checks = checks if approved else checks + [{"status":"needs_revision", "master_review":decision}]
         self.store.record_integration(self.master_principal, str(directory), manifest, recorded_checks)
         if not approved:
-            with self.store.connect() as con:
+            with closing(self.store.connect()) as con:
                 failures = con.execute("SELECT count(*) FROM event WHERE project_id=? AND kind='integration-failed'", (self.project_id,)).fetchone()[0]
             affected = decision.get("affected_modules", [])
             if (decision.get('failure_kind', 'implementation') == 'implementation'
@@ -531,6 +1014,73 @@ class Controller:
         return {"path": str(directory), "modules": manifest, "validation": checks,
                 "master_review":decision, "state":state, "original_project_mutated": False}
 
+    # ---- Event-driven scheduling ----------------------------------------------
+
+    def ready_modules(self, states, accepted):
+        order = {module.key: index for index, module in enumerate(self.spec.modules)}
+        ready = [module for module in self.spec.modules
+                 if states[module.key]["state"] in DISPATCHABLE_MODULE_STATES and set(module.dependencies) <= accepted]
+        return sorted(ready, key=lambda module: (-self.critical_weight[module.key], order[module.key]))
+
+    def next_master_job(self, states, running_owners, now):
+        order = {module.key: index for index, module in enumerate(self.spec.modules)}
+        def due(row):
+            return not row.get("retry_after") or row["retry_after"] <= now
+        evidence = [key for key, row in states.items()
+                    if row["state"] == "awaiting_evidence" and due(row) and key not in self.failed_keys]
+        if evidence:
+            key = min(evidence, key=order.get)
+            return "evidence", key, self.recover_evidence_and_review(key)
+        reviews = [key for key, row in states.items()
+                   if row["state"] == "awaiting_review" and due(row) and key not in self.failed_keys]
+        if reviews:
+            key = min(reviews, key=lambda k: (self.store.candidate(states[k]["current_candidate"]).get("at") or 0, order[k]))
+            return "review", key, self.review_candidate(states[key]["current_candidate"])
+        if states and all(row["state"] == "accepted" for row in states.values()) and not running_owners \
+                and "integration" not in self.failed_keys \
+                and (not self.integration_retry_after or self.integration_retry_after <= now):
+            return "integration", None, self.integrate()
+        return None
+
+    def schedule(self, tasks):
+        status = self.store.status(self.project_id)
+        states = {row["key"]: row for row in status["modules"]}
+        lanes = [lane for lane, _ in tasks.values()]
+        running_owners = {key for lane, key in tasks.values() if lane == "owner"}
+        active_actors = {op["actor_id"] for op in status["operations"] if op["status"] in ACTIVE_STATUSES}
+        now = time.time()
+        master = f"{self.project_id}:master"
+        if not set(lanes) & {"review", "evidence", "integration"} and master not in active_actors:
+            job = self.next_master_job(states, running_owners, now)
+            if job:
+                lane, key, coroutine = job
+                tasks[asyncio.create_task(coroutine)] = (lane, key)
+        accepted = {key for key, row in states.items() if row["state"] == "accepted"}
+        running_actor_ids = {states[key]["owner"] for key in running_owners}
+        foreign_live = {row["owner"] for row in states.values() if row["owner"] in active_actors} - running_actor_ids
+        slots = self.spec.max_parallel - len(running_owners) - len(foreign_live)
+        for module in self.ready_modules(states, accepted):
+            if slots <= 0:
+                break
+            row = states[module.key]
+            if module.key in running_owners or module.key in self.failed_keys or row["owner"] in active_actors:
+                continue
+            if row.get("retry_after") and row["retry_after"] > now:
+                continue
+            tasks[asyncio.create_task(self.execute_module(module))] = ("owner", module.key)
+            slots -= 1
+        if "timer" not in [lane for lane, _ in tasks.values()]:
+            waits = [row["retry_after"] for row in states.values() if row.get("retry_after") and row["retry_after"] > now
+                     and row["state"] in (*DISPATCHABLE_MODULE_STATES, "awaiting_review", "awaiting_evidence")]
+            if self.integration_retry_after and self.integration_retry_after > now:
+                waits.append(self.integration_retry_after)
+            if waits:
+                tasks[asyncio.create_task(asyncio.sleep(min(min(waits) - now, 3600)))] = ("timer", None)
+
+    def record_job_failure(self, lane, key, error):
+        self.failed_keys.add(key if key is not None else lane)
+        self.note("scheduler-job-failed", {"lane": lane, "module": key, "error": f"{type(error).__name__}: {error}"})
+
     async def run(self):
         with project_lease(self.state_root/'controller.lock'):
             return await self._run_owned()
@@ -539,51 +1089,71 @@ class Controller:
         self.prepare()
         existing=self.store.project(self.project_id)
         if existing['state']=='accepted':
-            with self.store.connect() as con:
+            with closing(self.store.connect()) as con:
                 row=con.execute("SELECT payload FROM event WHERE project_id=? AND kind='integration-accepted' ORDER BY seq DESC LIMIT 1",(self.project_id,)).fetchone()
             if not row:raise ConflictError('Accepted project has no integration artifact')
             return {'state':'accepted',**json.loads(row['payload']),'original_project_mutated':False,'resumed_completed_project':True}
         if existing['state']!='active':
             return {'state':existing['state'],'status':self.store.status(self.project_id)}
+        tasks = {}
+        stop = None
+        fatal = None
+        result = None
         try:
-            await self.ensure_master()
+            try:
+                await self.ensure_master()
+            except ProjectCancelled:
+                stop = "cancelling"
+            except BudgetError:
+                stop = "budget"
             while True:
-                states = self.store.modules(self.project_id)
-                evidence_pending = [row for row in states if row['state'] == 'awaiting_evidence']
-                if evidence_pending:
-                    for row in evidence_pending:
-                        await self.attach_candidate_evidence(row['current_candidate'], recovered=True)
-                        await self.review_candidate(row['current_candidate'])
-                    continue
-                if all(m["state"] == "accepted" for m in states):
-                    integrated = await self.integrate()
-                    if integrated["state"] == "revision_requested":
-                        continue
-                    return integrated
-                if any(m["state"] in {"blocked", "working", "awaiting_review"} for m in states):
-                    # Existing work cannot be blindly respawned on a restart.
-                    # Pending review messages are recoverable without rerunning
-                    # their producers; uncertain execution stays explicit.
-                    pending = [m for m in states if m["state"] == "awaiting_review"]
-                    if pending:
-                        for module in pending:
-                            await self.review_candidate(module["current_candidate"])
-                        continue
-                    return {"state": "blocked_or_reconciliation_required", "status": self.store.status(self.project_id)}
-                accepted = {m["key"] for m in states if m["state"] == "accepted"}
-                ready = [m for m in self.spec.modules if next(x for x in states if x["key"] == m.key)["state"] in {"ready","revision_requested"} and set(m.dependencies) <= accepted]
-                if not ready:
-                    raise ConflictError("No legitimate module work is ready")
-                batch = ready[:self.spec.max_parallel]
-                results = await asyncio.gather(*(self.execute_module(m) for m in batch), return_exceptions=True)
-                for result in results:
-                    if isinstance(result, BaseException):
-                        if isinstance(result,ProjectCancelled):
-                            return {'state':'cancelling','status':self.store.status(self.project_id)}
-                        raise result
-                    if result:
-                        await self.review_candidate(result)
+                if stop is None and self.store.project(self.project_id)["state"] != "active":
+                    stop = "cancelling"
+                if stop is None and result is None:
+                    self.schedule(tasks)
+                pending = [task for task, (lane, _) in tasks.items() if lane != "timer"]
+                if not pending and (stop is not None or result is not None or not tasks):
+                    for task in list(tasks):
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks.clear()
+                    break
+                done, _ = await asyncio.wait(list(tasks), return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    lane, key = tasks.pop(task)
+                    try:
+                        value = task.result()
+                    except ProjectCancelled:
+                        stop = stop or "cancelling"
+                    except BudgetError:
+                        stop = stop or "budget"
+                    except (EnvironmentFailure, ModelUnavailable, AuthorityError) as error:
+                        stop = stop or "fatal"
+                        fatal = fatal or error
+                    except Exception as error:
+                        self.record_job_failure(lane, key, error)
+                    else:
+                        if lane == "integration":
+                            if value["state"] in ("accepted", "integration_failed"):
+                                result = value
+                            elif value["state"] == "integration_review_unavailable":
+                                self.integration_retry_after = time.time() + self.policy.transient_backoff_seconds
         finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.gather(*(actor.close() for actor, _ in self.live.values()), return_exceptions=True)
             self.live.clear()
             self.store.finalize_cancellation(self.project_id)
+        if fatal is not None:
+            raise fatal
+        if result is not None:
+            return result
+        status = self.store.status(self.project_id)
+        if stop == "cancelling" or status["state"] in ("cancelling", "cancelled"):
+            return {'state': status["state"] if status["state"] in ("cancelling", "cancelled") else "cancelling", 'status': status}
+        if stop == "budget":
+            return {"state": "budget_exhausted", "status": status,
+                    "remedy": "Raise the envelope with the budget command (incurred usage is never refunded), then run again; "
+                              "interrupted owners continue from their checkpoints."}
+        return {"state": "blocked_or_reconciliation_required", "status": status}

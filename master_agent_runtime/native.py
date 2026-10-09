@@ -200,8 +200,75 @@ def permission_config(workspace: Path, context: Path, control: Path, *, readonly
     return name, config
 
 
+USAGE_FIELDS = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens",
+                "cacheWriteInputTokens", "totalTokens")
+
+
+def usage_detail(breakdown):
+    """Normalized cumulative token detail from a TokenUsageBreakdown object."""
+    if not isinstance(breakdown, dict):
+        return None
+    detail = {name: breakdown.get(name) for name in USAGE_FIELDS}
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in detail.values()
+               if value is not None):
+        return None
+    return {name: value for name, value in detail.items() if value is not None}
+
+
+async def read_turn(client, thread_id, turn_id, *, page_limit=200, max_pages=50):
+    """Read one persisted turn without resuming its thread or starting inference.
+
+    Prefers thread/read with full turns. When that history is unavailable or
+    returns only summaries, falls back to the paginated thread/turns/list and
+    thread/items/list APIs (experimental in current App Server releases).
+    Returns (thread, turn_or_None, source).
+    """
+    thread = {"id": thread_id, "sessionId": thread_id}
+    turn = None
+    source = "thread/read"
+    try:
+        reply = await client.call("thread/read", {"threadId": thread_id, "includeTurns": True})
+        thread = reply["thread"]
+        turn = next((row for row in thread.get("turns") or [] if row.get("id") == turn_id), None)
+        if turn is not None and turn.get("itemsView") in (None, "full"):
+            return thread, turn, source
+    except NativeRejected:
+        source = "thread/read unavailable"
+    try:
+        if turn is None:
+            cursor = None
+            for _ in range(max_pages):
+                params = {"threadId": thread_id, "itemsView": "notLoaded", "limit": page_limit}
+                if cursor:
+                    params["cursor"] = cursor
+                page = await client.call("thread/turns/list", params)
+                turn = next((row for row in page.get("data") or [] if row.get("id") == turn_id), None)
+                cursor = page.get("nextCursor")
+                if turn is not None or not cursor:
+                    break
+            if turn is None:
+                return thread, None, source + "; thread/turns/list"
+        items, cursor = [], None
+        for _ in range(max_pages):
+            params = {"threadId": thread_id, "turnId": turn_id, "limit": page_limit}
+            if cursor:
+                params["cursor"] = cursor
+            page = await client.call("thread/items/list", params)
+            items.extend(entry["item"] for entry in page.get("data") or []
+                         if isinstance(entry, dict) and isinstance(entry.get("item"), dict)
+                         and entry.get("turnId", turn_id) == turn_id)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        return thread, dict(turn, items=items, itemsView="full"), source + "; thread/items/list"
+    except NativeRejected:
+        return thread, turn, source + "; paginated history unavailable"
+
+
 class NativeActor:
     """One independently launched/resumable root session per registered actor."""
+    provider = "codex"
+
     def __init__(self, actor_id, workspace: Path, context: Path, control: Path, *, kind,
                  cli="codex", model=None, effort=None, timeout=180,write_paths=None,runtime_executables=()):
         self.actor_id = actor_id
@@ -220,13 +287,18 @@ class NativeActor:
         self.command_receipts = {}
         self.command_output = {}
         self.command_output_truncated = set()
+        self.initialize_info = {}
+        self.compactions = 0
         self.profile, self.config = permission_config(self.workspace, self.context, self.control,
                                                       readonly=kind == "master", cli=cli,write_paths=write_paths,runtime_executables=runtime_executables)
 
     async def open(self, *, existing_thread=None, instructions=""):
         self.workspace.mkdir(parents=True, exist_ok=True)
         await self.client.start()
-        await self.client.initialize()
+        initialized = await self.client.initialize()
+        if isinstance(initialized, dict):
+            self.initialize_info = {key: initialized.get(key) for key in ("userAgent", "platformOs", "platformFamily")
+                                    if isinstance(initialized.get(key), str)}
         config = (await self.client.call('config/read',{'includeLayers':False})).get('config',{})
         selected = self.model or config.get('model')
         provider = config.get('model_provider') or 'openai'
@@ -266,7 +338,8 @@ class NativeActor:
             raise AuthorityError("Native runtime substituted the explicitly admitted model")
         self.thread_id = thread["id"]
         self.session_id = thread["sessionId"]
-        self.effective = {"model": result.get("model"), "model_provider": result.get("modelProvider"),
+        self.effective = {"provider": "codex", "initialize": dict(self.initialize_info),
+                          "model": result.get("model"), "model_provider": result.get("modelProvider"),
                           "reasoning_effort": result.get("reasoningEffort"),
                           "explicit_turn_effort": self.effort,
                           "approval_policy": result.get("approvalPolicy"),
@@ -333,13 +406,16 @@ class NativeActor:
             if method == "turn/started" and params.get("turn", {}).get("id") == turn_id:
                 active = True
             if method == "thread/tokenUsage/updated" and on_usage and active:
-                total = params.get("tokenUsage", {}).get("total", {}).get("totalTokens")
+                breakdown = params.get("tokenUsage", {}).get("total", {})
+                total = breakdown.get("totalTokens")
                 if isinstance(total, int):
-                    on_usage(total)
+                    on_usage(total, usage_detail(breakdown))
             if method == "item/completed" and params.get("turnId") == turn_id:
                 item = params.get("item", {})
                 if item.get("type") == "agentMessage":
                     final.append(item.get("text", ""))
+                elif item.get("type") == "contextCompaction":
+                    self.compactions += 1
             if method == "turn/completed" and params.get("turn", {}).get("id") == turn_id:
                 turn = params["turn"]
                 if turn.get("status") != "completed":

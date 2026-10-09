@@ -33,3 +33,27 @@ async def select_cli(*,model=None,candidates=None):
         finally:
             await client.close()
     raise ModelUnavailable('No existing native CLI supports the configured project. '+ '; '.join(failures))
+
+
+async def select_claude_cli(*,candidates=None):
+    """Choose an existing Claude Code CLI new enough for restricted unattended turns."""
+    import asyncio
+    from .claude_native import MINIMUM_VERSION, parse_version
+    paths = candidates if candidates is not None else (
+        shutil.which('claude'), str(Path.home()/'.local'/'bin'/'claude'))
+    failures=[];seen=set()
+    for path in paths:
+        if not path or not Path(path).is_file() or str(Path(path).resolve()) in seen:
+            continue
+        seen.add(str(Path(path).resolve()))
+        try:
+            process=await asyncio.create_subprocess_exec(path,'--version',stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+            out,_=await asyncio.wait_for(process.communicate(),20)
+        except (OSError,asyncio.TimeoutError) as error:
+            failures.append(f'{path}: {type(error).__name__}: {error}');continue
+        version=parse_version(out.decode(errors='replace'))
+        if version is None or version<MINIMUM_VERSION:
+            failures.append(f"{path}: version {out.decode(errors='replace').strip()!r} is older than {'.'.join(map(str,MINIMUM_VERSION))}")
+            continue
+        return str(path)
+    raise ModelUnavailable('No existing Claude Code CLI supports restricted unattended turns. '+'; '.join(failures))

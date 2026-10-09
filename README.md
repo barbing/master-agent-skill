@@ -60,6 +60,60 @@ python3.12 -B -m unittest discover -s tests -p 'test_runtime_publication_recover
 python3.12 -B -m unittest discover -s tests -p 'owned_*_test.py' -v
 ```
 
+### Runtime policy, continuation and Claude Code owners
+
+These changes target the stalls seen in the pilots: held operations with no exit, a batch scheduler that idled the Master, unactionable rejections and missing cost detail. They are verified offline with synthetic actors and recorded fixtures; no live model run has exercised them yet.
+
+A handoff may carry an optional `runtime_policy` object. `init` validates it strictly and stores it beside the contract, so it never changes the contract fingerprint. The `policy` operator command revises it later.
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `owner_turn_timeout_seconds`, `master_turn_timeout_seconds` | contract timeout | Per-kind turn deadline, enforced by the controller |
+| `interrupt_grace_seconds` | 60 | Wait after an interrupt before the owned process is closed |
+| `max_continuations` | 2 | Continuations of a stopped owner turn before the module blocks |
+| `max_transient_retries`, `transient_backoff_seconds` | 3, 30 | Bounded retry with exponential backoff for refused dispatches, unavailable reviews and admission turns |
+| `admission_review` | true | When false, the host records a policy approval instead of a Master admission turn |
+| `structured_review` | true | Rejections cite an admitted obligation with evidence; advisories never block or consume a revision |
+| `fail_fast_failed_checks` | false | When true, failed admitted checks return to the owner without a Master turn |
+| `provider`, `master`, `modules` | `codex` | Provider (`codex` or `claude`), model and effort per actor |
+| `prices` | none | USD per million tokens per model (`input`, `cached_input`, `output`, optional `cache_write`) for estimates |
+
+**Stopped turns continue.** A deadline, budget stop, native failure, lost transport or missing receipt interrupts the turn and waits for the owned process to exit. The host then checkpoints the owner's files and sends a continuation to the same owner and context. The module blocks only after `max_continuations`, and a budget stop does not consume one. Without an observed exit the operation stays held for `reconcile`.
+
+**Scheduling is event-driven.** One Master lane takes evidence recovery first, then reviews in submission order, then integration. Owners fill `max_parallel` slots by how many modules depend on them, directly or indirectly. A blocked or failed module stops only its dependents.
+
+**Admission is never implied.** A refused, stopped or malformed admission turn is retried within the bound, and no module work starts before an approval. `reconcile` records the verdict of an admission turn that already completed instead of asking again. A store without a verdict event counts as admitted only when the Master has already reviewed work.
+
+**Operator commands** are journaled with a required reason and refused while a controller holds the project:
+
+```bash
+python3.12 -m master_agent_runtime --state /absolute/runtime-state resolve PROJECT_ID --operation OPERATION --outcome failed --rearm --authorization 'reason'
+python3.12 -m master_agent_runtime --state /absolute/runtime-state rearm PROJECT_ID --module KEY --rounds 1 --authorization 'reason'
+python3.12 -m master_agent_runtime --state /absolute/runtime-state admission PROJECT_ID --decision rerun --authorization 'reason'
+python3.12 -m master_agent_runtime --state /absolute/runtime-state budget PROJECT_ID --tokens 8000000 --authorization 'reason'
+python3.12 -m master_agent_runtime --state /absolute/runtime-state policy PROJECT_ID --set '{"max_continuations": 3}' --authorization 'reason'
+```
+
+`resolve` closes an operation nobody can confirm without inferring a submission. `rearm` gives a blocked module more attempts with the same owner and context. Incurred usage is never refunded. `health` names the resolve, rearm or admission command when one applies.
+
+**Accounting** keeps the provider's token breakdown: input, cached input, cache writes, output and reasoning. It adds a cost estimate from the provider or the `prices` table and counts unpriced tokens separately. Each actor records its CLI version and effective configuration, and each turn trace records context compactions. History reads fall back to `thread/turns/list` and `thread/items/list` when `thread/read` lacks full turns.
+
+**Claude Code owners** use `"provider": "claude"`, and `run` and `reconcile` accept `--claude` for an exact executable (Claude Code 2.1.263 or later). Each turn is one non-interactive `claude -p` process on a host-chosen session id that later turns resume. The flags give it an explicit tool list with no subagents, web or MCP, and prompts are denied instead of asked. Edits are allowed only on the admitted paths and private `.tmp`. Bash is allowed explicitly and always runs in the OS sandbox with network off. Its writes reach only the admitted paths and `.tmp`, and the kernel denies reads of the home folder, credential folders and control state. Only the workspace, the Master's public view, admitted interpreters and the CLI's own snapshot folders are re-opened. Unlike the Codex profile, world-readable files in the shared temp roots stay readable, because the CLI keeps its sandboxed temp directory there. Keep runtime state under the home folder so other projects' actors cannot read it. The process starts from a minimal environment, so a launching agent session's identity, messaging channel, proxies and API routing never reach it. `MASTER_AGENT_CLAUDE_ENV` names extra variables to forward, such as API-key authentication; session variables stay blocked. Claude Code reports permission mode `default` while its subprocess credential scrub is on, and the init check accepts exactly that mode, plugins built into the CLI and nothing else. The host writes the stream to `native-traces/` and uses it for command evidence, recovery and the per-run usage the result message reports.
+
+The standalone CLI must be logged in; check with `claude auth status`. File tools are enforced by Claude Code's permission rules, not by the OS sandbox, and validators still run through the Codex CLI. On 2026-10-09, with Claude Code 2.1.295 and Haiku 5.5, a live boundary probe confirmed the denials. Smoke projects and the historical atomic-publication task were then accepted end to end through this adapter.
+
+Offline verification on macOS with Python 3.12 and 3.14 passes 176 runtime cases and 20 owner-suite cases. Live Codex checks on 2026-10-09 with CLI 0.162.0-alpha.17.2 and `gpt-6-luna` covered both a smoke project and a kill test. The smoke project was accepted after one journaled rearm; the first attempt exposed that exact write grants could not create a missing parent directory, so the host now creates parents of admitted paths. In the kill test, the owner's app-server was killed mid-turn; the runtime checkpointed the owner's files, resumed the same thread and was accepted 37 seconds later without operator action. On 2026-10-09 the historical Store/CLI and atomic-publication tasks were replayed from their frozen inputs with Haiku 5.5 fulfilling every turn through a validation relay. Both were accepted without a rejection, revision or continuation. The two `test_runtime_sandbox.py` cases create a directory under `/private/tmp`, so they pass only where that is writable. New checks:
+
+```bash
+python3.12 -B -m unittest discover -s tests -p 'test_runtime_scheduler.py' -v
+python3.12 -B -m unittest discover -s tests -p 'test_runtime_continuation.py' -v
+python3.12 -B -m unittest discover -s tests -p 'test_runtime_operator.py' -v
+python3.12 -B -m unittest discover -s tests -p 'test_runtime_review_calibration.py' -v
+python3.12 -B -m unittest discover -s tests -p 'test_runtime_accounting.py' -v
+python3.12 -B -m unittest discover -s tests -p 'test_runtime_admission_retry.py' -v
+python3.12 -B -m unittest discover -s tests -p 'test_claude_adapter.py' -v
+```
+
 ## What This Provides
 
 - A main `master-agent-system` Codex skill.

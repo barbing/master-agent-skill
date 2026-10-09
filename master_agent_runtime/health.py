@@ -37,9 +37,13 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
     pending_reviews = sorted(module["key"] for module in modules
                              if module["state"] in {"awaiting_review", 'awaiting_evidence'})
     project_state = status["state"]
+    admission = status.get("admission")
+    failed_admissions = sum(1 for operation in status["operations"]
+                            if operation["kind"] == "admission" and operation["status"] == "failed")
     reconciliation_required = bool(uncertain_operations or unowned_work)
     safe_to_run = (project_state == "active" and not active_operations
-                   and not blocked_modules and not reconciliation_required)
+                   and not blocked_modules and not reconciliation_required
+                   and admission != "rejected")
 
     if reconciliation_required:
         reasons = []
@@ -51,7 +55,10 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
                            + ", ".join(unowned_work))
         next_action = ("Reconcile " + "; ".join(reasons)
                        + ". Confirm native outcomes and ownership before resuming; "
-                       "retain reservations until settlement has actual evidence.")
+                       "retain reservations until settlement has actual evidence. "
+                       "If reconcile holds an operation that nobody can confirm, an operator may close it "
+                       "without inferring a submission: resolve " + status["project_id"]
+                       + " --operation OPERATION --outcome failed --authorization 'reason'.")
         if project_state != "active":
             next_action += f" Project is {project_state}; execution is not admitted."
     elif project_state != "active":
@@ -62,16 +69,27 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
     elif active_operations:
         next_action = ("Observe running native operations before resuming Master scheduling: "
                        + ", ".join(operation["id"] for operation in active_operations) + ".")
+    elif admission == "rejected":
+        next_action = ("The Master's project admission requested changes, so no module work is admitted. "
+                       "Correct the contract and admit a new project, or record a human decision: admission "
+                       + status["project_id"] + " --decision rerun|override --authorization 'reason'.")
     elif blocked_modules:
         next_action = ("Master must resolve blocked modules before resuming: "
                        + ", ".join(blocked_modules) + ".")
         limits = status.get('recovery_limits', {})
         for module in modules:
             if module['key'] not in blocked_modules or not module.get('failure_reason'): continue
+            extra = module.get('operator_rounds') or 0
+            implementation_limit = limits.get('implementation', 'unknown')
+            evidence_limit = limits.get('evidence', 'unknown')
+            if extra and isinstance(implementation_limit, int):
+                implementation_limit, evidence_limit = implementation_limit + extra, evidence_limit + extra
             next_action += (f" {module['key']} owner={module['owner']}: {module.get('failure_kind')}; "
                             f"{module['failure_reason']} Action={module.get('recovery_action')}. "
-                            f"Implementation requests={module['rounds']}/{limits.get('implementation', 'unknown')}; "
-                            f"evidence requests={module.get('evidence_rounds', 0)}/{limits.get('evidence', 'unknown')}.")
+                            f"Implementation requests={module['rounds']}/{implementation_limit}; "
+                            f"evidence requests={module.get('evidence_rounds', 0)}/{evidence_limit}.")
+        next_action += (" Independent modules keep running; to give a blocked module more attempts with the same owner "
+                        "and context: rearm " + status["project_id"] + " --module KEY --authorization 'reason'.")
     elif pending_reviews:
         next_action = ("Resume Master review of submitted candidates for modules: "
                        + ", ".join(pending_reviews) + ".")
@@ -84,6 +102,15 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
     else:
         next_action = ("Resume Master scheduling of ready modules and requested revisions "
                        "within the admitted resource envelope.")
+        continuing = [module['key'] for module in modules if module['state'] == 'continuing']
+        if continuing:
+            next_action += (" Owners continue interrupted work from preserved checkpoints: "
+                            + ", ".join(sorted(continuing)) + ".")
+        if admission == "pending":
+            next_action += " The next run first asks the Master for project admission; no module work starts before approval."
+            if failed_admissions:
+                next_action += (f" {failed_admissions} earlier admission turn(s) returned no decision; "
+                                "inspect the native runtime if this repeats.")
 
     return {
         "project_id": status["project_id"],

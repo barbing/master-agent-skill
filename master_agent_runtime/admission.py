@@ -5,9 +5,11 @@ from dataclasses import MISSING, fields
 import json
 from pathlib import Path
 
-from .contracts import ContractError, ModuleSpec, ProjectSpec, ValidationStep
+from .contracts import ContractError, ModuleSpec, ProjectSpec, RuntimePolicy, ValidationStep
 
-__all__ = ["load_handoff", "describe_handoff"]
+__all__ = ["load_handoff", "load_handoff_with_policy", "describe_handoff"]
+
+POLICY_KEY = "runtime_policy"
 
 
 def _check_fields(data: object, contract: type, location: str) -> None:
@@ -31,9 +33,18 @@ def _reject_constant(value: str) -> None:
 
 def load_handoff(path: str | Path) -> ProjectSpec:
     """Load the existing contract, retaining actionable handoff failure details."""
+    return load_handoff_with_policy(path)[0]
+
+
+def load_handoff_with_policy(path: str | Path) -> tuple[ProjectSpec, RuntimePolicy]:
+    """Load the contract and its optional runtime_policy (kept outside contract identity)."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"),
                           parse_constant=_reject_constant)
+        policy_data = None
+        if isinstance(data, dict) and POLICY_KEY in data:
+            policy_data = data[POLICY_KEY]
+            data = {key: value for key, value in data.items() if key != POLICY_KEY}
         _check_fields(data, ProjectSpec, "handoff")
         for index, module in enumerate(data["modules"]):
             location = f"modules[{index}]"
@@ -47,7 +58,8 @@ def load_handoff(path: str | Path) -> ProjectSpec:
         # Admission must also support the contract's canonical identity. This
         # catches numeric overflow and invalid Unicode without a second schema.
         spec.fingerprint
-        return spec
+        policy = RuntimePolicy.from_dict(policy_data, POLICY_KEY).validate_for(spec)
+        return spec, policy
     except (ContractError, OSError, ValueError, TypeError, KeyError,
             AttributeError, OverflowError, RecursionError) as error:
         raise ContractError(f"Invalid handoff {path!r}: {error}") from error

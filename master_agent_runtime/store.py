@@ -13,7 +13,42 @@ import time
 import uuid
 
 from .contracts import (AuthorityError, BudgetError, ConflictError, ContractError,
-                        Principal, ProjectSpec, canonical, digest)
+                        Principal, ProjectSpec, RuntimePolicy, canonical, digest)
+
+
+ACTIVE_STATUSES = ('intent', 'running', 'unknown', 'stopping')
+DISPATCHABLE_MODULE_STATES = ('ready', 'revision_requested', 'continuing')
+ADMISSION_EVENTS = ('master-project-admission', 'operator-admission-override', 'operator-admission-rerun')
+STOP_REASONS = ('deadline', 'budget', 'native_failed', 'transport_lost', 'receipt_missing')
+
+
+def _admission_state(con, project_id):
+    latest = con.execute("SELECT kind,payload FROM event WHERE project_id=? AND kind IN (?,?,?) ORDER BY seq DESC LIMIT 1",
+                         (project_id, *ADMISSION_EVENTS)).fetchone()
+    if latest is None:
+        # Legacy stores predate the verdict event. Only Master review or
+        # integration work implies an earlier approval; an admission turn by
+        # itself (failed, held or settled without a recorded verdict) never
+        # does, so admission is asked again.
+        work = con.execute("SELECT 1 FROM operation WHERE actor_id=? AND kind NOT IN ('binding','admission')",
+                           (f"{project_id}:master",)).fetchone()
+        return "admitted" if work else "pending"
+    if latest["kind"] == "master-project-admission":
+        return "admitted" if _json(latest["payload"], {}).get("decision") == "approve" else "rejected"
+    return "admitted" if latest["kind"] == "operator-admission-override" else "pending"
+
+
+def _require_authorization(authorization):
+    if not isinstance(authorization, str) or not authorization.strip():
+        raise AuthorityError('Explicit operator authorization text is required')
+    return authorization.strip()
+
+
+def _json(value, default):
+    try:
+        return json.loads(value) if value else default
+    except (TypeError, ValueError):
+        return default
 
 
 SCHEMA = """
@@ -142,8 +177,21 @@ class Store:
             # Additive migration for existing writable stores. Read-only
             # inspection never migrates or changes a predecessor database.
             additions = {'module': {'evidence_rounds': 'INTEGER NOT NULL DEFAULT 0',
-                                    'failure_kind': 'TEXT', 'failure_reason': 'TEXT', 'recovery_action': 'TEXT'},
-                         'candidate': {'evidence': 'TEXT', 'evidence_hash': 'TEXT'}}
+                                    'failure_kind': 'TEXT', 'failure_reason': 'TEXT', 'recovery_action': 'TEXT',
+                                    'operator_rounds': 'INTEGER NOT NULL DEFAULT 0',
+                                    'continuations': 'INTEGER NOT NULL DEFAULT 0',
+                                    'transient_failures': 'INTEGER NOT NULL DEFAULT 0',
+                                    'retry_after': 'REAL', 'checkpoint': 'TEXT', 'checkpoint_hash': 'TEXT'},
+                         'candidate': {'evidence': 'TEXT', 'evidence_hash': 'TEXT', 'at': 'REAL'},
+                         'project': {'policy': "TEXT NOT NULL DEFAULT '{}'",
+                                     'usage_detail': "TEXT NOT NULL DEFAULT '{}'",
+                                     'cost_usd': 'REAL NOT NULL DEFAULT 0',
+                                     'unpriced_tokens': 'INTEGER NOT NULL DEFAULT 0'},
+                         'actor': {'last_usage_detail': "TEXT NOT NULL DEFAULT '{}'",
+                                   'last_cost_usd': 'REAL NOT NULL DEFAULT 0', 'runtime': 'TEXT'},
+                         'operation': {'exit_observed': 'INTEGER NOT NULL DEFAULT 0', 'outcome': 'TEXT',
+                                       'usage_detail': "TEXT NOT NULL DEFAULT '{}'"},
+                         'review': {'details': 'TEXT'}}
             for table, columns in additions.items():
                 present = {row['name'] for row in con.execute(f'PRAGMA table_info({table})')}
                 for name, declaration in columns.items():
@@ -246,12 +294,13 @@ class Store:
         con.execute("INSERT INTO event(project_id,kind,payload,at) VALUES(?,?,?,?)",
                     (project_id, kind, canonical(payload), time.time()))
 
-    def create_project(self, spec: ProjectSpec) -> str:
+    def create_project(self, spec: ProjectSpec, policy: RuntimePolicy | None = None) -> str:
+        policy = (policy or RuntimePolicy()).validate_for(spec)
         project_id = uuid.uuid4().hex
         master = f"{project_id}:master"
         with self.transaction() as con:
-            con.execute("INSERT INTO project(id,spec,spec_hash) VALUES(?,?,?)",
-                        (project_id, canonical(spec.to_dict()), spec.fingerprint))
+            con.execute("INSERT INTO project(id,spec,spec_hash,policy) VALUES(?,?,?,?)",
+                        (project_id, canonical(spec.to_dict()), spec.fingerprint, canonical(policy.to_dict())))
             con.execute("INSERT INTO actor(id,project_id,kind) VALUES(?,?,'master')",
                         (master, project_id))
             for mod in spec.modules:
@@ -294,6 +343,7 @@ class Store:
                 raise ContractError("Unknown project")
             result = dict(row)
             result["contract"] = ProjectSpec.from_dict(json.loads(row["spec"]))
+            result["policy"] = RuntimePolicy.from_dict(_json(result.get("policy"), {}))
             return result
         finally:
             con.close()
@@ -380,7 +430,7 @@ class Store:
                     input_binding[dependency] = {"revision": dep["revision"], "candidate": dep["accepted_candidate"]}
                     if dep["state"] != "accepted":
                         raise ConflictError("Required module interface is not accepted/current")
-                if module["state"] not in {"ready", "revision_requested"}:
+                if module["state"] not in DISPATCHABLE_MODULE_STATES:
                     raise ConflictError("Module is not ready for execution")
                 live = con.execute("SELECT count(*) FROM operation o JOIN actor a ON a.id=o.actor_id WHERE a.project_id=? AND a.kind='module' AND o.status IN ('intent','running','unknown','stopping')", (project["id"],)).fetchone()[0]
                 if live >= spec.max_parallel:
@@ -395,6 +445,8 @@ class Store:
             payload = {"message": message, "module_revision": module["revision"] if actor["kind"] == "module" else None,
                        "issuer": master.actor_id, "issuer_epoch": master.epoch,
                        "spec_hash": project["spec_hash"], "inputs": input_binding}
+            if actor["kind"] == "module":
+                payload["module_state"] = module["state"]
             try:
                 con.execute("INSERT INTO operation(id,actor_id,kind,status,payload,payload_hash,reserve,at) VALUES(?,?,?,'intent',?,?,?,?)",
                             (operation, actor_id, kind, canonical(payload), digest(payload), reserve, time.time()))
@@ -453,7 +505,9 @@ class Store:
                 row = con.execute('SELECT * FROM module WHERE project_id=? AND key=?', (actor['project_id'], key)).fetchone()
                 if row['state'] == 'blocked':
                     raise ConflictError('Blocked work cannot be rearmed through dependency invalidation')
-                con.execute("UPDATE module SET revision=revision+1,state='ready',accepted_candidate=NULL WHERE project_id=? AND key=?", (actor["project_id"], key))
+                con.execute("UPDATE module SET revision=revision+1,state='ready',accepted_candidate=NULL,"
+                            "checkpoint=NULL,checkpoint_hash=NULL,continuations=0,retry_after=NULL "
+                            "WHERE project_id=? AND key=?", (actor["project_id"], key))
                 owner = f"{actor['project_id']}:module:{key}"
                 con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)", (uuid.uuid4().hex, owner, canonical({"instructions": reason, "input_revision_changed": True}), time.time()))
             self.event(con, actor["project_id"], "module-inputs-invalidated", {"modules": sorted(affected), "reason": reason})
@@ -468,12 +522,26 @@ class Store:
                 raise ConflictError("Operation cannot transition to native running")
             con.execute("UPDATE operation SET status='running',remote_id=? WHERE id=?", (remote_id, operation_id))
 
+    def note_remote_turn(self, operation_id, remote_id):
+        """Record a started native turn id without changing the operation status."""
+        with self.transaction() as con:
+            con.execute("UPDATE operation SET remote_id=? WHERE id=? AND remote_id IS NULL "
+                        "AND status IN ('intent','running','unknown','stopping')", (remote_id, operation_id))
+
     def mark_unknown(self, operation_id, reason):
         with self.transaction() as con:
             con.execute("UPDATE operation SET status='unknown',error=? WHERE id=? AND status IN ('intent','running','stopping')", (reason, operation_id))
 
-    def record_usage(self, actor_id, cumulative_total: int):
-        if not isinstance(cumulative_total, int) or cumulative_total < 0:
+    def record_usage(self, actor_id, cumulative_total: int, detail=None, *, cost_usd=None, price=None, cost_pending=False):
+        """Record a cumulative native usage observation for one actor.
+
+        detail is an optional cumulative per-field token breakdown; cost_usd
+        an optional provider-reported cumulative estimate. cost_pending marks
+        an observation whose provider reports cumulative cost when the turn
+        ends, so its tokens are not counted as unpriced. Counter resets keep
+        prior usage (no refund). Costs are estimates, never billing.
+        """
+        if not isinstance(cumulative_total, int) or isinstance(cumulative_total, bool) or cumulative_total < 0:
             raise ContractError("Invalid native usage counter")
         with self.transaction() as con:
             actor = con.execute("SELECT * FROM actor WHERE id=?", (actor_id,)).fetchone()
@@ -485,6 +553,43 @@ class Store:
             con.execute("UPDATE actor SET last_usage=? WHERE id=?", (cumulative_total, actor_id))
             con.execute("UPDATE project SET spent=spent+? WHERE id=?", (delta, actor["project_id"]))
             con.execute("UPDATE operation SET usage=usage+? WHERE actor_id=? AND status IN ('intent','running','unknown','stopping')", (delta, actor_id))
+            detail_delta = {}
+            if isinstance(detail, dict):
+                last = _json(actor["last_usage_detail"], {})
+                current = {name: value for name, value in detail.items()
+                           if isinstance(value, int) and not isinstance(value, bool) and value >= 0}
+                for name, value in current.items():
+                    previous = last.get(name, 0)
+                    detail_delta[name] = value - previous if value >= previous else value
+                con.execute("UPDATE actor SET last_usage_detail=? WHERE id=?", (canonical({**last, **current}), actor_id))
+                if detail_delta:
+                    project = con.execute("SELECT usage_detail FROM project WHERE id=?", (actor["project_id"],)).fetchone()
+                    totals = _json(project["usage_detail"], {})
+                    for name, value in detail_delta.items():
+                        totals[name] = totals.get(name, 0) + value
+                    con.execute("UPDATE project SET usage_detail=? WHERE id=?", (canonical(totals), actor["project_id"]))
+                    for row in con.execute("SELECT id,usage_detail FROM operation WHERE actor_id=? AND status IN ('intent','running','unknown','stopping')", (actor_id,)).fetchall():
+                        totals = _json(row["usage_detail"], {})
+                        for name, value in detail_delta.items():
+                            totals[name] = totals.get(name, 0) + value
+                        con.execute("UPDATE operation SET usage_detail=? WHERE id=?", (canonical(totals), row["id"]))
+            cost_delta = None
+            if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool) and cost_usd >= 0:
+                previous = actor["last_cost_usd"] or 0.0
+                cost_delta = cost_usd - previous if cost_usd >= previous else cost_usd
+                con.execute("UPDATE actor SET last_cost_usd=? WHERE id=?", (float(cost_usd), actor_id))
+            elif price and detail_delta:
+                total_input = detail_delta.get("inputTokens", 0)
+                cached = detail_delta.get("cachedInputTokens", 0)
+                written = detail_delta.get("cacheWriteInputTokens", 0)
+                uncached = max(total_input - cached - written, 0)
+                cost_delta = (uncached * price["input"] + cached * price.get("cached_input", price["input"])
+                              + written * price.get("cache_write", price["input"])
+                              + detail_delta.get("outputTokens", 0) * price["output"]) / 1_000_000
+            if cost_delta is not None:
+                con.execute("UPDATE project SET cost_usd=cost_usd+? WHERE id=?", (cost_delta, actor["project_id"]))
+            elif delta and not cost_pending:
+                con.execute("UPDATE project SET unpriced_tokens=unpriced_tokens+? WHERE id=?", (delta, actor["project_id"]))
             return delta
 
     def settle(self, operation_id, *, state="done", evidence: str):
@@ -517,10 +622,13 @@ class Store:
             admitted = json.loads(operation["payload"])
             if admitted["module_revision"] != module["revision"] or admitted["inputs"] != inputs:
                 raise ConflictError("Submission changed the admitted mandate or input binding")
-            con.execute("INSERT INTO candidate(id,project_id,module_key,owner,tree_hash,snapshot,inputs,mandate_revision,validation,summary) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            con.execute("INSERT INTO candidate(id,project_id,module_key,owner,tree_hash,snapshot,inputs,mandate_revision,validation,summary,at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (candidate_id, actor["project_id"], module["key"], actor["id"], tree_hash, snapshot,
-                         canonical(inputs), module["revision"], canonical(validation), summary))
-            con.execute("UPDATE module SET state='awaiting_review',current_candidate=? WHERE owner=?", (candidate_id, actor["id"]))
+                         canonical(inputs), module["revision"], canonical(validation), summary, time.time()))
+            # A submission ends the continuation chain: the sealed candidate
+            # now carries the owner's work forward instead of a checkpoint.
+            con.execute("UPDATE module SET state='awaiting_review',current_candidate=?,checkpoint=NULL,checkpoint_hash=NULL,"
+                        "continuations=0,transient_failures=0,retry_after=NULL WHERE owner=?", (candidate_id, actor["id"]))
             msg = uuid.uuid4().hex
             con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'submission',?,?)",
                         (msg, f"{actor['project_id']}:master", canonical({"candidate_id": candidate_id, "module": module["key"]}), time.time()))
@@ -540,7 +648,7 @@ class Store:
             con.close()
 
     def review(self, master: Principal, candidate_id, decision, rationale, *, verified_tree_hash: str,
-               failure_kind='implementation'):
+               failure_kind='implementation', details=None):
         if decision not in {"approve", "request_changes"} or not rationale.strip():
             raise ContractError("Review needs explicit decision and substantive rationale")
         if failure_kind not in {'none', 'implementation', 'evidence', 'uncertain_execution'}:
@@ -566,27 +674,35 @@ class Store:
                 failure_kind = 'implementation'
             if decision == "approve" and (not checks or any(x.get("status") != "passed" for x in checks)):
                 raise ConflictError("Cannot approve without actual successful admitted validation")
-            con.execute("INSERT INTO review(id,candidate_id,reviewer,decision,rationale,at) VALUES(?,?,?,?,?,?)",
-                        (uuid.uuid4().hex, candidate_id, master.actor_id, decision, rationale, time.time()))
+            details = details if isinstance(details, dict) else None
+            con.execute("INSERT INTO review(id,candidate_id,reviewer,decision,rationale,at,details) VALUES(?,?,?,?,?,?,?)",
+                        (uuid.uuid4().hex, candidate_id, master.actor_id, decision, rationale, time.time(),
+                         canonical(details) if details else None))
             con.execute("UPDATE candidate SET state=? WHERE id=?", ("approved" if decision == "approve" else "changes_requested", candidate_id))
             if decision == "approve":
                 con.execute("UPDATE module SET state='accepted',accepted_candidate=?,failure_kind=NULL,failure_reason=NULL,recovery_action=NULL WHERE project_id=? AND key=?", (candidate_id, cand["project_id"], cand["module_key"]))
             else:
                 spec_row = con.execute("SELECT spec FROM project WHERE id=?", (cand["project_id"],)).fetchone()
                 spec = ProjectSpec.from_dict(json.loads(spec_row["spec"]))
+                extra = module['operator_rounds'] or 0
                 if failure_kind == 'evidence':
-                    state = 'awaiting_evidence' if module['evidence_rounds'] < spec.max_evidence_rounds else 'blocked'
+                    state = 'awaiting_evidence' if module['evidence_rounds'] < spec.max_evidence_rounds + extra else 'blocked'
                     action = 'collect_and_rerun_evidence' if state != 'blocked' else 'evidence_recovery_exhausted'
                     con.execute('UPDATE module SET state=?,evidence_rounds=evidence_rounds+1 WHERE project_id=? AND key=?', (state, cand['project_id'], cand['module_key']))
                 elif failure_kind == 'uncertain_execution':
                     state, action = 'blocked', 'inspect_recorded_execution_outcomes'
                     con.execute('UPDATE module SET state=? WHERE project_id=? AND key=?', (state, cand['project_id'], cand['module_key']))
                 else:
-                    state = 'revision_requested' if module['rounds'] < spec.max_revision_rounds else 'blocked'
+                    state = 'revision_requested' if module['rounds'] < spec.max_revision_rounds + extra else 'blocked'
                     action = 'same_owner_code_or_test_correction' if state != 'blocked' else 'implementation_revision_exhausted'
                     con.execute('UPDATE module SET state=?,rounds=rounds+1 WHERE project_id=? AND key=?', (state, cand['project_id'], cand['module_key']))
+                    correction = {'candidate_id': candidate_id, 'instructions': rationale}
+                    if details:
+                        for name in ('blocking_issues', 'advisories'):
+                            if details.get(name):
+                                correction[name] = details[name]
                     con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)",
-                                (uuid.uuid4().hex, module['owner'], canonical({'candidate_id': candidate_id, 'instructions': rationale}), time.time()))
+                                (uuid.uuid4().hex, module['owner'], canonical(correction), time.time()))
                 con.execute('UPDATE module SET failure_kind=?,failure_reason=?,recovery_action=? WHERE project_id=? AND key=?',
                             (failure_kind, rationale, action, cand['project_id'], cand['module_key']))
             self.event(con, cand["project_id"], "master-review", {"candidate": candidate_id, "decision": decision, 'failure_kind': failure_kind})
@@ -720,6 +836,11 @@ class Store:
                                   recovery_action='inspect_preserved_rejection_no_automatic_rearming')
             return {"project_id": project_id, "state": project["state"],
                     "token_budget": json.loads(project['spec'])['token_budget'], "spent_tokens": project["spent"],
+                    "usage_detail": _json(project.get("usage_detail"), {}),
+                    "estimated_cost_usd": project.get("cost_usd", 0.0),
+                    "unpriced_tokens": project.get("unpriced_tokens", 0),
+                    "runtime_policy": _json(project.get("policy"), {}),
+                    "admission": _admission_state(con, project_id),
                     'recovery_limits': {'implementation': json.loads(project['spec']).get('max_revision_rounds', 2),
                                         'evidence': json.loads(project['spec']).get('max_evidence_rounds', 2)},
                     "reserved_tokens": project["reserved"], "modules": modules,
@@ -727,3 +848,304 @@ class Store:
                     "operations": [dict(x) for x in con.execute("SELECT * FROM operation WHERE actor_id IN (SELECT id FROM actor WHERE project_id=?) ORDER BY at", (project_id,))]}
         finally:
             con.close()
+
+    # ---- Stopped turns, continuations and transient native rejections ----
+
+    def note_exit_observed(self, operation_id):
+        with self.transaction() as con:
+            con.execute("UPDATE operation SET exit_observed=1 WHERE id=?", (operation_id,))
+
+    def settle_interrupted(self, operation_id, *, reason, evidence, instructions, checkpoint=None,
+                           max_continuations=2, consume=True):
+        """Settle a stopped native turn whose owned process exit was observed.
+
+        The owner keeps its context; a bounded continuation carries its
+        checkpointed files forward. Usage is never refunded. Returns the
+        module state that results (or None for non-module operations).
+        """
+        if reason not in STOP_REASONS or not evidence:
+            raise ContractError("Stopped-turn settlement needs a known reason and actual evidence")
+        with self.transaction() as con:
+            row = con.execute("SELECT o.*,a.project_id,a.kind AS actor_kind,a.module_key FROM operation o "
+                              "JOIN actor a ON a.id=o.actor_id WHERE o.id=?", (operation_id,)).fetchone()
+            if not row or row["status"] not in ACTIVE_STATUSES:
+                raise ConflictError("Operation already settled or unknown")
+            con.execute("UPDATE operation SET status='failed',error=?,exit_observed=1,outcome=? WHERE id=?",
+                        (evidence, reason, operation_id))
+            con.execute("UPDATE project SET reserved=reserved-? WHERE id=?", (row["reserve"], row["project_id"]))
+            con.execute("UPDATE actor SET state='idle' WHERE id=?", (row["actor_id"],))
+            state = None
+            if row["actor_kind"] == "module" and row["kind"] == "work":
+                module = con.execute("SELECT * FROM module WHERE owner=?", (row["actor_id"],)).fetchone()
+                if checkpoint:
+                    con.execute("UPDATE module SET checkpoint=?,checkpoint_hash=? WHERE owner=?",
+                                (checkpoint["path"], checkpoint["tree_hash"], row["actor_id"]))
+                if module["state"] == "working":
+                    if not consume or module["continuations"] < max_continuations:
+                        state = "continuing"
+                        con.execute("UPDATE module SET state='continuing',continuations=continuations+?,failure_kind=?,"
+                                    "failure_reason=?,recovery_action='automatic_continuation' WHERE owner=?",
+                                    (1 if consume else 0, reason, evidence, row["actor_id"]))
+                        con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'continuation',?,?)",
+                                    (uuid.uuid4().hex, row["actor_id"], canonical({
+                                        "instructions": instructions, "reason": reason,
+                                        "checkpoint": bool(checkpoint), "operation": operation_id}), time.time()))
+                    else:
+                        state = "blocked"
+                        con.execute("UPDATE module SET state='blocked',failure_kind=?,failure_reason=?,"
+                                    "recovery_action='continuation_limit_reached_operator_rearm' WHERE owner=?",
+                                    (reason, evidence, row["actor_id"]))
+            self.event(con, row["project_id"], "native-turn-stopped", {
+                "operation": operation_id, "actor": row["actor_id"], "reason": reason, "evidence": evidence,
+                "checkpoint": checkpoint["tree_hash"] if checkpoint else None, "module_state": state,
+                "usage_retained": row["usage"]})
+            return state
+
+    def release_rejected_dispatch(self, operation_id, *, reason, max_retries=3, backoff_seconds=30):
+        """A definitive native refusal to start a turn: nothing ran, so release it.
+
+        The module returns to its prior dispatchable state with exponential
+        backoff, or blocks after the bounded number of rejections.
+        """
+        with self.transaction() as con:
+            row = con.execute("SELECT o.*,a.project_id,a.kind AS actor_kind FROM operation o "
+                              "JOIN actor a ON a.id=o.actor_id WHERE o.id=?", (operation_id,)).fetchone()
+            if not row or row["status"] not in ("intent", "unknown"):
+                raise ConflictError("Only an unstarted operation can be released after a definitive rejection")
+            con.execute("UPDATE operation SET status='failed',error=?,outcome='dispatch_rejected' WHERE id=?",
+                        ("native turn/start definitively rejected; no turn exists: " + reason, operation_id))
+            con.execute("UPDATE project SET reserved=reserved-? WHERE id=?", (row["reserve"], row["project_id"]))
+            con.execute("UPDATE actor SET state='idle' WHERE id=?", (row["actor_id"],))
+            state = None
+            if row["actor_kind"] == "module" and row["kind"] == "work":
+                module = con.execute("SELECT * FROM module WHERE owner=?", (row["actor_id"],)).fetchone()
+                failures = module["transient_failures"] + 1
+                if failures <= max_retries:
+                    state = _json(row["payload"], {}).get("module_state") or "ready"
+                    if state not in DISPATCHABLE_MODULE_STATES:
+                        state = "ready"
+                    con.execute("UPDATE module SET state=?,transient_failures=?,retry_after=? WHERE owner=?",
+                                (state, failures, time.time() + backoff_seconds * 2 ** (failures - 1), row["actor_id"]))
+                else:
+                    state = "blocked"
+                    con.execute("UPDATE module SET state='blocked',transient_failures=?,failure_kind='native_rejected',"
+                                "failure_reason=?,recovery_action='inspect_native_runtime_then_operator_rearm' WHERE owner=?",
+                                (failures, reason, row["actor_id"]))
+            self.event(con, row["project_id"], "native-dispatch-rejected",
+                       {"operation": operation_id, "reason": reason, "module_state": state})
+            return state
+
+    def reject_unsubmittable(self, operation_id, *, reason, checkpoint=None, max_revision_rounds=2):
+        """Return completed work that cannot be sealed (scope violation) to its owner."""
+        with self.transaction() as con:
+            row = con.execute("SELECT o.*,a.project_id,a.kind AS actor_kind FROM operation o "
+                              "JOIN actor a ON a.id=o.actor_id WHERE o.id=?", (operation_id,)).fetchone()
+            if not row or row["actor_kind"] != "module" or row["kind"] != "work" or row["status"] != "done":
+                raise ConflictError("Only completed module work can be returned as unsubmittable")
+            module = con.execute("SELECT * FROM module WHERE owner=?", (row["actor_id"],)).fetchone()
+            if module["state"] != "working":
+                raise ConflictError("Module is not awaiting publication of completed work")
+            if checkpoint:
+                con.execute("UPDATE module SET checkpoint=?,checkpoint_hash=? WHERE owner=?",
+                            (checkpoint["path"], checkpoint["tree_hash"], row["actor_id"]))
+            if module["rounds"] < max_revision_rounds + (module["operator_rounds"] or 0):
+                state, action = "revision_requested", "same_owner_code_or_test_correction"
+                con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)",
+                            (uuid.uuid4().hex, row["actor_id"], canonical({
+                                "instructions": reason, "unsubmittable": True, "operation": operation_id}), time.time()))
+            else:
+                state, action = "blocked", "implementation_revision_exhausted"
+            con.execute("UPDATE module SET state=?,rounds=rounds+1,failure_kind='implementation',failure_reason=?,"
+                        "recovery_action=? WHERE owner=?", (state, reason, action, row["actor_id"]))
+            self.event(con, row["project_id"], "candidate-unsubmittable",
+                       {"operation": operation_id, "reason": reason, "module_state": state,
+                        "checkpoint": checkpoint["tree_hash"] if checkpoint else None})
+            return state
+
+    def annotate_module(self, project_id, module_key, *, failure_kind, reason, action):
+        with self.transaction() as con:
+            con.execute("UPDATE module SET failure_kind=?,failure_reason=?,recovery_action=? WHERE project_id=? AND key=?",
+                        (failure_kind, reason, action, project_id, module_key))
+            self.event(con, project_id, "module-annotated",
+                       {"module": module_key, "failure_kind": failure_kind, "reason": reason, "action": action})
+
+    def note_review_unavailable(self, project_id, module_key, *, reason, max_retries=3, backoff_seconds=30):
+        """A Master review could not complete; retry later or block after the bound."""
+        with self.transaction() as con:
+            module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (project_id, module_key)).fetchone()
+            if not module or module["state"] not in ("awaiting_review", "awaiting_evidence"):
+                return None
+            failures = module["transient_failures"] + 1
+            if failures <= max_retries:
+                state = module["state"]
+                con.execute("UPDATE module SET transient_failures=?,retry_after=? WHERE project_id=? AND key=?",
+                            (failures, time.time() + backoff_seconds * 2 ** (failures - 1), project_id, module_key))
+            else:
+                state = "blocked"
+                con.execute("UPDATE module SET state='blocked',transient_failures=?,failure_kind='review_unavailable',"
+                            "failure_reason=?,recovery_action='operator_rearm_review' WHERE project_id=? AND key=?",
+                            (failures, reason, project_id, module_key))
+            self.event(con, project_id, "master-review-unavailable",
+                       {"module": module_key, "reason": reason, "module_state": state})
+            return state
+
+    def clear_review_retry(self, project_id, module_key):
+        with self.transaction() as con:
+            con.execute("UPDATE module SET transient_failures=0,retry_after=NULL WHERE project_id=? AND key=?",
+                        (project_id, module_key))
+
+    def record_actor_runtime(self, actor_id, runtime):
+        with self.transaction() as con:
+            actor = con.execute("SELECT project_id FROM actor WHERE id=?", (actor_id,)).fetchone()
+            if not actor:
+                raise AuthorityError("Unknown actor")
+            con.execute("UPDATE actor SET runtime=? WHERE id=?", (canonical(runtime), actor_id))
+            self.event(con, actor["project_id"], "native-runtime-observed", {"actor": actor_id, **runtime})
+
+    # ---- Master admission ----
+
+    def admission_state(self, project_id):
+        """'admitted', 'rejected' or 'pending', from journaled decisions only."""
+        con = self.connect()
+        try:
+            return _admission_state(con, project_id)
+        finally:
+            con.close()
+
+    def record_admission(self, project_id, *, decision, rationale, operation=None, source="master"):
+        with self.transaction() as con:
+            self.event(con, project_id, "master-project-admission",
+                       {"decision": decision, "rationale": rationale, "operation": operation, "source": source})
+
+    # ---- Journaled operator actions (trusted host; caller holds the project lease) ----
+
+    def operator_resolve_operation(self, project_id, operation_id, *, outcome, authorization):
+        """Close an operation a person has confirmed cannot be reconciled.
+
+        Never infers a submission. Module work becomes blocked with an
+        explicit rearm path; incurred usage stays recorded.
+        """
+        authorization = _require_authorization(authorization)
+        if outcome not in ("failed", "cancelled"):
+            raise ContractError("An operator can resolve an operation only as failed or cancelled")
+        with self.transaction() as con:
+            row = con.execute("SELECT o.*,a.project_id,a.kind AS actor_kind FROM operation o "
+                              "JOIN actor a ON a.id=o.actor_id WHERE o.id=?", (operation_id,)).fetchone()
+            if not row or row["project_id"] != project_id:
+                raise ContractError("Unknown operation for this project")
+            if row["status"] not in ACTIVE_STATUSES:
+                raise ConflictError("Operation is already settled")
+            con.execute("UPDATE operation SET status=?,error=?,outcome='operator_resolved' WHERE id=?",
+                        (outcome, "operator-resolved: " + authorization, operation_id))
+            con.execute("UPDATE project SET reserved=reserved-? WHERE id=?", (row["reserve"], project_id))
+            con.execute("UPDATE actor SET state='idle' WHERE id=?", (row["actor_id"],))
+            if row["actor_kind"] == "module" and row["kind"] == "work":
+                con.execute("UPDATE module SET state='blocked',failure_kind='uncertain_execution',failure_reason=?,"
+                            "recovery_action='operator_resolved_rearm_available' WHERE owner=? AND state='working'",
+                            ("Operator resolved an unreconcilable operation: " + authorization, row["actor_id"]))
+            self.event(con, project_id, "operator-resolved-operation", {
+                "operation": operation_id, "previous_status": row["status"], "outcome": outcome,
+                "authorization": authorization, "usage_retained": row["usage"], "reserve_released": row["reserve"]})
+            project = con.execute("SELECT state FROM project WHERE id=?", (project_id,)).fetchone()
+            active = con.execute("SELECT 1 FROM operation WHERE actor_id IN (SELECT id FROM actor WHERE project_id=?) "
+                                 "AND status IN ('intent','running','unknown','stopping')", (project_id,)).fetchone()
+            if project["state"] == "cancelling" and not active:
+                con.execute("UPDATE project SET state='cancelled' WHERE id=?", (project_id,))
+                self.event(con, project_id, "project-cancellation-settled", {"basis": "operator resolution of last operation"})
+
+    def operator_rearm_module(self, project_id, module_key, *, authorization, extra_rounds=1):
+        """Give a blocked module bounded additional attempts with the same owner/context."""
+        authorization = _require_authorization(authorization)
+        if not isinstance(extra_rounds, int) or isinstance(extra_rounds, bool) or not 1 <= extra_rounds <= 10:
+            raise ContractError("Extra rounds must be an integer between 1 and 10")
+        with self.transaction() as con:
+            project = con.execute("SELECT state FROM project WHERE id=?", (project_id,)).fetchone()
+            if not project or project["state"] != "active":
+                raise ConflictError("Only an active project can be rearmed")
+            module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (project_id, module_key)).fetchone()
+            if not module:
+                raise ContractError("Unknown module")
+            if module["state"] != "blocked":
+                raise ConflictError("Only a blocked module can be rearmed")
+            live = con.execute("SELECT 1 FROM operation WHERE actor_id=? AND status IN ('intent','running','unknown','stopping')",
+                               (module["owner"],)).fetchone()
+            if live:
+                raise ConflictError("Resolve the owner's unsettled operation before rearming")
+            kind = module["failure_kind"]
+            if kind == "review_unavailable" and module["current_candidate"]:
+                state = "awaiting_review"
+            elif kind == "evidence" and module["current_candidate"]:
+                state = "awaiting_evidence"
+            elif module["checkpoint"]:
+                state = "continuing"
+            else:
+                state = "revision_requested"
+            con.execute("UPDATE module SET state=?,operator_rounds=operator_rounds+?,continuations=0,transient_failures=0,"
+                        "retry_after=NULL,recovery_action='operator_rearmed' WHERE project_id=? AND key=?",
+                        (state, extra_rounds, project_id, module_key))
+            if state in ("revision_requested", "continuing"):
+                con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)",
+                            (uuid.uuid4().hex, module["owner"], canonical({
+                                "instructions": f"Operator rearmed this module ({authorization}). Previous stop: "
+                                                f"{kind or 'blocked'}: {module['failure_reason'] or 'no recorded reason'}",
+                                "operator_rearm": True}), time.time()))
+            self.event(con, project_id, "operator-rearmed-module", {
+                "module": module_key, "new_state": state, "failure_kind": kind, "failure_reason": module["failure_reason"],
+                "authorization": authorization, "extra_rounds": extra_rounds})
+            return state
+
+    def operator_admission(self, project_id, *, decision, authorization):
+        authorization = _require_authorization(authorization)
+        if decision not in ("rerun", "override"):
+            raise ContractError("Admission decision must be rerun or override")
+        if self.admission_state(project_id) == "admitted":
+            raise ConflictError("Project admission is already approved")
+        with self.transaction() as con:
+            project = con.execute("SELECT state FROM project WHERE id=?", (project_id,)).fetchone()
+            if not project or project["state"] != "active":
+                raise ConflictError("Only an active project can be admitted")
+            kind = "operator-admission-rerun" if decision == "rerun" else "operator-admission-override"
+            self.event(con, project_id, kind, {"authorization": authorization})
+
+    def operator_set_budget(self, project_id, token_budget, *, authorization):
+        authorization = _require_authorization(authorization)
+        if not isinstance(token_budget, int) or isinstance(token_budget, bool) or token_budget < 1:
+            raise ContractError("Token budget must be a positive integer")
+        with self.transaction() as con:
+            row = con.execute("SELECT * FROM project WHERE id=?", (project_id,)).fetchone()
+            if not row or row["state"] != "active":
+                raise ConflictError("Only an active project's envelope can change")
+            if token_budget < row["spent"] + row["reserved"]:
+                raise BudgetError("A new envelope cannot erase incurred usage or held reservations")
+            data = json.loads(row["spec"])
+            before = data["token_budget"]
+            data["token_budget"] = token_budget
+            revised = ProjectSpec.from_dict(data)
+            con.execute("UPDATE project SET spec=?,spec_hash=? WHERE id=?",
+                        (canonical(revised.to_dict()), revised.fingerprint, project_id))
+            self.event(con, project_id, "operator-budget-revised", {
+                "authorization": authorization, "before": before, "after": token_budget,
+                "retained_spent": row["spent"], "retained_reserved": row["reserved"],
+                "previous_spec_hash": row["spec_hash"], "new_spec_hash": revised.fingerprint})
+
+    def operator_set_policy(self, project_id, updates, *, authorization):
+        """Revise operational policy; never changes contract identity or bound actors' providers."""
+        authorization = _require_authorization(authorization)
+        if not isinstance(updates, dict) or not updates:
+            raise ContractError("Policy updates must be a nonempty object")
+        with self.transaction() as con:
+            row = con.execute("SELECT * FROM project WHERE id=?", (project_id,)).fetchone()
+            if not row or row["state"] != "active":
+                raise ConflictError("Only an active project's policy can change")
+            spec = ProjectSpec.from_dict(json.loads(row["spec"]))
+            before = RuntimePolicy.from_dict(_json(row["policy"], {}))
+            after = RuntimePolicy.from_dict({**before.to_dict(), **updates}).validate_for(spec)
+            for actor in con.execute("SELECT * FROM actor WHERE project_id=? AND thread_id IS NOT NULL", (project_id,)):
+                key = actor["module_key"]
+                if before.runtime_for(spec, key).provider != after.runtime_for(spec, key).provider:
+                    raise ConflictError(f"Actor {actor['id']} is bound to a {before.runtime_for(spec, key).provider} "
+                                        "session; changing its provider would replace its context")
+            con.execute("UPDATE project SET policy=? WHERE id=?", (canonical(after.to_dict()), project_id))
+            self.event(con, project_id, "operator-policy-revised",
+                       {"authorization": authorization, "before": before.to_dict(), "after": after.to_dict()})
+            return after

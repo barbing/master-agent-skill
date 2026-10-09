@@ -9,7 +9,8 @@ import shutil
 import stat
 import tempfile
 
-from .contracts import ConflictError, ContractError, PROTECTED_PARTS, canonical, digest, in_scope, relative_path
+from .contracts import (ConflictError, ContextModified, ContractError, PROTECTED_PARTS, ScopeViolation,
+                        canonical, digest, in_scope, relative_path)
 
 
 IGNORED_GENERATED = {"__pycache__", ".pytest_cache", ".tmp"}
@@ -32,9 +33,9 @@ def read_regular(root_fd: int, relative: str, *, metadata_read=False) -> bytes:
         try:
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-                raise ContractError("Artifacts must be ordinary single-link files")
+                raise ScopeViolation(f"Artifacts must be ordinary single-link files: {relative}")
             if before.st_size > 16 * 1024 * 1024:
-                raise ContractError("Artifact file exceeds the admitted 16 MiB limit")
+                raise ScopeViolation(f"Artifact file exceeds the admitted 16 MiB limit: {relative}")
             with os.fdopen(fd, "rb", closefd=False) as stream:
                 data = stream.read()
             after = os.fstat(fd)
@@ -54,7 +55,7 @@ def file_names(root: Path) -> list[str]:
         for name in list(dirs):
             path = Path(directory) / name
             if path.is_symlink():
-                raise ContractError("Symlink directories cannot be submitted")
+                raise ScopeViolation(f"Symlink directories cannot be submitted: {path.relative_to(root).as_posix()}")
             if name in IGNORED_GENERATED:
                 dirs.remove(name)
         for name in files:
@@ -75,7 +76,8 @@ def context_hashes(root,paths):
     finally:os.close(fd)
 
 
-def tree(root: Path, paths: tuple[str, ...] | list[str], *, context_inputs=None) -> tuple[list[dict], dict[str, bytes]]:
+def tree(root: Path, paths: tuple[str, ...] | list[str], *, context_inputs=None,
+         ignore_unowned=False) -> tuple[list[dict], dict[str, bytes]]:
     root = root.absolute()
     if root.is_symlink() or not root.is_dir():
         raise ContractError("Artifact root must be a real directory")
@@ -87,37 +89,43 @@ def tree(root: Path, paths: tuple[str, ...] | list[str], *, context_inputs=None)
     try:
         for name in names:
             if not owned_path(name,paths):
+                if ignore_unowned:
+                    # Checkpoints carry only owned work forward; unowned
+                    # changes are never delivered and need no inspection.
+                    continue
                 if context_inputs is None:
-                    raise ContractError(f"Candidate writes outside module namespace: {name}")
+                    raise ScopeViolation(f"Candidate writes outside module namespace: {name}")
                 content=read_regular(fd,name,metadata_read=True)
                 if context_inputs.get(name)!=hashlib.sha256(content).hexdigest():
-                    raise ConflictError(f'Readonly project context was modified or added: {name}')
+                    raise ContextModified(f'Readonly project context was modified or added: {name}')
                 continue
             content = read_regular(fd, name)
             total += len(content)
             if total > 64 * 1024 * 1024:
-                raise ContractError("Candidate exceeds the admitted 64 MiB limit")
+                raise ScopeViolation("Candidate exceeds the admitted 64 MiB limit")
             data[name] = content
             rows.append({"path": name, "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)})
     finally:
         os.close(fd)
     if names != file_names(root):
         raise ConflictError("Candidate membership changed during capture")
-    if context_inputs is not None and set(context_inputs)-set(names):
-        raise ConflictError('Readonly project context was deleted')
+    if context_inputs is not None and not ignore_unowned and set(context_inputs)-set(names):
+        raise ContextModified('Readonly project context was deleted: '
+                              + ', '.join(sorted(set(context_inputs)-set(names))[:10]))
     return rows, data
 
 
-def capture(workspace: Path, destination: Path, paths, *, bindings: dict, baseline_files=(),context_inputs=None) -> dict:
-    rows, data = tree(workspace, paths,context_inputs=context_inputs)
+def capture(workspace: Path, destination: Path, paths, *, bindings: dict, baseline_files=(),context_inputs=None,
+            ignore_unowned=False) -> dict:
+    rows, data = tree(workspace, paths,context_inputs=context_inputs,ignore_unowned=ignore_unowned)
     if "candidate-manifest.json" in data:
-        raise ContractError("The snapshot manifest is controller-owned")
+        raise ScopeViolation("The snapshot manifest is controller-owned")
     baseline = {relative_path(name) for name in baseline_files}
     if any(not in_scope(name, paths) for name in baseline):
         raise ContractError("Deletion baseline exceeds the module grant")
     deleted = sorted(baseline - data.keys())
     if not rows and not deleted:
-        raise ContractError("A candidate must contain actual files or admitted deletions")
+        raise ScopeViolation("A candidate must contain actual files or admitted deletions")
     manifest = {"bindings": bindings, "files": rows, "deleted": deleted}
     content_hash = digest(manifest)
     target = destination / content_hash
