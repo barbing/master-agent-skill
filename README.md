@@ -23,21 +23,7 @@ State must be outside the input project and ambient `/tmp` or `/var/tmp` trees. 
 
 **Validation status:** the native startup and temporary-path defects are corrected by admitting required launcher traversal reads and final native deny-glob rules, with no global setting changes or unsandboxed fallback. Actual macOS command probes cover allowed edits/private scratch, readonly source, direct/symlink/child/rename attempts and network blocking. Native editing and same-root resume passed. Local engineering actors disable apps, plugins, hooks, browser/computer use, native subagents and background goals until those routes are admitted separately. The real two-owner repository workload completed Master rejection, correction by the same owner/context, independent module checks and whole-project integration acceptance. The accepted admission/health modules and their tests are now in this package; 94 package tests pass. All testing continuation used `gpt-6-luna` under explicit human authorization, retaining the earlier budget stop and all prior usage. New live test harnesses use Luna; production defaults are unchanged. The completed run used 3,261,139 observed total tokens, including cached input, with zero remaining reservations. This is a bounded real-work pilot, not proof of long-duration production reliability or exact monetary containment. Arbitrary escaped processes are not certified quiescent; retired write namespaces fence them away from later artifacts/activations.
 
-Run the new package checks separately:
-
-```bash
-python3.12 -B -m unittest discover -s tests -p 'test_module_runtime.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_native_rpc.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_controller.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_sandbox.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_permissions.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_recovery.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_backend.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_test_settings.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_admission.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_health.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_empty_master.py' -v
-```
+The package's checks are part of the repository suite; see [Validation](#validation).
 
 The historical persistence replay also covers secondary Python toolchain libraries and recovery of a provably unused native Master root. New Masters review task admission before delegating, establishing actual persisted context; a rejected admission cannot be bypassed by restarting. Used or unresolved Master/worker contexts are never silently replaced. That checkpoint passed 99 runtime checks.
 
@@ -50,15 +36,6 @@ Current package verification passes 138 test executions (including inherited own
 Recovery also handles an acknowledged producer completed before submission, without rerunning it, and checks its final submitted/blocked receipt before reconstruction. A blocked or missing producer receipt cannot become a successful candidate. Source-publication regression checks cover that boundary.
 
 The repository compatibility repairs use a tracked CI example, platform-neutral cooperative supervisor test cleanup, and interpreter-independent JSON decoder error tests, and correctly quoted provider commands for paths containing spaces or punctuation. Legacy role-skill validation requires Codex's `skill-creator/scripts/quick_validate.py` at `~/.codex/skills/.system/` and PyYAML in the validation interpreter; the opt-in runtime itself uses the Python standard library. The complete repository suite passes 258 cases plus 20 separate owner-suite cases on macOS with both Python 3.12 and 3.14. No original semantic assertion or ignore rule is removed.
-
-Run the added checks alongside the existing package checks:
-
-```bash
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_evidence.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_review_recovery.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_publication_recovery.py' -v
-python3.12 -B -m unittest discover -s tests -p 'owned_*_test.py' -v
-```
 
 ### Runtime policy, continuation and Claude Code owners
 
@@ -102,17 +79,7 @@ python3.12 -m master_agent_runtime --state /absolute/runtime-state policy PROJEC
 
 The standalone CLI must be logged in; check with `claude auth status`. File tools are enforced by Claude Code's permission rules, not by the OS sandbox, and validators still run through the Codex CLI. On 2026-10-09, with Claude Code 2.1.295 and Haiku 5.5, a live boundary probe confirmed the denials. Smoke projects and the historical atomic-publication task were then accepted end to end through this adapter.
 
-Offline verification on macOS with Python 3.12 and 3.14 passes 176 runtime cases and 20 owner-suite cases. Live Codex checks on 2026-10-09 with CLI 0.162.0-alpha.17.2 and `gpt-6-luna` covered both a smoke project and a kill test. The smoke project was accepted after one journaled rearm; the first attempt exposed that exact write grants could not create a missing parent directory, so the host now creates parents of admitted paths. In the kill test, the owner's app-server was killed mid-turn; the runtime checkpointed the owner's files, resumed the same thread and was accepted 37 seconds later without operator action. On 2026-10-09 the historical Store/CLI and atomic-publication tasks were replayed from their frozen inputs with Haiku 5.5 fulfilling every turn through a validation relay. Both were accepted without a rejection, revision or continuation. The two `test_runtime_sandbox.py` cases create a directory under `/private/tmp`, so they pass only where that is writable. New checks:
-
-```bash
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_scheduler.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_continuation.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_operator.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_review_calibration.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_accounting.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_runtime_admission_retry.py' -v
-python3.12 -B -m unittest discover -s tests -p 'test_claude_adapter.py' -v
-```
+Offline verification on macOS with Python 3.12 and 3.14 passes 176 runtime cases and 20 owner-suite cases. Live Codex checks on 2026-10-09 with CLI 0.162.0-alpha.17.2 and `gpt-6-luna` covered both a smoke project and a kill test. The smoke project was accepted after one journaled rearm; the first attempt exposed that exact write grants could not create a missing parent directory, so the host now creates parents of admitted paths. In the kill test, the owner's app-server was killed mid-turn; the runtime checkpointed the owner's files, resumed the same thread and was accepted 37 seconds later without operator action. On 2026-10-09 the historical Store/CLI and atomic-publication tasks were replayed from their frozen inputs with Haiku 5.5 fulfilling every turn through a validation relay. Both were accepted without a rejection, revision or continuation. The two `test_runtime_sandbox.py` cases create a directory under `/private/tmp`, so they pass only where that is writable.
 
 ## What This Provides
 
@@ -142,6 +109,8 @@ Conversation is not treated as durable state. Accepted decisions and current pro
 │   └── openai.yaml
 ├── assets/
 │   └── templates/
+├── master_agent_runtime/
+├── pilots/
 ├── references/
 │   ├── master-agent-system.md
 │   └── provider-command-adapter.md
@@ -236,12 +205,15 @@ Run the core checks from the repository root:
 
 ```bash
 python -m unittest discover -s tests -v
+python -m unittest discover -s pilots -p 'owned_*_test.py' -v
 python -m py_compile scripts/bootstrap_project_state.py scripts/file_session_provider.py scripts/validate_state_pack.py scripts/master_agent_tool.py scripts/state_io.py scripts/release_validate.py scripts/soak_validate.py tests/test_master_agent_system.py
 python scripts/validate_state_pack.py assets/templates
 python scripts/soak_validate.py --quick
 python scripts/master_agent_tool.py validate-worktreeinclude --state-dir <project-root>/docs/master-agent --project-root <project-root>
 python scripts/master_agent_tool.py repair-log-status --state-dir <project-root>/docs/master-agent --project-root <project-root>
 ```
+
+`tests/` is the regression suite for the legacy tool and the runtime package; the release gate runs all of it. `pilots/` keeps the frozen files of two completed runtime pilots byte-for-byte, and the second command reruns the tests their module owners wrote. See `pilots/README.md`.
 
 Validate the skill metadata with Codex's skill validator:
 

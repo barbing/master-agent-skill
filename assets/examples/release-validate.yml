@@ -40,4 +40,4 @@ jobs:
           python scripts/release_validate.py \
             --quick-validate "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py"
       - name: Rerun module-owner acceptance tests
-        run: python -B -m unittest discover -s tests -p 'owned_*_test.py' -v
+        run: python -B -m unittest discover -s pilots -p 'owned_*_test.py' -v
