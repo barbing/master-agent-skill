@@ -38,6 +38,11 @@ def make_project(root, modules, *, budget=100000, policy=None, **spec_fields):
 
 def default_master(actor, number, message, schema):
     required = (schema or {}).get('required', [])
+    if 'action' in required:
+        return {'action': 'answer', 'answer': 'Use the first option', 'rationale': 'The brief settles it',
+                'question_for_user': None}
+    if required == ['affected_modules', 'rationale']:
+        return {'affected_modules': [], 'rationale': 'The feedback needs no file change'}
     if 'Review initial project admission' in message:
         return {'decision': 'approve', 'rationale': 'Feasible bounded mandates'}
     failed = '"status": "failed"' in message
@@ -62,7 +67,8 @@ def default_owner(actor, number, message):
 class ScriptedActor:
     """Per-actor scripts decide each turn. Behaviour keys for owners:
     write {path: text}, sleep seconds, usage total, hang (wait for interrupt),
-    raise exception, reject_start, text raw output, status submitted|blocked."""
+    raise exception, reject_start, text raw output, status submitted|needs_decision|blocked,
+    and question/options/recommendation for a decision request."""
     owner_script = staticmethod(default_owner)
     master_script = staticmethod(default_master)
     log = []
@@ -128,9 +134,10 @@ class ScriptedActor:
         self.log.append((self.key, self.number, 'finished'))
         if 'text' in behaviour:
             return {'text': behaviour['text'], 'turn': {'id': turn_id, 'status': 'completed'}}
-        return {'text': json.dumps({'status': behaviour.get('status', 'submitted'),
-                                    'summary': 'Synthetic owner wrote real fixture files', 'issues': []}),
-                'turn': {'id': turn_id, 'status': 'completed'}}
+        output = {'status': behaviour.get('status', 'submitted'),
+                  'summary': 'Synthetic owner wrote real fixture files', 'issues': []}
+        output.update({key: behaviour[key] for key in ('question', 'options', 'recommendation') if key in behaviour})
+        return {'text': json.dumps(output), 'turn': {'id': turn_id, 'status': 'completed'}}
 
     async def interrupt(self, turn_id):
         self.interrupted = True

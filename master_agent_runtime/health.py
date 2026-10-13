@@ -36,6 +36,8 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
                              if module["state"] == "blocked")
     pending_reviews = sorted(module["key"] for module in modules
                              if module["state"] in {"awaiting_review", 'awaiting_evidence'})
+    questions = status.get("pending_questions") or []
+    waiting_user = [item for item in questions if item.get("state") == "awaiting_user"]
     project_state = status["state"]
     admission = status.get("admission")
     failed_admissions = sum(1 for operation in status["operations"]
@@ -61,6 +63,12 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
                        + " --operation OPERATION --outcome failed --authorization 'reason'.")
         if project_state != "active":
             next_action += f" Project is {project_state}; execution is not admitted."
+    elif project_state == "awaiting_acceptance":
+        integration = status.get("integration") or {}
+        next_action = ("The integrated project is waiting for your acceptance. Inspect the files at "
+                       f"{integration.get('path')} and the report at {integration.get('report')}, then either accept "
+                       f"it: accept {status['project_id']} --authorization 'reason', or return it with feedback: "
+                       f"reject {status['project_id']} --feedback 'what is wrong' [--module KEY] --authorization 'reason'.")
     elif project_state != "active":
         next_action = (f"Project is {project_state}; execution is not admitted. "
                        "Master should inspect lifecycle and outcome evidence.")
@@ -90,6 +98,14 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
                             f"evidence requests={module.get('evidence_rounds', 0)}/{evidence_limit}.")
         next_action += (" Independent modules keep running; to give a blocked module more attempts with the same owner "
                         "and context: rearm " + status["project_id"] + " --module KEY --authorization 'reason'.")
+    elif waiting_user:
+        next_action = ("Owners are waiting for your answer: "
+                       + " ".join(f"{item['module']}: {item.get('question_for_user') or item.get('question')}"
+                                  + (f" Options: {item['options']}." if item.get("options") else "")
+                                  + (f" Owner recommends: {item['recommendation']}." if item.get("recommendation") else "")
+                                  for item in waiting_user)
+                       + " Answer with: answer " + status["project_id"] + " --module KEY --text 'answer' "
+                       "--authorization 'reason'. Other modules continue on the next run.")
     elif pending_reviews:
         next_action = ("Resume Master review of submitted candidates for modules: "
                        + ", ".join(pending_reviews) + ".")
@@ -106,6 +122,9 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
         if continuing:
             next_action += (" Owners continue interrupted work from preserved checkpoints: "
                             + ", ".join(sorted(continuing)) + ".")
+        asked = sorted(item["module"] for item in questions if item.get("state") == "awaiting_decision")
+        if asked:
+            next_action += " The Master answers the owners' questions first: " + ", ".join(asked) + "."
         if admission == "pending":
             next_action += " The next run first asks the Master for project admission; no module work starts before approval."
             if failed_admissions:

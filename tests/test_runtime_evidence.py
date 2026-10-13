@@ -69,6 +69,7 @@ class EvidenceBundleTests(unittest.TestCase):
     def test_old_contract_identity_is_preserved_and_test_scope_is_explicit(self):
         spec = ProjectSpec(str(self.root), 'Deliver', (ModuleSpec('one','Deliver',('one.py',)),), 10000)
         old = asdict(spec); old.pop('max_evidence_rounds')
+        for name in ('interfaces', 'acceptance_directory', 'acceptance_checks'): old.pop(name)
         for module in old['modules']: module.pop('test_paths'); module.pop('test_validation')
         self.assertEqual(spec.fingerprint, digest(old))
         with self.assertRaises(ContractError): ModuleSpec('one','Deliver',('one.py',),test_paths=('outside.py',),test_validation=(ValidationStep(('python','tests.py')),))

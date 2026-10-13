@@ -5,7 +5,8 @@ from dataclasses import MISSING, fields
 import json
 from pathlib import Path
 
-from .contracts import ContractError, ModuleSpec, ProjectSpec, RuntimePolicy, ValidationStep
+from .contracts import (AcceptanceCheck, ContractError, InterfaceSpec, ModuleSpec, ProjectSpec, RuntimePolicy,
+                        ValidationStep)
 
 __all__ = ["load_handoff", "load_handoff_with_policy", "describe_handoff"]
 
@@ -36,8 +37,12 @@ def load_handoff(path: str | Path) -> ProjectSpec:
     return load_handoff_with_policy(path)[0]
 
 
-def load_handoff_with_policy(path: str | Path) -> tuple[ProjectSpec, RuntimePolicy]:
-    """Load the contract and its optional runtime_policy (kept outside contract identity)."""
+def load_handoff_with_policy(path: str | Path, defaults: dict | None = None) -> tuple[ProjectSpec, RuntimePolicy]:
+    """Load the contract and its optional runtime_policy (kept outside contract identity).
+
+    defaults are policy values applied where the handoff's runtime_policy is
+    silent; `init` passes the operator-mode defaults.
+    """
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"),
                           parse_constant=_reject_constant)
@@ -54,10 +59,16 @@ def load_handoff_with_policy(path: str | Path) -> tuple[ProjectSpec, RuntimePoli
                     _check_fields(step, ValidationStep, f"{location}.{group}[{step_index}]")
         for index, step in enumerate(data.get("integration_validation", ())):
             _check_fields(step, ValidationStep, f"integration_validation[{index}]")
+        for index, item in enumerate(data.get("interfaces", ())):
+            _check_fields(item, InterfaceSpec, f"interfaces[{index}]")
+        for index, item in enumerate(data.get("acceptance_checks", ())):
+            _check_fields(item, AcceptanceCheck, f"acceptance_checks[{index}]")
         spec = ProjectSpec.from_dict(data)
         # Admission must also support the contract's canonical identity. This
         # catches numeric overflow and invalid Unicode without a second schema.
         spec.fingerprint
+        if defaults and (policy_data is None or isinstance(policy_data, dict)):
+            policy_data = {**defaults, **(policy_data or {})}
         policy = RuntimePolicy.from_dict(policy_data, POLICY_KEY).validate_for(spec)
         return spec, policy
     except (ContractError, OSError, ValueError, TypeError, KeyError,
@@ -85,4 +96,6 @@ def describe_handoff(spec: ProjectSpec) -> dict:
         "model": spec.model,
         "effort": spec.effort,
         "forbidden_effects": list(spec.forbidden_effects),
+        "interfaces": [item.name for item in spec.interfaces],
+        "acceptance_checks": [check.name for check in spec.acceptance_checks],
     }

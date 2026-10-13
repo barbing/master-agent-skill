@@ -105,6 +105,46 @@ class ValidationStep:
             raise ContractError("Validation timeout must be between 1 and 600 seconds")
 
 
+def _check_name(value, kind):
+    if not isinstance(value, str) or not value or not all(c.isalnum() or c in "-_." for c in value):
+        raise ContractError(f"{kind} names use letters, digits, dots, hyphens and underscores")
+
+
+@dataclass(frozen=True)
+class InterfaceSpec:
+    """An admitted contract one module provides and named modules consume.
+
+    Consumers need not depend on the owner: they can be built in parallel
+    against the contract text, and integration checks prove the composition.
+    """
+    name: str
+    owner: str
+    contract: str
+    consumers: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        _check_name(self.name, "Interface")
+        if not isinstance(self.contract, str) or not self.contract.strip():
+            raise ContractError(f"Interface {self.name} needs contract text")
+        if self.owner in self.consumers or len(set(self.consumers)) != len(self.consumers):
+            raise ContractError(f"Interface {self.name} consumers must be unique and exclude its owner")
+
+
+@dataclass(frozen=True)
+class AcceptanceCheck:
+    """A user-supplied check kept private from every agent; its results go to the user."""
+    name: str
+    argv: tuple[str, ...]
+    timeout_seconds: int = 60
+    description: str = ""
+
+    def __post_init__(self):
+        _check_name(self.name, "Acceptance check")
+        ValidationStep(self.argv, self.timeout_seconds)
+        if not isinstance(self.description, str):
+            raise ContractError(f"Acceptance check {self.name} description must be text")
+
+
 @dataclass(frozen=True)
 class ModuleSpec:
     key: str
@@ -147,6 +187,9 @@ class ProjectSpec:
     forbidden_effects: tuple[str, ...] = tuple(sorted(FORBIDDEN_EFFECTS))
     integration_validation: tuple[ValidationStep, ...] = ()
     max_evidence_rounds: int = 2
+    interfaces: tuple[InterfaceSpec, ...] = ()
+    acceptance_directory: str | None = None
+    acceptance_checks: tuple[AcceptanceCheck, ...] = ()
 
     def __post_init__(self):
         root = Path(self.root)
@@ -180,6 +223,24 @@ class ProjectSpec:
                     raise ContractError("Module write scopes overlap; use one coherent owner")
         if not FORBIDDEN_EFFECTS <= set(self.forbidden_effects):
             raise ContractError("This initial runtime cannot admit irreversible/external effects")
+        names = [item.name for item in self.interfaces]
+        if len(set(names)) != len(names):
+            raise ContractError("Interface names must be unique")
+        for item in self.interfaces:
+            if item.owner not in keys or not set(item.consumers) <= keys:
+                raise ContractError(f"Interface {item.name} names an unknown owner or consumer module")
+        if self.acceptance_checks or self.acceptance_directory is not None:
+            if not self.acceptance_checks or self.acceptance_directory is None:
+                raise ContractError("Private acceptance checks need both a directory and at least one check")
+            directory = Path(self.acceptance_directory)
+            if not directory.is_absolute() or not directory.is_dir() or directory.is_symlink():
+                raise ContractError("Acceptance directory must be an existing absolute real directory")
+            resolved, project = directory.resolve(), root.resolve()
+            if resolved == project or project in resolved.parents or resolved in project.parents:
+                raise ContractError("Acceptance directory must be outside the project tree so no agent can read it")
+            check_names = [check.name for check in self.acceptance_checks]
+            if len(set(check_names)) != len(check_names):
+                raise ContractError("Acceptance check names must be unique")
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -189,6 +250,9 @@ class ProjectSpec:
             if not module['test_paths']: module.pop('test_paths')
             if not module['test_validation']: module.pop('test_validation')
         if self.max_evidence_rounds == 2: data.pop('max_evidence_rounds')
+        if not self.interfaces: data.pop('interfaces')
+        if self.acceptance_directory is None: data.pop('acceptance_directory')
+        if not self.acceptance_checks: data.pop('acceptance_checks')
         return data
 
     @classmethod
@@ -207,6 +271,11 @@ class ProjectSpec:
             modules.append(ModuleSpec(**item))
         data["integration_validation"] = tuple(ValidationStep(tuple(x["argv"]), x.get("timeout_seconds", 60))
             for x in data.get("integration_validation", ()))
+        data["interfaces"] = tuple(InterfaceSpec(x["name"], x["owner"], x["contract"], tuple(x.get("consumers", ())))
+                                   for x in data.get("interfaces", ()))
+        data["acceptance_checks"] = tuple(AcceptanceCheck(x["name"], tuple(x["argv"]), x.get("timeout_seconds", 60),
+                                                          x.get("description", ""))
+                                          for x in data.get("acceptance_checks", ()))
         if "forbidden_effects" in data:
             data["forbidden_effects"] = tuple(data["forbidden_effects"])
         return cls(modules=tuple(modules), **data)
@@ -232,9 +301,16 @@ POLICY_INTEGER_LIMITS = {
     "max_continuations": (0, 20),
     "max_transient_retries": (0, 10),
     "transient_backoff_seconds": (0, 3600),
+    "max_decisions": (0, 20),
 }
-POLICY_FLAGS = ("admission_review", "structured_review", "fail_fast_failed_checks")
+POLICY_FLAGS = ("admission_review", "structured_review", "fail_fast_failed_checks", "preflight")
 PRICE_FIELDS = ("input", "cached_input", "output", "cache_write")
+FINAL_ACCEPTANCE = ("master", "user")
+MODULE_REVIEW = ("always", "checks_only")
+# Operator mode, applied by `init` to new handoffs unless their runtime_policy
+# says otherwise: a host preflight replaces the Master admission turn, and the
+# user is the final checker of the integrated project.
+OPERATOR_POLICY = {"admission_review": False, "preflight": True, "final_acceptance": "user"}
 
 
 def _strict_fields(data, contract, location):
@@ -291,6 +367,12 @@ class RuntimePolicy:
     master: ActorRuntime | None = None
     modules: dict = field(default_factory=dict)
     prices: dict = field(default_factory=dict)
+    preflight: bool = False
+    final_acceptance: str = "master"
+    module_review: str = "always"
+    review_modules: tuple = ()
+    max_decisions: int = 3
+    master_token_budget: int | None = None
 
     def __post_init__(self):
         for name, (low, high) in POLICY_INTEGER_LIMITS.items():
@@ -317,6 +399,16 @@ class RuntimePolicy:
                     or any(isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 for v in row.values()):
                 raise ContractError(f"Invalid price row for model {model!r}; use input/output (and optional "
                                     "cached_input/cache_write) USD per million tokens")
+        if self.final_acceptance not in FINAL_ACCEPTANCE:
+            raise ContractError(f"Runtime policy final_acceptance must be one of {list(FINAL_ACCEPTANCE)}")
+        if self.module_review not in MODULE_REVIEW:
+            raise ContractError(f"Runtime policy module_review must be one of {list(MODULE_REVIEW)}")
+        if not isinstance(self.review_modules, tuple) or len(set(self.review_modules)) != len(self.review_modules) \
+                or any(not isinstance(key, str) or not key for key in self.review_modules):
+            raise ContractError("Runtime policy review_modules must list distinct module keys")
+        budget = self.master_token_budget
+        if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
+            raise ContractError("Runtime policy master_token_budget must be a positive integer when set")
 
     @classmethod
     def from_dict(cls, data, location="runtime_policy"):
@@ -332,6 +424,10 @@ class RuntimePolicy:
                                for key, value in data["modules"].items()}
         if "prices" in data and not isinstance(data["prices"], dict):
             raise ContractError(f"{location}.prices must be a JSON object")
+        if "review_modules" in data:
+            if not isinstance(data["review_modules"], (list, tuple)):
+                raise ContractError(f"{location}.review_modules must be a list of module keys")
+            data["review_modules"] = tuple(data["review_modules"])
         return cls(**data)
 
     def to_dict(self):
@@ -347,15 +443,21 @@ class RuntimePolicy:
                 value = {key: runtime.to_dict() for key, runtime in sorted(value.items())}
             elif item.name == "prices":
                 value = {key: dict(sorted(row.items())) for key, row in sorted(value.items())}
+            elif item.name == "review_modules":
+                value = sorted(value)
             result[item.name] = value
         return result
 
     def validate_for(self, spec):
         keys = {module.key for module in spec.modules}
-        unknown = sorted(set(self.modules) - keys)
+        unknown = sorted((set(self.modules) | set(self.review_modules)) - keys)
         if unknown:
             raise ContractError(f"Runtime policy names unknown modules: {', '.join(unknown)}")
         return self
+
+    def host_reviews(self, module_key):
+        """True when admitted checks, not a Master turn, decide this module's acceptance."""
+        return self.module_review == "checks_only" and module_key not in self.review_modules
 
     def runtime_for(self, spec, module_key=None):
         """Resolve one actor's runtime. module_key None means the Master.

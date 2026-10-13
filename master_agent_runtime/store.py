@@ -181,7 +181,8 @@ class Store:
                                     'operator_rounds': 'INTEGER NOT NULL DEFAULT 0',
                                     'continuations': 'INTEGER NOT NULL DEFAULT 0',
                                     'transient_failures': 'INTEGER NOT NULL DEFAULT 0',
-                                    'retry_after': 'REAL', 'checkpoint': 'TEXT', 'checkpoint_hash': 'TEXT'},
+                                    'retry_after': 'REAL', 'checkpoint': 'TEXT', 'checkpoint_hash': 'TEXT',
+                                    'decisions': 'INTEGER NOT NULL DEFAULT 0', 'pending_question': 'TEXT'},
                          'candidate': {'evidence': 'TEXT', 'evidence_hash': 'TEXT', 'at': 'REAL'},
                          'project': {'policy': "TEXT NOT NULL DEFAULT '{}'",
                                      'usage_detail': "TEXT NOT NULL DEFAULT '{}'",
@@ -495,23 +496,26 @@ class Store:
             spec = ProjectSpec.from_dict(json.loads(project["spec"]))
             if module_key not in {m.key for m in spec.modules} or not reason.strip():
                 raise ContractError("Invalid module revision request")
-            affected = {module_key}
-            while True:
-                expanded = affected | {m.key for m in spec.modules if set(m.dependencies) & affected}
-                if expanded == affected:
-                    break
-                affected = expanded
-            for key in affected:
-                row = con.execute('SELECT * FROM module WHERE project_id=? AND key=?', (actor['project_id'], key)).fetchone()
-                if row['state'] == 'blocked':
-                    raise ConflictError('Blocked work cannot be rearmed through dependency invalidation')
-                con.execute("UPDATE module SET revision=revision+1,state='ready',accepted_candidate=NULL,"
-                            "checkpoint=NULL,checkpoint_hash=NULL,continuations=0,retry_after=NULL "
-                            "WHERE project_id=? AND key=?", (actor["project_id"], key))
-                owner = f"{actor['project_id']}:module:{key}"
-                con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)", (uuid.uuid4().hex, owner, canonical({"instructions": reason, "input_revision_changed": True}), time.time()))
-            self.event(con, actor["project_id"], "module-inputs-invalidated", {"modules": sorted(affected), "reason": reason})
-            return sorted(affected)
+            return self._invalidate(con, actor["project_id"], spec, (module_key,), reason)
+
+    def _invalidate(self, con, project_id, spec, keys, reason):
+        affected = set(keys)
+        while True:
+            expanded = affected | {m.key for m in spec.modules if set(m.dependencies) & affected}
+            if expanded == affected:
+                break
+            affected = expanded
+        for key in affected:
+            row = con.execute('SELECT * FROM module WHERE project_id=? AND key=?', (project_id, key)).fetchone()
+            if row['state'] == 'blocked':
+                raise ConflictError('Blocked work cannot be rearmed through dependency invalidation')
+            con.execute("UPDATE module SET revision=revision+1,state='ready',accepted_candidate=NULL,"
+                        "checkpoint=NULL,checkpoint_hash=NULL,continuations=0,retry_after=NULL "
+                        "WHERE project_id=? AND key=?", (project_id, key))
+            owner = f"{project_id}:module:{key}"
+            con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)", (uuid.uuid4().hex, owner, canonical({"instructions": reason, "input_revision_changed": True}), time.time()))
+        self.event(con, project_id, "module-inputs-invalidated", {"modules": sorted(affected), "reason": reason})
+        return sorted(affected)
 
     def mark_started(self, operation_id, remote_id):
         if not remote_id:
@@ -592,7 +596,7 @@ class Store:
                 con.execute("UPDATE project SET unpriced_tokens=unpriced_tokens+? WHERE id=?", (delta, actor["project_id"]))
             return delta
 
-    def settle(self, operation_id, *, state="done", evidence: str):
+    def settle(self, operation_id, *, state="done", evidence: str, checkpoint=None):
         if state not in {"done", "failed", "cancelled"} or not evidence:
             raise ContractError("Terminal settlement requires actual runtime/effect evidence")
         with self.transaction() as con:
@@ -604,7 +608,119 @@ class Store:
             con.execute("UPDATE actor SET state='idle' WHERE id=?", (row["actor_id"],))
             if row["actor_kind"] == "module" and row["kind"] != "binding" and state != "done":
                 con.execute("UPDATE module SET state='blocked' WHERE owner=?", (row["actor_id"],))
+            if checkpoint and row["actor_kind"] == "module" and row["kind"] == "work":
+                # The owner's files at a blocked stop carry into its next activation.
+                con.execute("UPDATE module SET checkpoint=?,checkpoint_hash=? WHERE owner=?",
+                            (checkpoint["path"], checkpoint["tree_hash"], row["actor_id"]))
             self.event(con, row["project_id"], "native-operation-settled", {"operation": operation_id, "state": state, "evidence": evidence})
+
+    # ---- Owner decision requests ----
+
+    def settle_decision(self, operation_id, *, request, evidence, checkpoint=None, max_decisions=3):
+        """Settle an owner turn that ended with a decision request, keeping its files.
+
+        The Master answers within the brief or escalates to the user. Past the
+        per-module bound the question goes to the user directly.
+        """
+        question = str((request or {}).get("question") or "").strip()
+        if not question or not evidence:
+            raise ContractError("A decision request needs a question and settlement evidence")
+        with self.transaction() as con:
+            row = con.execute("SELECT o.*,a.project_id,a.kind AS actor_kind FROM operation o "
+                              "JOIN actor a ON a.id=o.actor_id WHERE o.id=?", (operation_id,)).fetchone()
+            if not row or row["actor_kind"] != "module" or row["kind"] != "work" or row["status"] not in ACTIVE_STATUSES:
+                raise ConflictError("Only an unsettled module work turn can request a decision")
+            module = con.execute("SELECT * FROM module WHERE owner=?", (row["actor_id"],)).fetchone()
+            if module["state"] != "working":
+                raise ConflictError("Module is not working; no decision can be requested")
+            con.execute("UPDATE operation SET status='done',error=?,outcome='needs_decision' WHERE id=?",
+                        (evidence, operation_id))
+            con.execute("UPDATE project SET reserved=reserved-? WHERE id=?", (row["reserve"], row["project_id"]))
+            con.execute("UPDATE actor SET state='idle' WHERE id=?", (row["actor_id"],))
+            if checkpoint:
+                con.execute("UPDATE module SET checkpoint=?,checkpoint_hash=? WHERE owner=?",
+                            (checkpoint["path"], checkpoint["tree_hash"], row["actor_id"]))
+            options = [str(item).strip() for item in (request.get("options") or []) if str(item).strip()][:10]
+            recommendation = request.get("recommendation")
+            pending = {"module": module["key"], "question": question, "options": options,
+                       "recommendation": str(recommendation).strip() if recommendation else None,
+                       "summary": str(request.get("summary") or ""), "operation": operation_id}
+            decisions = (module["decisions"] or 0) + 1
+            if decisions > max_decisions:
+                state = "awaiting_user"
+                pending.update(escalated_by="host", reason=f"decision limit of {max_decisions} for this module reached")
+                con.execute("UPDATE module SET state=?,decisions=?,pending_question=?,failure_kind='decision_escalated',"
+                            "failure_reason=?,recovery_action='user_answer',transient_failures=0,retry_after=NULL WHERE owner=?",
+                            (state, decisions, canonical(pending), pending["reason"], row["actor_id"]))
+                self.event(con, row["project_id"], "decision-escalated", pending)
+            else:
+                state = "awaiting_decision"
+                con.execute("UPDATE module SET state=?,decisions=?,pending_question=?,failure_kind=NULL,failure_reason=NULL,"
+                            "recovery_action='master_answer',transient_failures=0,retry_after=NULL WHERE owner=?",
+                            (state, decisions, canonical(pending), row["actor_id"]))
+                con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'decision_request',?,?)",
+                            (uuid.uuid4().hex, f"{row['project_id']}:master", canonical(pending), time.time()))
+                self.event(con, row["project_id"], "decision-requested", pending)
+            self.event(con, row["project_id"], "native-operation-settled",
+                       {"operation": operation_id, "state": "done", "evidence": evidence})
+            return state
+
+    @staticmethod
+    def _ack_decision_requests(con, project_id, module_key):
+        for item in con.execute("SELECT id,payload FROM message WHERE target=? AND kind='decision_request' "
+                                "AND status='pending'", (f"{project_id}:master",)).fetchall():
+            if _json(item["payload"], {}).get("module") == module_key:
+                con.execute("UPDATE message SET status='acked' WHERE id=?", (item["id"],))
+
+    def _deliver_answer(self, con, project_id, module_key, answer, rationale, source, expected, authorization=None):
+        module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (project_id, module_key)).fetchone()
+        if not module:
+            raise ContractError("Unknown module")
+        if module["state"] not in expected:
+            raise ConflictError(f"Module {module_key} has no pending question to answer")
+        pending = _json(module["pending_question"], {})
+        payload = {"question": pending.get("question"), "answer": answer, "rationale": rationale, "source": source}
+        if authorization:
+            payload["authorization"] = authorization
+        con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'decision',?,?)",
+                    (uuid.uuid4().hex, module["owner"], canonical(payload), time.time()))
+        # The owner resumes the same session from the files it had when it asked.
+        con.execute("UPDATE module SET state='continuing',pending_question=NULL,failure_kind=NULL,failure_reason=NULL,"
+                    "recovery_action='decision_answered',transient_failures=0,retry_after=NULL "
+                    "WHERE project_id=? AND key=?", (project_id, module_key))
+        self._ack_decision_requests(con, project_id, module_key)
+        self.event(con, project_id, "decision-answered", {"module": module_key, **payload})
+
+    def answer_decision(self, master: Principal, module_key, *, answer, rationale):
+        if not isinstance(answer, str) or not answer.strip():
+            raise ContractError("A decision answer needs text")
+        with self.transaction() as con:
+            actor = self.authorize(con, master, "master")
+            self._deliver_answer(con, actor["project_id"], module_key, answer.strip(), rationale, "master",
+                                 ("awaiting_decision",))
+
+    def escalate_decision(self, master: Principal, module_key, *, question_for_user, rationale, source="master"):
+        with self.transaction() as con:
+            actor = self.authorize(con, master, "master")
+            module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?",
+                                 (actor["project_id"], module_key)).fetchone()
+            if not module or module["state"] != "awaiting_decision":
+                raise ConflictError(f"Module {module_key} has no pending question to escalate")
+            pending = _json(module["pending_question"], {})
+            pending.update(escalated_by=source, master_rationale=rationale,
+                           question_for_user=(question_for_user or "").strip() or pending.get("question"))
+            con.execute("UPDATE module SET state='awaiting_user',pending_question=?,failure_kind='decision_escalated',"
+                        "failure_reason=?,recovery_action='user_answer' WHERE project_id=? AND key=?",
+                        (canonical(pending), pending["question_for_user"], actor["project_id"], module_key))
+            self._ack_decision_requests(con, actor["project_id"], module_key)
+            self.event(con, actor["project_id"], "decision-escalated", pending)
+
+    def actor_usage(self, actor_id):
+        con = self.connect()
+        try:
+            return con.execute("SELECT coalesce(sum(usage),0) FROM operation WHERE actor_id=?", (actor_id,)).fetchone()[0]
+        finally:
+            con.close()
 
     def submit(self, principal: Principal, candidate_id, *, tree_hash, snapshot,
                inputs: dict, validation: list, summary: str, operation_id: str):
@@ -800,7 +916,9 @@ class Store:
                 return True
             return False
 
-    def record_integration(self, master, path, module_bindings, validation):
+    def record_integration(self, master, path, module_bindings, validation, *, user_gate=False, extra=None):
+        """Record an integration outcome. With user_gate a passing integration
+        waits for the user's acceptance instead of accepting the project."""
         with self.transaction() as con:
             actor = self.authorize(con, master, "master")
             modules = list(con.execute("SELECT * FROM module WHERE project_id=?", (actor["project_id"],)))
@@ -813,10 +931,120 @@ class Store:
             if live:
                 raise ConflictError("Integration has unsettled owned operations")
             passed = bool(validation) and all(x.get("status") == "passed" for x in validation)
-            self.event(con, actor["project_id"], "integration-accepted" if passed else "integration-failed", {
-                "path": path, "modules": module_bindings, "validation": validation})
+            payload = {"path": path, "modules": module_bindings, "validation": validation, **(extra or {})}
+            if passed and user_gate:
+                self.event(con, actor["project_id"], "integration-passed", payload)
+                con.execute("UPDATE project SET state='awaiting_acceptance' WHERE id=?", (actor["project_id"],))
+                return
+            self.event(con, actor["project_id"], "integration-accepted" if passed else "integration-failed", payload)
             if passed:
                 con.execute("UPDATE project SET state='accepted' WHERE id=?", (actor["project_id"],))
+
+    # ---- The user as final checker ----
+
+    def operator_accept(self, project_id, *, authorization):
+        """The user accepts the integrated project after inspecting it."""
+        authorization = _require_authorization(authorization)
+        with self.transaction() as con:
+            project = con.execute("SELECT state FROM project WHERE id=?", (project_id,)).fetchone()
+            if not project or project["state"] != "awaiting_acceptance":
+                raise ConflictError("Project is not awaiting your acceptance")
+            row = con.execute("SELECT payload FROM event WHERE project_id=? AND kind='integration-passed' "
+                              "ORDER BY seq DESC LIMIT 1", (project_id,)).fetchone()
+            if not row:
+                raise ConflictError("No passed integration is recorded for acceptance")
+            payload = json.loads(row["payload"])
+            modules = list(con.execute("SELECT * FROM module WHERE project_id=?", (project_id,)))
+            if any(m["state"] != "accepted" or payload["modules"].get(m["key"]) != {
+                    "candidate": m["accepted_candidate"], "revision": m["revision"]} for m in modules):
+                raise ConflictError("Modules changed after the integration passed; run the project again")
+            self.event(con, project_id, "user-accepted", {"authorization": authorization, "path": payload["path"]})
+            self.event(con, project_id, "integration-accepted",
+                       {**payload, "accepted_by": "user", "authorization": authorization})
+            con.execute("UPDATE project SET state='accepted' WHERE id=?", (project_id,))
+            return payload
+
+    def operator_reject(self, project_id, *, feedback, modules=(), authorization):
+        """The user returns the integrated project with feedback.
+
+        Named modules (and their dependents) go back to their owners now;
+        without names the Master maps the feedback to modules on the next run.
+        """
+        authorization = _require_authorization(authorization)
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise ContractError("A rejection needs feedback for the owners")
+        with self.transaction() as con:
+            project = con.execute("SELECT * FROM project WHERE id=?", (project_id,)).fetchone()
+            if not project or project["state"] != "awaiting_acceptance":
+                raise ConflictError("Project is not awaiting your acceptance")
+            spec = ProjectSpec.from_dict(json.loads(project["spec"]))
+            named = sorted(set(modules))
+            unknown = sorted(set(named) - {m.key for m in spec.modules})
+            if unknown:
+                raise ContractError(f"Unknown modules: {', '.join(unknown)}")
+            con.execute("UPDATE project SET state='active' WHERE id=?", (project_id,))
+            affected = []
+            if named:
+                affected = self._invalidate(con, project_id, spec, named,
+                                            "The user rejected the integrated project: " + feedback.strip())
+                for key in named:
+                    con.execute("UPDATE module SET operator_rounds=operator_rounds+1 WHERE project_id=? AND key=?",
+                                (project_id, key))
+            self.event(con, project_id, "user-rejected", {"feedback": feedback.strip(), "modules": named,
+                                                          "affected": affected, "authorization": authorization})
+            return affected
+
+    def untriaged_rejection(self, project_id):
+        """The latest user rejection that named no modules and has not been mapped yet."""
+        con = self.connect()
+        try:
+            row = con.execute("SELECT kind,payload FROM event WHERE project_id=? AND kind IN "
+                              "('user-rejected','user-feedback-triaged') ORDER BY seq DESC LIMIT 1",
+                              (project_id,)).fetchone()
+        finally:
+            con.close()
+        if row and row["kind"] == "user-rejected":
+            payload = json.loads(row["payload"])
+            if not payload.get("modules"):
+                return payload
+        return None
+
+    def record_triage(self, master, *, affected, rationale, feedback):
+        """Master maps unnamed user feedback to modules; none means back to the user."""
+        with self.transaction() as con:
+            actor = self.authorize(con, master, "master")
+            project_id = actor["project_id"]
+            project = con.execute("SELECT spec FROM project WHERE id=?", (project_id,)).fetchone()
+            spec = ProjectSpec.from_dict(json.loads(project["spec"]))
+            named = sorted(set(affected))
+            if set(named) - {m.key for m in spec.modules}:
+                raise ContractError("Triage named unknown modules")
+            result = []
+            if named:
+                result = self._invalidate(con, project_id, spec, named,
+                    f"The user rejected the integrated project: {feedback}\nMaster triage: {rationale}")
+                for key in named:
+                    con.execute("UPDATE module SET operator_rounds=operator_rounds+1 WHERE project_id=? AND key=?",
+                                (project_id, key))
+            elif con.execute("SELECT 1 FROM event WHERE project_id=? AND kind='integration-passed'",
+                             (project_id,)).fetchone():
+                # Nothing to change: the unchanged integration goes back to the user.
+                con.execute("UPDATE project SET state='awaiting_acceptance' WHERE id=?", (project_id,))
+            self.event(con, project_id, "user-feedback-triaged",
+                       {"affected": result, "rationale": rationale, "feedback": feedback})
+            return result
+
+    def operator_answer(self, project_id, module_key, *, answer, authorization):
+        """The user answers an owner's escalated (or still pending) question."""
+        authorization = _require_authorization(authorization)
+        if not isinstance(answer, str) or not answer.strip():
+            raise ContractError("An answer needs text")
+        with self.transaction() as con:
+            project = con.execute("SELECT state FROM project WHERE id=?", (project_id,)).fetchone()
+            if not project or project["state"] != "active":
+                raise ConflictError("Only an active project's questions can be answered")
+            self._deliver_answer(con, project_id, module_key, answer.strip(), "Answered by the user", "user",
+                                 ("awaiting_user", "awaiting_decision"), authorization=authorization)
 
     def status(self, project_id):
         con = self.connect()
@@ -834,7 +1062,19 @@ class Store:
                 if review:
                     module.update(failure_kind='legacy_review_rejection', failure_reason=review['rationale'],
                                   recovery_action='inspect_preserved_rejection_no_automatic_rearming')
+            questions = [{"module": module["key"], "state": module["state"], **_json(module.get("pending_question"), {})}
+                         for module in modules if module["state"] in ("awaiting_decision", "awaiting_user")]
+            role = {"master": 0, "owners": 0}
+            for usage, kind in con.execute("SELECT o.usage,a.kind FROM operation o JOIN actor a ON a.id=o.actor_id "
+                                           "WHERE a.project_id=?", (project_id,)):
+                role["master" if kind == "master" else "owners"] += usage or 0
+            integration = con.execute("SELECT kind,payload FROM event WHERE project_id=? AND kind IN "
+                                      "('integration-passed','integration-accepted') ORDER BY seq DESC LIMIT 1",
+                                      (project_id,)).fetchone()
+            integration = ({"kind": integration["kind"], "path": _json(integration["payload"], {}).get("path"),
+                            "report": _json(integration["payload"], {}).get("report")} if integration else None)
             return {"project_id": project_id, "state": project["state"],
+                    "pending_questions": questions, "usage_by_role": role, "integration": integration,
                     "token_budget": json.loads(project['spec'])['token_budget'], "spent_tokens": project["spent"],
                     "usage_detail": _json(project.get("usage_detail"), {}),
                     "estimated_cost_usd": project.get("cost_usd", 0.0),
@@ -970,16 +1210,29 @@ class Store:
                        {"module": module_key, "failure_kind": failure_kind, "reason": reason, "action": action})
 
     def note_review_unavailable(self, project_id, module_key, *, reason, max_retries=3, backoff_seconds=30):
-        """A Master review could not complete; retry later or block after the bound."""
+        """A Master review could not complete; retry later or block after the bound.
+
+        An unanswerable decision request goes to the user instead of blocking.
+        """
         with self.transaction() as con:
             module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (project_id, module_key)).fetchone()
-            if not module or module["state"] not in ("awaiting_review", "awaiting_evidence"):
+            if not module or module["state"] not in ("awaiting_review", "awaiting_evidence", "awaiting_decision"):
                 return None
             failures = module["transient_failures"] + 1
             if failures <= max_retries:
                 state = module["state"]
                 con.execute("UPDATE module SET transient_failures=?,retry_after=? WHERE project_id=? AND key=?",
                             (failures, time.time() + backoff_seconds * 2 ** (failures - 1), project_id, module_key))
+            elif module["state"] == "awaiting_decision":
+                state = "awaiting_user"
+                pending = _json(module["pending_question"], {})
+                pending.update(escalated_by="host", reason="The Master could not answer: " + reason)
+                con.execute("UPDATE module SET state='awaiting_user',transient_failures=?,retry_after=NULL,pending_question=?,"
+                            "failure_kind='decision_unavailable',failure_reason=?,recovery_action='user_answer' "
+                            "WHERE project_id=? AND key=?",
+                            (failures, canonical(pending), pending["reason"], project_id, module_key))
+                self._ack_decision_requests(con, project_id, module_key)
+                self.event(con, project_id, "decision-escalated", pending)
             else:
                 state = "blocked"
                 con.execute("UPDATE module SET state='blocked',transient_failures=?,failure_kind='review_unavailable',"

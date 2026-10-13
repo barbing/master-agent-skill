@@ -17,13 +17,15 @@ from contextlib import closing
 
 import asyncio
 import errno
+import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .artifacts import capture, context_hashes, file_names, owned_path, verify
 from .contracts import (AuthorityError, BudgetError, ConflictError, ContractError, DispatchRejected,
@@ -39,9 +41,17 @@ from .evidence import command_observation, seal_review_evidence, verify_review_e
 
 
 MODULE_OUTPUT = {"type": "object", "properties": {
-    "status": {"type": "string", "enum": ["submitted", "blocked"]},
-    "summary": {"type": "string"}, "issues": {"type": "array", "items": {"type": "string"}}},
-    "required": ["status", "summary", "issues"], "additionalProperties": False}
+    "status": {"type": "string", "enum": ["submitted", "needs_decision", "blocked"]},
+    "summary": {"type": "string"}, "issues": {"type": "array", "items": {"type": "string"}},
+    "question": {"type": ["string", "null"]},
+    "options": {"type": "array", "items": {"type": "string"}},
+    "recommendation": {"type": ["string", "null"]}},
+    "required": ["status", "summary", "issues", "question", "options", "recommendation"], "additionalProperties": False}
+DECISION_OUTPUT = {"type": "object", "properties": {
+    "action": {"type": "string", "enum": ["answer", "escalate"]},
+    "answer": {"type": "string"}, "rationale": {"type": "string"},
+    "question_for_user": {"type": ["string", "null"]}},
+    "required": ["action", "answer", "rationale", "question_for_user"], "additionalProperties": False}
 REVIEW_OUTPUT = {"type": "object", "properties": {
     "decision": {"type": "string", "enum": ["approve", "request_changes"]},
     "rationale": {"type": "string"}}, "required": ["decision", "rationale"], "additionalProperties": False}
@@ -63,6 +73,27 @@ STRUCTURED_REVIEW_OUTPUT = {"type": "object", "properties": {
     "required": ["decision", "rationale", "failure_kind", "blocking_issues", "advisories", "previous_issues"],
     "additionalProperties": False}
 OBLIGATION_CATEGORIES = ("objective", "module", "interface", "check", "owner_tests", "scope", "regression", "integration")
+# Fields the host already treats as optional. Claude Code validates structured
+# output after the model answers and retries the whole turn on a miss, so for
+# Claude actors these stay optional instead of costing full-context retries.
+# Codex constrains generation to the schema and keeps every field required.
+LENIENT_FIELDS = {"advisories": {"type": "array", "items": {"type": "string"}},
+                  "previous_issues": {"type": "array", "items": PREVIOUS_ISSUE},
+                  "question": {"type": ["string", "null"]},
+                  "options": {"type": "array", "items": {"type": "string"}},
+                  "recommendation": {"type": ["string", "null"]}}
+
+
+def lenient_schema(schema):
+    """The same contract with the host-optional fields optional, and tolerated where absent."""
+    if not isinstance(schema, dict) or "properties" not in schema:
+        return schema
+    properties = dict(schema["properties"])
+    if "blocking_issues" in properties:
+        properties.setdefault("advisories", LENIENT_FIELDS["advisories"])
+        properties.setdefault("previous_issues", LENIENT_FIELDS["previous_issues"])
+    return {**schema, "properties": properties,
+            "required": [name for name in schema.get("required", []) if name not in LENIENT_FIELDS]}
 SCOPE_ERRNOS = {errno.ELOOP, errno.EMLINK}
 
 
@@ -133,6 +164,10 @@ class Controller:
         self.snapshots = self.public / "candidates"
         self.checkpoints = self.public / "checkpoints"
         self.evidence = self.public / "validation"
+        # Outside public/: no agent profile can read the user's private checks,
+        # their logs or the reports written for the user.
+        self.private = self.state_root / "private"
+        self.reports = self.state_root / "reports"
         self.traces = self.state_root / "native-traces"
         self.cli = cli
         self.claude_cli = claude_cli or "claude"
@@ -196,6 +231,7 @@ class Controller:
         if kind == "master":
             return common + ("You are the non-implementing project Master. Review actual module code and evidence, "
                 "coordinate interfaces and return specific corrections to the existing owners. "
+                "Answer owners' decision requests within the project brief and escalate decisions that belong to the user. "
                 "Do not approve because a producer says PASS. Do not write production code.")
         return common + (f"You are the independent owner of module {module.key}. "
             f"Complete planning, implementation, testing and correction in this session. Objective: {module.objective}. "
@@ -203,7 +239,10 @@ class Controller:
             "Agent configuration and instruction files (.claude/, CLAUDE.md, .codex/, .agents/) are never deliverables. "
             "Use the readonly public project context for relevant source/requirements. "
             "Keep your internal planning in this session; do not create role packets or extra managed personas. "
-            "Return an honest submitted/blocked summary; the Master owns acceptance.")
+            "Decide choices inside your own module yourself. When a decision outside your module's authority blocks "
+            "you (an unclear requirement, an interface you do not own, scope), return needs_decision with one precise "
+            "question, the options and your recommendation; your files are preserved and you resume with the answer. "
+            "Return an honest submitted/needs_decision/blocked result; the Master owns acceptance.")
 
     def module_row(self, key):
         return next(m for m in self.store.modules(self.project_id) if m["key"] == key)
@@ -412,6 +451,8 @@ class Controller:
         payloads = [(x["kind"], json.loads(x["payload"])) for x in owned]
         corrections = [p.get("instructions", "") for kind, p in payloads if kind == "correction"]
         continuations = [p.get("instructions", "") for kind, p in payloads if kind == "continuation"]
+        answers = [{"question": p.get("question"), "answer": p.get("answer"), "from": p.get("source")}
+                   for kind, p in payloads if kind == "decision"]
         blocking = [issue for kind, p in payloads if kind == "correction" for issue in p.get("blocking_issues", [])]
         advisories = [item for kind, p in payloads if kind == "correction" for item in p.get("advisories", [])]
         message = (f"Project objective: {self.spec.objective}\n"
@@ -421,8 +462,15 @@ class Controller:
                    f"Actual accepted dependency source: {json.dumps({k: self.store.candidate(v['candidate'])['snapshot'] for k,v in inputs.items()})}\n"
                    f"Write only admitted module paths in your current workspace: {list(module.paths)}\n"
                    f"Latest corrections: {json.dumps(corrections)}\n")
+        interfaces = self.interface_brief(module)
+        if interfaces:
+            message += (interfaces + "Provide the interfaces you own exactly as written and code against the ones you "
+                        "consume; a provider you do not depend on is combined with your module at integration.\n")
         if continuations:
             message += f"Continuation: {continuations[-1]}\n"
+        if answers:
+            message += ("Answers to your questions; your files at the point you asked are preserved in your workspace: "
+                        + json.dumps(answers) + "\n")
         if blocking:
             message += ("Blocking issues the Master will verify on resubmission: "
                         + json.dumps(blocking) + "\n")
@@ -441,8 +489,20 @@ class Controller:
                     "The host records executed commands and independently reruns admitted checks against your sealed code/test version. "
                     "Use the admitted project view; do not inspect unrelated memories, sessions or original checkouts. "
                     "Inspect actual repository requirements and validate the complete requested behavior. "
-                    "Do not stop early at a partial implementation. Return only the constrained JSON submission.")
+                    "Do not stop early at a partial implementation. If a decision outside your module's authority blocks "
+                    "you, return status needs_decision with question, options and recommendation; otherwise set question "
+                    "and recommendation to null and options to []. Return only the constrained JSON result.")
         return message
+
+    def interface_brief(self, module=None):
+        """Admitted interface contracts relevant to one module, or all of them."""
+        items = [item for item in self.spec.interfaces
+                 if module is None or item.owner == module.key or module.key in item.consumers]
+        if not items:
+            return ""
+        return ("Admitted interface contracts: " + json.dumps([
+            {"name": item.name, "owner": item.owner, "consumers": list(item.consumers), "contract": item.contract}
+            for item in items]) + "\n")
 
     # ---- Native turns ----------------------------------------------------
 
@@ -471,6 +531,8 @@ class Controller:
         raise UnknownOutcome(f"{reason}: owned native service did not exit after interrupt")
 
     async def run_native_operation(self, actor, principal, operation, message, schema):
+        if getattr(actor, "provider", None) == "claude":
+            schema = lenient_schema(schema)
         before=len(getattr(actor,'events',[]) or [])
         kind = "master" if principal.actor_id.endswith(":master") else "module"
         limit = self.deadline(kind)
@@ -622,7 +684,8 @@ class Controller:
             output = json.loads(result["text"])
         except (TypeError, ValueError, KeyError):
             output = None
-        valid = isinstance(output, dict) and output.get("status") in ("submitted", "blocked")
+        valid = isinstance(output, dict) and output.get("status") in ("submitted", "needs_decision", "blocked") \
+            and (output.get("status") != "needs_decision" or bool(str(output.get("question") or "").strip()))
         shutdown = await actor.close()
         self.live.pop(actor_id, None)
         if not shutdown["process_exited"]:
@@ -633,15 +696,25 @@ class Controller:
                 evidence="completed native turn returned no valid structured submission; owned service exited; workspace fenced",
                 instructions=continuation_instructions("receipt_missing"), max_continuations=self.policy.max_continuations)
             return None
-        # Snapshot/publish effects are fenced away from the producer's own
-        # writable namespace. Escaped-process quiescence is not certified.
-        self.store.settle(operation, state="done" if output["status"] == "submitted" else "failed",
-            evidence="native turn completed; owned service exited; isolated workspace cannot write sealed/integration targets")
         if output["status"] != "submitted":
+            # The owner's files at a question or a blocked stop carry into its
+            # next activation instead of being discarded with the workspace.
+            checkpoint = self.capture_checkpoint(actor.workspace, module, operation, inputs, context, admitted["module_revision"])
+            if output["status"] == "needs_decision":
+                self.store.settle_decision(operation, request=output, checkpoint=checkpoint,
+                    evidence="native turn completed with a decision request; owned service exited; files checkpointed",
+                    max_decisions=self.policy.max_decisions)
+                return None
+            self.store.settle(operation, state="failed", checkpoint=checkpoint,
+                evidence="native turn completed with a blocked receipt; owned service exited; files checkpointed")
             self.store.annotate_module(self.project_id, module.key, failure_kind="owner_blocked",
                 reason=(output.get("summary") or "") + (" Issues: " + "; ".join(output.get("issues") or []) if output.get("issues") else ""),
                 action="master_or_operator_decision_then_rearm")
             return None
+        # Snapshot/publish effects are fenced away from the producer's own
+        # writable namespace. Escaped-process quiescence is not certified.
+        self.store.settle(operation, state="done",
+            evidence="native turn completed; owned service exited; isolated workspace cannot write sealed/integration targets")
         try:
             artifact = capture(actor.workspace, self.snapshots, module.paths,
                 bindings={"operation": operation, "module": module.key, "inputs": inputs,
@@ -668,7 +741,7 @@ class Controller:
         commands = list(getattr(actor, 'command_receipts', {}).values())
         await self.attach_candidate_evidence(candidate_id, commands=commands)
         for item in self.store.pending_messages(actor_id):
-            if item["kind"] in ("correction", "continuation"):
+            if item["kind"] in ("correction", "continuation", "decision"):
                 self.store.acknowledge(principal, item["id"])
         return candidate_id
 
@@ -750,8 +823,11 @@ class Controller:
 
     # ---- Master decisions --------------------------------------------------
 
-    async def master_decision(self, actor, principal, message, schema, *, kind, module_key=None):
-        """One Master turn. Returns (decision, operation) or (None, operation) when unavailable."""
+    async def master_decision(self, actor, principal, message, schema, *, kind, module_key=None, valid=None):
+        """One Master turn. Returns (decision, operation) or (None, operation) when unavailable.
+
+        valid checks the structured output; it defaults to an approve/request_changes decision.
+        """
         operation = self.store.dispatch(principal, principal.actor_id, message, kind=kind)
         try:
             result = await self.run_native_operation(actor, principal, operation, message, schema)
@@ -775,15 +851,19 @@ class Controller:
             decision = json.loads(result["text"])
         except (TypeError, ValueError, KeyError):
             decision = None
-        if not isinstance(decision, dict) or decision.get("decision") not in ("approve", "request_changes") \
-                or not isinstance(decision.get("rationale"), str):
+        if valid is None:
+            def valid(value):
+                return value.get("decision") in ("approve", "request_changes") and isinstance(value.get("rationale"), str)
+        if not isinstance(decision, dict) or not valid(decision):
             self.store.settle(operation, state="failed", evidence=f"Master {kind} turn completed without a valid structured decision")
             if module_key:
                 self.store.note_review_unavailable(self.project_id, module_key, reason="no valid structured decision",
                     max_retries=self.policy.max_transient_retries, backoff_seconds=self.policy.transient_backoff_seconds)
             return None, operation
         evidence = {"admission": "Master project admission reviewed in readonly scope; native context has a persisted turn",
-                    "integration-review": "Master whole-project review turn completed in readonly scope"}.get(
+                    "integration-review": "Master whole-project review turn completed in readonly scope",
+                    "decision": "Master answered an owner decision request in readonly scope",
+                    "feedback-triage": "Master mapped the user's feedback to modules in readonly scope"}.get(
                     kind, "Master native turn completed under readonly source scope")
         self.store.settle(operation, evidence=evidence)
         return decision, operation
@@ -806,10 +886,108 @@ class Controller:
 
     def obligation_catalog(self, module):
         checks = [f"check:{index} {' '.join(step.argv)}" for index, step in enumerate((*module.validation, *module.test_validation))]
+        named = [item.name for item in self.spec.interfaces if item.owner == module.key or module.key in item.consumers]
+        interface = (f"interface (the admitted contracts {named} and any contract dependent modules consume)" if named
+                     else "interface (contracts that dependent modules consume)")
         return ("Admitted obligations you may cite: objective (the project objective); module (this module's objective); "
                 f"{'; '.join(checks)}; owner_tests (admitted owner test files must be meaningful and runnable); "
                 "scope (only admitted paths change); regression (existing behavior is preserved); "
-                "interface (contracts that dependent modules consume); integration (whole-project composition).")
+                f"{interface}; integration (whole-project composition).")
+
+    def master_budget_exhausted(self):
+        budget = self.policy.master_token_budget
+        return bool(budget) and self.store.actor_usage(f"{self.project_id}:master") >= budget
+
+    async def host_review(self, candidate, module, *, reason):
+        """Accept on admitted checks alone, or return failed checks to the owner, with no Master turn."""
+        if any(x.get("status") != "passed" for x in candidate["validation"]):
+            return await self.fail_fast_review(candidate, module)
+        principal = self.master_principal
+        rationale = (f"Host acceptance: every admitted check passed on the sealed candidate; no Master review turn "
+                     f"was spent ({reason}).")
+        details = {"source": "host_policy", "blocking_issues": [], "advisories": []}
+        self.store.review(principal, candidate["id"], "approve", rationale, verified_tree_hash=candidate["tree_hash"],
+                          failure_kind="none", details=details)
+        for item in self.store.pending_messages(principal.actor_id):
+            if json.loads(item["payload"]).get("candidate_id") == candidate["id"]:
+                self.store.acknowledge(principal, item["id"])
+        return {"decision": "approve", "rationale": rationale, "failure_kind": "none", **details}
+
+    # ---- Owner decision requests -----------------------------------------------
+
+    async def decide(self, key):
+        actor = await self.ensure_master()
+        principal = self.master_principal
+        row = self.module_row(key)
+        if row["state"] != "awaiting_decision":
+            return None
+        pending = json.loads(row.get("pending_question") or "{}")
+        module = next(m for m in self.spec.modules if m.key == key)
+        if self.master_budget_exhausted():
+            self.store.escalate_decision(principal, key, question_for_user=pending.get("question"),
+                rationale="The Master token budget is spent; the user answers remaining questions.", source="host")
+            return {"action": "escalate"}
+        message = (f"Project objective: {self.spec.objective}\n"
+                   f"The owner of module {key} ({module.objective}; paths {list(module.paths)}) asks:\n"
+                   f"Question: {pending.get('question')}\nOptions: {json.dumps(pending.get('options') or [])}\n"
+                   f"Owner recommendation: {pending.get('recommendation')}\n"
+                   f"Owner summary (untrusted): {pending.get('summary')}\n"
+                   f"{self.interface_brief(module)}"
+                   f"Readonly project source: {self.context}\n"
+                   + (f"Readonly owner files at the question: {row['checkpoint']}\n" if row.get("checkpoint") else "")
+                   + "Answer when the project objective, the module mandates, the interface contracts or ordinary "
+                   "engineering judgement settle the question, and give the owner a concrete actionable answer. "
+                   "Escalate only what belongs to the user: a change of scope, objective or acceptance criteria; any "
+                   "external effect such as network access, installs, publication or credentials; spending beyond the "
+                   "admitted envelope; or a product choice the brief leaves open with material consequences. When you "
+                   "escalate, write question_for_user as a short self-contained question with its options; otherwise "
+                   "set it to null. Never direct the owner outside its admitted paths.")
+        def valid(value):
+            return (value.get("action") in ("answer", "escalate") and isinstance(value.get("answer"), str)
+                    and isinstance(value.get("rationale"), str)
+                    and (value["action"] == "escalate" or bool(value["answer"].strip())))
+        decision, _ = await self.master_decision(actor, principal, message, DECISION_OUTPUT, kind="decision",
+                                                 module_key=key, valid=valid)
+        if decision is None:
+            return None
+        if decision["action"] == "answer":
+            self.store.answer_decision(principal, key, answer=decision["answer"], rationale=decision["rationale"])
+        else:
+            self.store.escalate_decision(principal, key, rationale=decision["rationale"],
+                question_for_user=decision.get("question_for_user") or pending.get("question"))
+        return decision
+
+    async def triage_feedback(self, rejection):
+        """Map the user's unnamed rejection feedback to the modules that must change."""
+        actor = await self.ensure_master()
+        principal = self.master_principal
+        if self.master_budget_exhausted():
+            raise ContractError("The Master token budget is spent, so it cannot map your feedback; reject again "
+                                "naming the modules with --module, or raise master_token_budget with the policy command")
+        with closing(self.store.connect()) as con:
+            row = con.execute("SELECT payload FROM event WHERE project_id=? AND kind='integration-passed' "
+                              "ORDER BY seq DESC LIMIT 1", (self.project_id,)).fetchone()
+        integrated = json.loads(row["payload"])["path"] if row else None
+        keys = [module.key for module in self.spec.modules]
+        message = (f"The user rejected the integrated project. User feedback: {rejection['feedback']}\n"
+                   f"Project objective: {self.spec.objective}\n"
+                   + (f"Readonly integrated files: {integrated}\n" if integrated else "")
+                   + f"Modules and their admitted paths: {json.dumps({m.key: list(m.paths) for m in self.spec.modules})}\n"
+                   + self.interface_brief()
+                   + "Name every module whose owner must change its files to address the feedback and explain in the "
+                   "rationale what each must change. Return no modules only when the feedback needs no file change.")
+        schema = {"type": "object", "properties": {
+            "affected_modules": {"type": "array", "items": {"type": "string", "enum": keys}},
+            "rationale": {"type": "string"}}, "required": ["affected_modules", "rationale"], "additionalProperties": False}
+        def valid(value):
+            return (isinstance(value.get("affected_modules"), list) and isinstance(value.get("rationale"), str)
+                    and set(value["affected_modules"]) <= set(keys))
+        decision, _ = await self.master_decision(actor, principal, message, schema, kind="feedback-triage", valid=valid)
+        if decision is None:
+            raise ContractError("The Master returned no usable mapping of your feedback; reject again naming the "
+                                "modules with --module")
+        return self.store.record_triage(principal, affected=decision["affected_modules"],
+                                        rationale=decision["rationale"], feedback=rejection["feedback"])
 
     async def fail_fast_review(self, candidate, module):
         principal = self.master_principal
@@ -854,6 +1032,10 @@ class Controller:
         bindings = self.candidate_evidence_bindings(candidate, manifest)
         evidence = verify_review_evidence(Path(candidate['evidence']),
             expected_hash=candidate['evidence_hash'], bindings=bindings)
+        if self.policy.host_reviews(module.key):
+            return await self.host_review(candidate, module, reason="runtime policy module_review=checks_only")
+        if self.master_budget_exhausted():
+            return await self.host_review(candidate, module, reason="the Master token budget is spent")
         if self.policy.fail_fast_failed_checks and any(x.get("status") != "passed" for x in candidate["validation"]):
             return await self.fail_fast_review(candidate, module)
         previous = self.previous_issues(module.key) if self.policy.structured_review else []
@@ -931,6 +1113,7 @@ class Controller:
         message = (f"Review the complete integrated project against: {self.spec.objective}\n"
                    f"Readonly integrated files: {directory}\nActual validation: {json.dumps(checks)}\n"
                    f"Module owners: {module_keys}\n"
+                   + self.interface_brief() +
                    f"Accepted module evidence indexes: {json.dumps({row['key']: self.store.candidate(row['accepted_candidate']).get('evidence') for row in self.store.modules(self.project_id)})}\n"
                    "Use failure_kind=implementation for incomplete code/test behavior, evidence for missing transport only, "
                    "uncertain_execution for unresolved execution, and none for approval. "
@@ -970,7 +1153,15 @@ class Controller:
                                              self.context, self.evidence / directory.name, cli=self.cli)
         except ContractError as error:
             raise EnvironmentFailure(f"Integration validator environment failed: {error}") from error
-        decision = await self.review_integration(directory, checks, list(manifest))
+        budget_spent = self.master_budget_exhausted()
+        if budget_spent:
+            passed = all(x["status"] == "passed" for x in checks)
+            decision = {"decision": "approve" if passed else "request_changes",
+                        "failure_kind": "none" if passed else "implementation", "source": "host_policy",
+                        "rationale": "The Master token budget is spent; admitted checks decide and the user is the final checker.",
+                        "affected_modules": [], "blocking_issues": [], "advisories": []}
+        else:
+            decision = await self.review_integration(directory, checks, list(manifest))
         # A missing receipt is repaired on the same composed tree; it does not
         # invalidate owners or consume a code-revision allowance. All evidence
         # retries stay journaled and bounded, with incurred usage retained.
@@ -996,8 +1187,19 @@ class Controller:
             return {"path": str(directory), "modules": manifest, "validation": checks, "master_review": None,
                     "state": state, "original_project_mutated": False}
         approved = decision["decision"] == "approve" and all(x["status"] == "passed" for x in checks)
+        acceptance = await self.run_acceptance_checks(directory) if approved and self.spec.acceptance_checks else []
+        # The user is the final checker in operator mode, when the Master can no
+        # longer review, and whenever one of the user's private checks failed.
+        user_gate = approved and (self.policy.final_acceptance == "user" or budget_spent
+                                  or any(item["status"] != "passed" for item in acceptance))
+        extra = {}
+        if approved:
+            if acceptance:
+                extra["acceptance_checks"] = [{"name": item["name"], "status": item["status"]} for item in acceptance]
+            extra["report"] = str(self.write_report(directory, manifest, checks, decision, acceptance, user_gate))
         recorded_checks = checks if approved else checks + [{"status":"needs_revision", "master_review":decision}]
-        self.store.record_integration(self.master_principal, str(directory), manifest, recorded_checks)
+        self.store.record_integration(self.master_principal, str(directory), manifest, recorded_checks,
+                                      user_gate=user_gate, extra=extra)
         if not approved:
             with closing(self.store.connect()) as con:
                 failures = con.execute("SELECT count(*) FROM event WHERE project_id=? AND kind='integration-failed'", (self.project_id,)).fetchone()[0]
@@ -1010,9 +1212,144 @@ class Controller:
             else:
                 state = "integration_failed"
         else:
-            state = "accepted"
+            state = "awaiting_acceptance" if user_gate else "accepted"
         return {"path": str(directory), "modules": manifest, "validation": checks,
-                "master_review":decision, "state":state, "original_project_mutated": False}
+                "master_review":decision, "state":state, "original_project_mutated": False, **extra}
+
+    # ---- The user's private acceptance checks, preflight and report ----------------
+
+    def seal_acceptance(self):
+        """Copy the user's acceptance directory once into storage no agent can read."""
+        target = self.private / "acceptance"
+        if not target.exists():
+            staging = self.private / ("acceptance-" + uuid.uuid4().hex)
+            copy_public_project(Path(self.spec.acceptance_directory), staging)
+            staging.rename(target)
+            files = sorted(str(path.relative_to(target)) for path in target.rglob("*") if path.is_file())
+            self.note("acceptance-checks-sealed", {"files": files, "tree_hash": digest(
+                {name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in files})})
+        return target
+
+    async def run_acceptance_checks(self, directory, *, label=None):
+        private = self.seal_acceptance()
+        destination = self.private / "acceptance-results" / (label or Path(directory).name)
+        try:
+            results = await asyncio.to_thread(validate, self.spec.acceptance_checks, directory, self.context,
+                                              destination, cli=self.cli, private=private)
+        except ContractError as error:
+            raise EnvironmentFailure(f"Acceptance check environment failed: {error}") from error
+        return [{**result, "name": check.name, "description": check.description}
+                for check, result in zip(self.spec.acceptance_checks, results)]
+
+    async def preflight(self):
+        """Host-only checks before any agent session: executables, paths and the baseline red/green state.
+
+        It replaces the Master's admission turn when that turn is disabled, and runs once per contract.
+        """
+        # Keyed on what the checks depend on, so budget or model revisions do not repeat it.
+        checks_hash = digest({"root": self.spec.root, "acceptance_directory": self.spec.acceptance_directory,
+            "modules": [[m.key, list(m.paths), [[list(s.argv), s.timeout_seconds] for s in (*m.validation, *m.test_validation)]]
+                        for m in self.spec.modules],
+            "integration": [[list(s.argv), s.timeout_seconds] for s in self.spec.integration_validation],
+            "acceptance": [[c.name, list(c.argv), c.timeout_seconds] for c in self.spec.acceptance_checks]})
+        with closing(self.store.connect()) as con:
+            rows = con.execute("SELECT payload FROM event WHERE project_id=? AND kind='preflight-passed'",
+                               (self.project_id,)).fetchall()
+        if any(json.loads(row["payload"]).get("checks_hash") == checks_hash for row in rows):
+            return
+        steps = [(f"module {m.key} check {i}", step) for m in self.spec.modules
+                 for i, step in enumerate((*m.validation, *m.test_validation))]
+        steps += [(f"integration check {i}", step) for i, step in enumerate(self.spec.integration_validation)]
+        steps += [(f"acceptance check {check.name}", check) for check in self.spec.acceptance_checks]
+        problems = [f"{label}: executable {step.argv[0]!r} is not available" for label, step in steps
+                    if not shutil.which(step.argv[0])]
+        for module in self.spec.modules:
+            for relative in module.paths:
+                for parent in PurePosixPath(relative).parents:
+                    if str(parent) != "." and (self.context / parent).exists() and not (self.context / parent).is_dir():
+                        problems.append(f"module {module.key}: {parent} is a file, so {relative} cannot be created")
+        if problems:
+            raise ContractError("Preflight refused the project before any agent session: " + "; ".join(problems))
+        evidence = self.evidence / ("preflight-" + uuid.uuid4().hex)
+        baseline = {}
+        try:
+            for module in self.spec.modules:
+                results = await asyncio.to_thread(validate, module.validation, self.context, self.context,
+                                                  evidence / module.key, cli=self.cli)
+                baseline[module.key] = [result.get("status") for result in results]
+            results = await asyncio.to_thread(validate, self.spec.integration_validation, self.context, self.context,
+                                              evidence / "integration", cli=self.cli)
+            baseline["integration"] = [result.get("status") for result in results]
+        except ContractError as error:
+            raise EnvironmentFailure(f"Preflight validator environment failed: {error}") from error
+        if self.spec.acceptance_checks:
+            results = await self.run_acceptance_checks(self.context, label="preflight-baseline")
+            baseline["acceptance"] = {item["name"]: item["status"] for item in results}
+        warnings = [f"{key} check {index} already passes on the unchanged project, so it may not test the new work"
+                    for key, statuses in baseline.items() if isinstance(statuses, list)
+                    for index, status in enumerate(statuses) if status == "passed"]
+        warnings += [f"acceptance check {name} already passes on the unchanged project"
+                     for name, status in baseline.get("acceptance", {}).items() if status == "passed"]
+        self.note("preflight-passed", {"spec_hash": self.spec.fingerprint, "checks_hash": checks_hash,
+                                       "baseline": baseline, "warnings": warnings})
+
+    def write_report(self, directory, manifest, checks, decision, acceptance, user_gate):
+        """A readable account of the integration for the user, kept outside every agent's view."""
+        self.reports.mkdir(parents=True, exist_ok=True)
+        status = self.store.status(self.project_id)
+        rows = {row["key"]: row for row in status["modules"]}
+        with closing(self.store.connect()) as con:
+            answered = [json.loads(row["payload"]) for row in con.execute(
+                "SELECT payload FROM event WHERE project_id=? AND kind='decision-answered' ORDER BY seq", (self.project_id,))]
+        state_dir = shlex.quote(str(self.runtime_root))
+        def shown(argv):
+            # Readable check commands: placeholders for the views, file names for other paths.
+            names = {str(self.context): "{context}", str(directory): "{candidate}"}
+            parts = []
+            for arg in map(str, argv or []):
+                prefix = next((path for path in names if arg == path or arg.startswith(path + "/")), None)
+                parts.append(names[prefix] + arg[len(prefix):] if prefix else (Path(arg).name if arg.startswith("/") else arg))
+            return " ".join(parts)
+        lines = [f"# Integration report", "", f"Objective: {self.spec.objective}", "",
+                 ("**Waiting for your acceptance.** Nothing has been applied to your project." if user_gate
+                  else "Accepted by the Master. Nothing has been applied to your project."), "",
+                 f"Integrated files: `{directory}`", ""]
+        if user_gate:
+            lines += ["Accept or return it with feedback:", "", "```bash",
+                      f"python -m master_agent_runtime --state {state_dir} accept {self.project_id} --authorization 'reason'",
+                      f"python -m master_agent_runtime --state {state_dir} reject {self.project_id} --feedback 'what is wrong' --authorization 'reason'",
+                      "```", "", "Add `--module KEY` to `reject` to send the feedback to specific modules; without it the "
+                      "Master decides which owners must change their files.", ""]
+        lines += ["## Checks", ""]
+        steps = list(self.spec.integration_validation)
+        lines += [f"- Integration check `{shown(item.get('argv') or (steps[index].argv if index < len(steps) else ()))}`: "
+                  f"{item['status']}" for index, item in enumerate(checks)]
+        lines += [f"- Your private check `{item['name']}`: {item['status']}" + (f" ({item['description']})" if item.get("description") else "")
+                  for item in acceptance]
+        lines += ["", "## Modules", "", "| Module | Revision | Review rounds | Questions | Files |", "| --- | --- | --- | --- | --- |"]
+        for key, binding in manifest.items():
+            module = next(m for m in self.spec.modules if m.key == key)
+            candidate = self.store.candidate(binding["candidate"])
+            files = verify(Path(candidate["snapshot"]), module.paths, expected_hash=candidate["tree_hash"])
+            names = [item["path"] for item in files.get("files", [])] + [f"deleted {name}" for name in files.get("deleted", [])]
+            row = rows.get(key, {})
+            lines.append(f"| {key} | {binding['revision']} | {row.get('rounds', 0)} | {row.get('decisions', 0)} | "
+                         + ", ".join(f"`{name}`" for name in names) + " |")
+        lines += ["", "## Master integration review", "", f"Decision: {decision.get('decision')}", "",
+                  str(decision.get("rationale") or "")]
+        if decision.get("advisories"):
+            lines += ["", "Advisories (non-blocking):", ""] + [f"- {item}" for item in decision["advisories"]]
+        if answered:
+            lines += ["", "## Questions answered during the run", ""]
+            lines += [f"- {item.get('module')}: {item.get('question')} — answered by {item.get('source')}: {item.get('answer')}"
+                      for item in answered]
+        usage = status.get("usage_by_role", {})
+        lines += ["", "## Usage", "", f"- Tokens: {status['spent_tokens']:,} (Master {usage.get('master', 0):,}, "
+                  f"owners {usage.get('owners', 0):,})",
+                  f"- Estimated cost: ${status.get('estimated_cost_usd', 0):.2f}", ""]
+        path = self.reports / f"{Path(directory).name}.md"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
 
     # ---- Event-driven scheduling ----------------------------------------------
 
@@ -1031,6 +1368,12 @@ class Controller:
         if evidence:
             key = min(evidence, key=order.get)
             return "evidence", key, self.recover_evidence_and_review(key)
+        # An owner's question blocks its work, so the Master answers before reviewing.
+        questions = [key for key, row in states.items()
+                     if row["state"] == "awaiting_decision" and due(row) and key not in self.failed_keys]
+        if questions:
+            key = min(questions, key=order.get)
+            return "decision", key, self.decide(key)
         reviews = [key for key, row in states.items()
                    if row["state"] == "awaiting_review" and due(row) and key not in self.failed_keys]
         if reviews:
@@ -1050,7 +1393,7 @@ class Controller:
         active_actors = {op["actor_id"] for op in status["operations"] if op["status"] in ACTIVE_STATUSES}
         now = time.time()
         master = f"{self.project_id}:master"
-        if not set(lanes) & {"review", "evidence", "integration"} and master not in active_actors:
+        if not set(lanes) & {"review", "evidence", "decision", "integration"} and master not in active_actors:
             job = self.next_master_job(states, running_owners, now)
             if job:
                 lane, key, coroutine = job
@@ -1071,7 +1414,8 @@ class Controller:
             slots -= 1
         if "timer" not in [lane for lane, _ in tasks.values()]:
             waits = [row["retry_after"] for row in states.values() if row.get("retry_after") and row["retry_after"] > now
-                     and row["state"] in (*DISPATCHABLE_MODULE_STATES, "awaiting_review", "awaiting_evidence")]
+                     and row["state"] in (*DISPATCHABLE_MODULE_STATES, "awaiting_review", "awaiting_evidence",
+                                          "awaiting_decision")]
             if self.integration_retry_after and self.integration_retry_after > now:
                 waits.append(self.integration_retry_after)
             if waits:
@@ -1095,6 +1439,8 @@ class Controller:
             return {'state':'accepted',**json.loads(row['payload']),'original_project_mutated':False,'resumed_completed_project':True}
         if existing['state']!='active':
             return {'state':existing['state'],'status':self.store.status(self.project_id)}
+        if self.policy.preflight:
+            await self.preflight()
         tasks = {}
         stop = None
         fatal = None
@@ -1102,6 +1448,13 @@ class Controller:
         try:
             try:
                 await self.ensure_master()
+                rejection = self.store.untriaged_rejection(self.project_id)
+                if rejection:
+                    await self.triage_feedback(rejection)
+                    if self.store.project(self.project_id)["state"] == "awaiting_acceptance":
+                        # The Master found nothing to change; the unchanged integration goes back to the user.
+                        return {"state": "awaiting_acceptance", "status": self.store.status(self.project_id),
+                                "remedy": "The Master found no file change for your feedback; accept, or reject naming modules."}
             except ProjectCancelled:
                 stop = "cancelling"
             except BudgetError:
@@ -1134,7 +1487,7 @@ class Controller:
                         self.record_job_failure(lane, key, error)
                     else:
                         if lane == "integration":
-                            if value["state"] in ("accepted", "integration_failed"):
+                            if value["state"] in ("accepted", "integration_failed", "awaiting_acceptance"):
                                 result = value
                             elif value["state"] == "integration_review_unavailable":
                                 self.integration_retry_after = time.time() + self.policy.transient_backoff_seconds
@@ -1156,4 +1509,9 @@ class Controller:
             return {"state": "budget_exhausted", "status": status,
                     "remedy": "Raise the envelope with the budget command (incurred usage is never refunded), then run again; "
                               "interrupted owners continue from their checkpoints."}
+        waiting = [item for item in status["pending_questions"] if item["state"] == "awaiting_user"]
+        if waiting:
+            return {"state": "awaiting_user", "questions": waiting, "status": status,
+                    "remedy": "Answer each question with: answer " + self.project_id + " --module KEY --text 'answer' "
+                              "--authorization 'reason', then run again. Other modules have continued meanwhile."}
         return {"state": "blocked_or_reconciliation_required", "status": status}

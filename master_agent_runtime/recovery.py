@@ -26,12 +26,32 @@ def _decision(text):
     return None
 
 
+def _activation_checkpoint(store,get_controller,root,spec,actor,operation):
+    """Checkpoint the owner's files from the activation workspace bound to this operation, if it still exists."""
+    with closing(store.connect()) as con:
+        binding=con.execute("SELECT payload FROM operation WHERE actor_id=? AND kind='binding' AND at<=? ORDER BY at DESC LIMIT 1",(actor['id'],operation['at'])).fetchone()
+    module=next((item for item in spec.modules if item.key==actor['module_key']),None)
+    if not binding or not module:
+        return None
+    workspace=Path(json.loads(binding['payload'])['workspace'])
+    if root/'workspaces' not in workspace.parents or not workspace.is_dir():
+        return None
+    payload=json.loads(operation['payload'])
+    control=get_controller()
+    context=control.input_context(module,payload['inputs'])
+    return control.capture_checkpoint(workspace,module,operation['id'],payload['inputs'],context,payload['module_revision'])
+
+
 def _producer(text):
     try:
         value=json.loads(text) if text else None
     except (ValueError,TypeError):
         return None
-    return value if isinstance(value,dict) and value.get('status') in {'submitted','blocked'} else None
+    if not isinstance(value,dict) or value.get('status') not in {'submitted','needs_decision','blocked'}:
+        return None
+    if value['status']=='needs_decision' and not str(value.get('question') or '').strip():
+        return None
+    return value
 
 
 async def _reconcile_owned(store,project_id,*,cli):
@@ -100,6 +120,18 @@ async def _reconcile_owned(store,project_id,*,cli):
                     report['held'].append({'operation':operation['id'],'reason':'completed native turn lacks a valid producer receipt; no inferred submission'})
                     continue
                 if producer['status']=='blocked':terminal='failed'
+                if producer['status']=='needs_decision':
+                    if not unsettled:
+                        report['held'].append({'operation':operation['id'],'reason':'settled decision request has no pending module work'})
+                        continue
+                    # The persisted turn asked a question: keep its files and route
+                    # the question as the live controller would, with no new inference.
+                    checkpoint=_activation_checkpoint(store,get_controller,root,spec,actor,operation)
+                    state=store.settle_decision(operation['id'],request=producer,checkpoint=checkpoint,
+                        evidence=f'reconciled completed decision request ({source}); old activation namespace fenced',
+                        max_decisions=policy.max_decisions)
+                    report['reconciled'].append({'operation':operation['id'],'state':'done','module_state':state})
+                    continue
             if unsettled:
                 if terminal=='failed' and producer is None and actor['kind']=='module' and operation['kind']=='work':
                     # A native failure, interrupt or abandoned turn is not the
@@ -122,7 +154,11 @@ async def _reconcile_owned(store,project_id,*,cli):
                         instructions=continuation_instructions(reason),max_continuations=policy.max_continuations)
                     report['reconciled'].append({'operation':operation['id'],'state':'failed','module_state':state})
                     continue
-                store.settle(operation['id'],state=terminal,evidence='persisted acknowledged native terminal turn and producer receipt; old activation namespace fenced')
+                blocked_checkpoint=None
+                if producer and producer['status']=='blocked':
+                    blocked_checkpoint=_activation_checkpoint(store,get_controller,root,spec,actor,operation)
+                store.settle(operation['id'],state=terminal,checkpoint=blocked_checkpoint,
+                             evidence='persisted acknowledged native terminal turn and producer receipt; old activation namespace fenced')
                 if terminal=='done' and actor['kind']=='master' and operation['kind']=='admission':
                     decision=_decision(final_text)
                     if decision and store.admission_state(project_id)=='pending':

@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import sqlite3
 
-from .contracts import Principal,ProjectSpec, RuntimeErrorBase, ContractError
+from .contracts import Principal,ProjectSpec, RuntimeErrorBase, ContractError, OPERATOR_POLICY
 from .controller import Controller
 from .store import Store
 from .backend import select_cli, select_claude_cli
@@ -17,7 +17,7 @@ from .health import inspect_project_state
 from .lease import project_lease
 
 
-OPERATOR_COMMANDS = ('resolve', 'rearm', 'admission', 'budget', 'policy')
+OPERATOR_COMMANDS = ('resolve', 'rearm', 'admission', 'budget', 'policy', 'answer', 'accept', 'reject')
 
 
 async def resolve_clis(store, project_id, codex=None, claude=None):
@@ -71,6 +71,13 @@ def operator_action(args):
             except ValueError as error:
                 raise ContractError(f'Policy updates must be a JSON object: {error}') from error
             store.operator_set_policy(args.project_id, updates, authorization=args.authorization)
+        elif args.command == 'answer':
+            store.operator_answer(args.project_id, args.module, answer=args.text, authorization=args.authorization)
+        elif args.command == 'accept':
+            store.operator_accept(args.project_id, authorization=args.authorization)
+        elif args.command == 'reject':
+            store.operator_reject(args.project_id, feedback=args.feedback, modules=args.module or (),
+                                  authorization=args.authorization)
     status = Store.open_readonly(database).status(args.project_id)
     return {'state': status['state'], 'operator_action': args.command, 'status': status,
             'health': inspect_project_state(Store.open_readonly(database), args.project_id)}
@@ -101,12 +108,22 @@ def main():
     budget.add_argument('project_id'); budget.add_argument('--tokens', type=int, required=True)
     policy = commands.add_parser('policy', help='Operator: revise runtime policy (JSON object of updates)')
     policy.add_argument('project_id'); policy.add_argument('--set', dest='updates', required=True)
-    for command in (resolve, rearm, admission, budget, policy):
+    answer = commands.add_parser('answer', help="Answer an owner's question that waits for you")
+    answer.add_argument('project_id'); answer.add_argument('--module', required=True)
+    answer.add_argument('--text', required=True)
+    accept = commands.add_parser('accept', help='Accept the integrated project after inspecting it')
+    accept.add_argument('project_id')
+    reject = commands.add_parser('reject', help='Return the integrated project with feedback for its owners')
+    reject.add_argument('project_id'); reject.add_argument('--feedback', required=True)
+    reject.add_argument('--module', action='append',
+                        help='Module to send the feedback to (repeatable); without it the Master decides')
+    for command in (resolve, rearm, admission, budget, policy, answer, accept, reject):
         command.add_argument('--authorization', required=True, help='Human reason recorded in the journal')
     args = parser.parse_args()
     try:
         if args.command == "init":
-            spec, runtime_policy = load_handoff_with_policy(args.handoff)
+            # New projects run in operator mode unless their runtime_policy says otherwise.
+            spec, runtime_policy = load_handoff_with_policy(args.handoff, defaults=OPERATOR_POLICY)
             store = Store(args.state / 'runtime.sqlite')
             result = {"project_id": store.create_project(spec, runtime_policy), "state": "admitted",
                       **describe_handoff(spec), "runtime_policy": runtime_policy.to_dict()}
@@ -148,7 +165,7 @@ def main():
                 writable=Store(args.state / 'runtime.sqlite')
                 result = asyncio.run(execute(writable,args.project_id,args.codex,args.claude))
         print(json.dumps(result, indent=2))
-        return (0 if result.get('state') == 'accepted' else 1) if args.command == 'run' else 0
+        return (0 if result.get('state') in ('accepted', 'awaiting_acceptance') else 1) if args.command == 'run' else 0
     except (RuntimeErrorBase, ValueError, OSError, KeyError, TypeError, sqlite3.DatabaseError) as error:
         print(json.dumps({"error": type(error).__name__, "detail": str(error),
                           "scope": "no approval/policy fallback; preserve uncertain operations"}), file=sys.stderr)

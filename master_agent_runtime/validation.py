@@ -17,19 +17,24 @@ from .permissions import filesystem_profile
 
 
 
-def validate(steps: tuple[ValidationStep, ...], candidate: Path, context: Path, evidence: Path, *, cli="codex") -> list[dict]:
+def validate(steps: tuple[ValidationStep, ...], candidate: Path, context: Path, evidence: Path, *, cli="codex",
+             private: Path | None = None) -> list[dict]:
+    """private is the user's sealed acceptance directory: readable by these validators only, as {acceptance}."""
     evidence.mkdir(parents=True, exist_ok=True)
     checks = []
+    readable = (candidate, context) + ((private,) if private is not None else ())
     for index, step in enumerate(steps):
         with tempfile.TemporaryDirectory(prefix="validator-", dir=evidence) as tmp:
             scratch = Path(tmp).resolve()
             private_temp = scratch/'.tmp';private_temp.mkdir()
             argv = [x.replace("{candidate}", str(candidate)).replace("{context}", str(context)) for x in step.argv]
+            if private is not None:
+                argv = [x.replace("{acceptance}", str(private)) for x in argv]
             executable_name = shutil.which(argv[0])
             if not executable_name:
                 raise ContractError("Admitted validation executable is unavailable")
             executable = Path(executable_name).resolve()
-            profile = filesystem_profile(scratch,(candidate,context),writable=True,executables=(argv[0],))
+            profile = filesystem_profile(scratch,readable,writable=True,executables=(argv[0],))
             check_scope(cli,"runtime-validator",profile,scratch,
                         evidence / f"scope-{index}-{time.time_ns()}.json",writable=True)
             launch = [*sandbox_prefix(cli),
