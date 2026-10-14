@@ -122,6 +122,10 @@ def inspect_project_state(store: Store, project_id: str) -> dict:
         if continuing:
             next_action += (" Owners continue interrupted work from preserved checkpoints: "
                             + ", ".join(sorted(continuing)) + ".")
+        waiting_inputs = [module['key'] for module in modules if module['state'] == 'awaiting_inputs']
+        if waiting_inputs:
+            next_action += (" Sealed work built against interface contracts waits for its dependencies to be accepted, "
+                            "then the host re-runs its checks on the accepted code: " + ", ".join(sorted(waiting_inputs)) + ".")
         asked = sorted(item["module"] for item in questions if item.get("state") == "awaiting_decision")
         if asked:
             next_action += " The Master answers the owners' questions first: " + ", ".join(asked) + "."

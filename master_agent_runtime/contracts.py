@@ -302,15 +302,29 @@ POLICY_INTEGER_LIMITS = {
     "max_transient_retries": (0, 10),
     "transient_backoff_seconds": (0, 3600),
     "max_decisions": (0, 20),
+    "max_obligations": (1, 100),
+    "max_probes": (1, 20),
+    "max_probe_rounds": (0, 10),
 }
-POLICY_FLAGS = ("admission_review", "structured_review", "fail_fast_failed_checks", "preflight")
+POLICY_FLAGS = ("admission_review", "structured_review", "fail_fast_failed_checks", "preflight", "planning",
+                "master_probes")
 PRICE_FIELDS = ("input", "cached_input", "output", "cache_write")
 FINAL_ACCEPTANCE = ("master", "user")
 MODULE_REVIEW = ("always", "checks_only")
+PARALLEL_DEPENDENTS = ("off", "contract")
+PROBE_TIMING = ("accepted", "draft")
+PROBE_AUTHORS = ("master", "verifier")
 # Operator mode, applied by `init` to new handoffs unless their runtime_policy
-# says otherwise: a host preflight replaces the Master admission turn, and the
-# user is the final checker of the integrated project.
-OPERATOR_POLICY = {"admission_review": False, "preflight": True, "final_acceptance": "user"}
+# says otherwise: a host preflight replaces the Master admission turn, the
+# Master plans obligations and missing interface contracts, owners of
+# contract-covered dependents work in parallel with their providers, admitted
+# checks accept modules, an independent verifier per module probes the actual
+# code of its accepted version (confirmed failures go back to the owner, and the
+# sealed probes re-run on every later version and on the integrated project),
+# and the user is the final checker of the integrated project.
+OPERATOR_POLICY = {"admission_review": False, "preflight": True, "final_acceptance": "user",
+                   "module_review": "checks_only", "parallel_dependents": "contract", "planning": True,
+                   "master_probes": True, "probe_author": "verifier"}
 
 
 def _strict_fields(data, contract, location):
@@ -373,6 +387,14 @@ class RuntimePolicy:
     review_modules: tuple = ()
     max_decisions: int = 3
     master_token_budget: int | None = None
+    parallel_dependents: str = "off"
+    planning: bool = False
+    max_obligations: int = 30
+    master_probes: bool = False
+    max_probes: int = 8
+    max_probe_rounds: int = 1
+    probe_timing: str = "accepted"
+    probe_author: str = "master"
 
     def __post_init__(self):
         for name, (low, high) in POLICY_INTEGER_LIMITS.items():
@@ -403,6 +425,15 @@ class RuntimePolicy:
             raise ContractError(f"Runtime policy final_acceptance must be one of {list(FINAL_ACCEPTANCE)}")
         if self.module_review not in MODULE_REVIEW:
             raise ContractError(f"Runtime policy module_review must be one of {list(MODULE_REVIEW)}")
+        if self.parallel_dependents not in PARALLEL_DEPENDENTS:
+            raise ContractError(f"Runtime policy parallel_dependents must be one of {list(PARALLEL_DEPENDENTS)}")
+        if self.probe_timing not in PROBE_TIMING:
+            raise ContractError(f"Runtime policy probe_timing must be one of {list(PROBE_TIMING)}")
+        if self.probe_author not in PROBE_AUTHORS:
+            raise ContractError(f"Runtime policy probe_author must be one of {list(PROBE_AUTHORS)}")
+        if self.probe_author == "verifier" and self.probe_timing == "draft":
+            raise ContractError("Runtime policy probe_timing 'draft' needs probe_author 'master': "
+                                "verifiers probe the sealed code of accepted versions")
         if not isinstance(self.review_modules, tuple) or len(set(self.review_modules)) != len(self.review_modules) \
                 or any(not isinstance(key, str) or not key for key in self.review_modules):
             raise ContractError("Runtime policy review_modules must list distinct module keys")

@@ -466,7 +466,8 @@ class LenientSchemaTests(OperatorModeCase):
         self.assertIn('blocking_issues', schema['required'])
         owner = lenient_schema(MODULE_OUTPUT)
         self.assertEqual(owner['required'], ['status', 'summary', 'issues'])
-        self.assertEqual(lenient_schema(DECISION_OUTPUT), DECISION_OUTPUT)
+        # Routed module changes are host-optional; every other decision field stays required.
+        self.assertEqual(lenient_schema(DECISION_OUTPUT)['required'], ['action', 'answer', 'rationale', 'question_for_user'])
         integration = {'type': 'object', 'additionalProperties': False, 'required': ['decision', 'advisories'],
                        'properties': {'decision': {'type': 'string'}, 'blocking_issues': {'type': 'array'},
                                       'advisories': {'type': 'array'}}}

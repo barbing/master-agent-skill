@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS project (
  spent INTEGER NOT NULL DEFAULT 0, reserved INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS actor (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES project(id),
- kind TEXT NOT NULL CHECK(kind IN ('master','module')), module_key TEXT,
+ kind TEXT NOT NULL CHECK(kind IN ('master','module','verifier')), module_key TEXT,
  thread_id TEXT UNIQUE, session_id TEXT UNIQUE, epoch INTEGER NOT NULL DEFAULT 1,
  last_usage INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'registered');
 CREATE TABLE IF NOT EXISTS module (
@@ -396,6 +396,61 @@ class Store:
     def master(self, project_id):
         return self.actor(f"{project_id}:master")
 
+    def register_verifier(self, master: Principal, module_key: str) -> str:
+        """The Master assigns a module its independent verifier: a readonly actor with its own native session.
+
+        Its module is named only in its id: module_key stays NULL, so every owner path (workspaces, write
+        grants, checkpoints, rearm) and every runtime lookup treats it as a Master-side readonly actor."""
+        self._allow_verifier_actors(self.actor(master.actor_id)["project_id"])
+        with self.transaction() as con:
+            reviewer = self.authorize(con, master, "master")
+            project_id = reviewer["project_id"]
+            if not con.execute("SELECT 1 FROM module WHERE project_id=? AND key=?", (project_id, module_key)).fetchone():
+                raise ContractError("Unknown module for a verifier")
+            actor_id = f"{project_id}:verifier:{module_key}"
+            if not con.execute("SELECT 1 FROM actor WHERE id=?", (actor_id,)).fetchone():
+                con.execute("INSERT INTO actor(id,project_id,kind) VALUES(?,?,'verifier')", (actor_id, project_id))
+                self.event(con, project_id, "verifier-registered", {"module": module_key, "actor": actor_id})
+        return actor_id
+
+    def _allow_verifier_actors(self, project_id):
+        """Stores created before verifier actors check actor kinds against ('master','module') only.
+
+        SQLite cannot alter a CHECK constraint, so the documented table rebuild widens it once, on the
+        first verifier this store registers: same rows, columns and references, foreign keys verified
+        before commit. Stores that never use verifiers are never rebuilt."""
+        def actor_sql(con):
+            return con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='actor'").fetchone()["sql"]
+        legacy, widened = "CHECK(kind IN ('master','module'))", "CHECK(kind IN ('master','module','verifier'))"
+        con = self.connect()
+        try:
+            if widened in actor_sql(con):
+                return
+            con.execute("PRAGMA foreign_keys=OFF")  # only outside a transaction
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                sql = actor_sql(con)
+                if widened not in sql:
+                    # SQLite quotes a table name it has renamed.
+                    head = next((prefix for prefix in ('CREATE TABLE actor (', 'CREATE TABLE "actor" (')
+                                 if sql.startswith(prefix)), None)
+                    if sql.count(legacy) != 1 or head is None:
+                        raise ContractError("Unrecognized actor table: this store cannot register verifier actors")
+                    con.execute("CREATE TABLE actor_widened (" + sql[len(head):].replace(legacy, widened))
+                    con.execute("INSERT INTO actor_widened SELECT * FROM actor")
+                    con.execute("DROP TABLE actor")
+                    con.execute("ALTER TABLE actor_widened RENAME TO actor")
+                    if con.execute("PRAGMA foreign_key_check").fetchone():
+                        raise ConflictError("The actor table rebuild would break a reference; nothing was changed")
+                    self.event(con, project_id, "store-actor-kinds-widened", {"kinds": ["master", "module", "verifier"]})
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+        finally:
+            con.execute("PRAGMA foreign_keys=ON")
+            con.close()
+
     def recover_unused_master_binding(self,project_id,*,evidence):
         """A missing rollout is replaceable only before any admitted model work."""
         if not evidence:raise AuthorityError('Definitive native absence evidence required')
@@ -414,7 +469,9 @@ class Store:
         return {key: {"revision": modules[key]["revision"], "candidate": modules[key]["accepted_candidate"]}
                 for key in spec.dependencies}
 
-    def dispatch(self, master: Principal, actor_id: str, message: str, *, kind="work") -> str:
+    def dispatch(self, master: Principal, actor_id: str, message: str, *, kind="work", provisional=()) -> str:
+        """provisional names dependencies the host lets this owner build against an interface contract
+        before they are accepted; their binding then records no accepted candidate."""
         with self.transaction() as con:
             reviewer = self.authorize(con, master, "master")
             actor = con.execute("SELECT * FROM actor WHERE id=?", (actor_id,)).fetchone()
@@ -429,7 +486,7 @@ class Store:
                 for dependency in mod_spec.dependencies:
                     dep = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (project["id"], dependency)).fetchone()
                     input_binding[dependency] = {"revision": dep["revision"], "candidate": dep["accepted_candidate"]}
-                    if dep["state"] != "accepted":
+                    if dep["state"] != "accepted" and dependency not in provisional:
                         raise ConflictError("Required module interface is not accepted/current")
                 if module["state"] not in DISPATCHABLE_MODULE_STATES:
                     raise ConflictError("Module is not ready for execution")
@@ -488,23 +545,64 @@ class Store:
             self.event(con, actor["project_id"], "native-binding-intent", {"actor": actor_id, "operation": operation})
             return operation
 
-    def invalidate_module(self, master, module_key, reason):
-        """New admitted revision, same owner; transitively invalidate old inputs."""
+    def queue_correction(self, master: Principal, module_key, instructions):
+        """A correction the Master sends an owner that is not at work; it reads it on its next turn."""
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise ContractError("A correction needs instructions")
+        with self.transaction() as con:
+            actor = self.authorize(con, master, "master")
+            module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?",
+                                 (actor["project_id"], module_key)).fetchone()
+            if not module:
+                raise ContractError("Unknown module for a correction")
+            if module["state"] not in DISPATCHABLE_MODULE_STATES:
+                raise ConflictError("Only an owner that is not at work can be sent a queued correction")
+            con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)",
+                        (uuid.uuid4().hex, module["owner"], canonical({"instructions": instructions}), time.time()))
+            self.event(con, actor["project_id"], "module-correction-queued", {"module": module_key})
+
+    def invalidate_module(self, master, module_key, reason, contract_edges=frozenset()):
+        """New admitted revision, same owner; transitively invalidate old inputs.
+
+        contract_edges holds (provider, consumer) pairs covered by an interface contract the consumer was
+        built against: such consumers keep their sealed work and wait to be rebased, instead of a redo.
+        """
         with self.transaction() as con:
             actor = self.authorize(con, master, "master")
             project = con.execute("SELECT spec FROM project WHERE id=?", (actor["project_id"],)).fetchone()
             spec = ProjectSpec.from_dict(json.loads(project["spec"]))
             if module_key not in {m.key for m in spec.modules} or not reason.strip():
                 raise ContractError("Invalid module revision request")
-            return self._invalidate(con, actor["project_id"], spec, (module_key,), reason)
+            return self._invalidate(con, actor["project_id"], spec, (module_key,), reason, contract_edges)
 
-    def _invalidate(self, con, project_id, spec, keys, reason):
+    def _invalidate(self, con, project_id, spec, keys, reason, contract_edges=frozenset()):
         affected = set(keys)
-        while True:
-            expanded = affected | {m.key for m in spec.modules if set(m.dependencies) & affected}
-            if expanded == affected:
-                break
-            affected = expanded
+        rebase = set()
+        changed = True
+        while changed:
+            changed = False
+            for module in spec.modules:
+                if module.key in affected:
+                    continue
+                touched = set(module.dependencies) & (affected | rebase)
+                if not touched:
+                    continue
+                if any((dependency, module.key) not in contract_edges for dependency in touched):
+                    affected.add(module.key)
+                    rebase.discard(module.key)
+                    changed = True
+                elif module.key not in rebase:
+                    rebase.add(module.key)
+                    changed = True
+        waiting = []
+        for key in sorted(rebase):
+            row = con.execute('SELECT * FROM module WHERE project_id=? AND key=?', (project_id, key)).fetchone()
+            # Sealed work built against the contract waits for the provider's next accepted version;
+            # owners still at work submit provisionally because a dependency is no longer accepted.
+            if row['current_candidate'] and row['state'] in ('accepted', 'awaiting_review', 'awaiting_evidence', 'awaiting_inputs'):
+                con.execute("UPDATE module SET state='awaiting_inputs',accepted_candidate=NULL,retry_after=NULL "
+                            "WHERE project_id=? AND key=?", (project_id, key))
+                waiting.append(key)
         for key in affected:
             row = con.execute('SELECT * FROM module WHERE project_id=? AND key=?', (project_id, key)).fetchone()
             if row['state'] == 'blocked':
@@ -514,7 +612,8 @@ class Store:
                         "WHERE project_id=? AND key=?", (project_id, key))
             owner = f"{project_id}:module:{key}"
             con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'correction',?,?)", (uuid.uuid4().hex, owner, canonical({"instructions": reason, "input_revision_changed": True}), time.time()))
-        self.event(con, project_id, "module-inputs-invalidated", {"modules": sorted(affected), "reason": reason})
+        self.event(con, project_id, "module-inputs-invalidated",
+                   {"modules": sorted(affected), "reason": reason, **({"awaiting_inputs": waiting} if rebase else {})})
         return sorted(affected)
 
     def mark_started(self, operation_id, remote_id):
@@ -723,7 +822,9 @@ class Store:
             con.close()
 
     def submit(self, principal: Principal, candidate_id, *, tree_hash, snapshot,
-               inputs: dict, validation: list, summary: str, operation_id: str):
+               inputs: dict, validation: list, summary: str, operation_id: str, provisional=False):
+        """provisional seals work built against an interface contract before every dependency was accepted:
+        it waits in awaiting_inputs, unvalidated, until the host rebases it onto the accepted inputs."""
         with self.transaction() as con:
             actor = self.authorize(con, principal, "module")
             module = con.execute("SELECT * FROM module WHERE owner=?", (actor["id"],)).fetchone()
@@ -743,12 +844,47 @@ class Store:
                          canonical(inputs), module["revision"], canonical(validation), summary, time.time()))
             # A submission ends the continuation chain: the sealed candidate
             # now carries the owner's work forward instead of a checkpoint.
-            con.execute("UPDATE module SET state='awaiting_review',current_candidate=?,checkpoint=NULL,checkpoint_hash=NULL,"
-                        "continuations=0,transient_failures=0,retry_after=NULL WHERE owner=?", (candidate_id, actor["id"]))
-            msg = uuid.uuid4().hex
+            state = "awaiting_inputs" if provisional else "awaiting_review"
+            con.execute("UPDATE module SET state=?,current_candidate=?,checkpoint=NULL,checkpoint_hash=NULL,"
+                        "continuations=0,transient_failures=0,retry_after=NULL WHERE owner=?", (state, candidate_id, actor["id"]))
+            if not provisional:
+                msg = uuid.uuid4().hex
+                con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'submission',?,?)",
+                            (msg, f"{actor['project_id']}:master", canonical({"candidate_id": candidate_id, "module": module["key"]}), time.time()))
+            self.event(con, actor["project_id"], "module-submitted",
+                       {"candidate": candidate_id, "owner": actor["id"], **({"provisional": True} if provisional else {})})
+
+    def rebase(self, master: Principal, module_key, candidate_id, *, inputs: dict, validation: list):
+        """Bind a waiting candidate's sealed files to its now-accepted inputs as a new candidate for review.
+
+        The host re-ran the module's admitted checks on the same sealed tree in the composed view of the
+        accepted inputs. Code, owner, mandate and summary are unchanged; only the input binding and the
+        validation are new, so review and evidence bind the inputs the checks actually used.
+        """
+        with self.transaction() as con:
+            actor = self.authorize(con, master, "master")
+            module = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (actor["project_id"], module_key)).fetchone()
+            if not module or module["state"] != "awaiting_inputs" or not module["current_candidate"]:
+                raise ConflictError("Only a sealed candidate waiting for its inputs can be rebased")
+            for key, binding in inputs.items():
+                dependency = con.execute("SELECT * FROM module WHERE project_id=? AND key=?", (actor["project_id"], key)).fetchone()
+                if (not dependency or dependency["state"] != "accepted"
+                        or binding != {"revision": dependency["revision"], "candidate": dependency["accepted_candidate"]}):
+                    raise ConflictError("Rebase inputs are not the accepted current dependencies")
+            spec = ProjectSpec.from_dict(json.loads(con.execute("SELECT spec FROM project WHERE id=?", (actor["project_id"],)).fetchone()["spec"]))
+            if set(inputs) != set(next(m.dependencies for m in spec.modules if m.key == module_key)):
+                raise ConflictError("Rebase must bind exactly the module's dependencies")
+            old = con.execute("SELECT * FROM candidate WHERE id=?", (module["current_candidate"],)).fetchone()
+            con.execute("INSERT INTO candidate(id,project_id,module_key,owner,tree_hash,snapshot,inputs,mandate_revision,validation,summary,at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (candidate_id, old["project_id"], old["module_key"], old["owner"], old["tree_hash"], old["snapshot"],
+                         canonical(inputs), module["revision"], canonical(validation), old["summary"], time.time()))
+            con.execute("UPDATE candidate SET state='rebased' WHERE id=?", (old["id"],))
+            con.execute("UPDATE module SET state='awaiting_review',current_candidate=?,retry_after=NULL WHERE project_id=? AND key=?",
+                        (candidate_id, actor["project_id"], module_key))
             con.execute("INSERT INTO message(id,target,kind,payload,at) VALUES(?,?,'submission',?,?)",
-                        (msg, f"{actor['project_id']}:master", canonical({"candidate_id": candidate_id, "module": module["key"]}), time.time()))
-            self.event(con, actor["project_id"], "module-submitted", {"candidate": candidate_id, "owner": actor["id"]})
+                        (uuid.uuid4().hex, master.actor_id, canonical({"candidate_id": candidate_id, "module": module_key}), time.time()))
+            self.event(con, actor["project_id"], "candidate-rebased",
+                       {"module": module_key, "from": old["id"], "candidate": candidate_id, "inputs": inputs})
 
     def candidate(self, candidate_id):
         con = self.connect()
@@ -1064,10 +1200,10 @@ class Store:
                                   recovery_action='inspect_preserved_rejection_no_automatic_rearming')
             questions = [{"module": module["key"], "state": module["state"], **_json(module.get("pending_question"), {})}
                          for module in modules if module["state"] in ("awaiting_decision", "awaiting_user")]
-            role = {"master": 0, "owners": 0}
+            role = {"master": 0, "owners": 0, "verifiers": 0}
             for usage, kind in con.execute("SELECT o.usage,a.kind FROM operation o JOIN actor a ON a.id=o.actor_id "
                                            "WHERE a.project_id=?", (project_id,)):
-                role["master" if kind == "master" else "owners"] += usage or 0
+                role[{"master": "master", "verifier": "verifiers"}.get(kind, "owners")] += usage or 0
             integration = con.execute("SELECT kind,payload FROM event WHERE project_id=? AND kind IN "
                                       "('integration-passed','integration-accepted') ORDER BY seq DESC LIMIT 1",
                                       (project_id,)).fetchone()

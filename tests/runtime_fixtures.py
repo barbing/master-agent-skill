@@ -75,17 +75,20 @@ class ScriptedActor:
     opens = []
     starts = {}
     workspaces = {}
+    instructions = {}
 
     @classmethod
     def reset(cls):
         cls.owner_script = staticmethod(default_owner)
         cls.master_script = staticmethod(default_master)
-        cls.log, cls.opens, cls.starts, cls.workspaces = [], [], {}, {}
+        cls.log, cls.opens, cls.starts, cls.workspaces, cls.instructions = [], [], {}, {}, {}
 
     def __init__(self, actor_id, workspace, context, control, *, kind, **kwargs):
         self.actor_id = actor_id
         self.kind = kind
-        self.key = 'master' if kind == 'master' else actor_id.rsplit(':', 1)[-1]
+        # A verifier runs under the Master's readonly profile and answers through master_script.
+        self.key = ('verifier:' + actor_id.rsplit(':', 1)[-1] if ':verifier:' in actor_id
+                    else 'master' if kind == 'master' else actor_id.rsplit(':', 1)[-1])
         self.workspace = Path(workspace)
         self.thread_id = self.session_id = None
         self.interrupted = False
@@ -94,6 +97,7 @@ class ScriptedActor:
     async def open(self, *, existing_thread=None, instructions=''):
         self.thread_id = self.session_id = existing_thread or 'thread-' + self.actor_id
         self.opens.append((self.key, existing_thread))
+        self.instructions[self.key] = instructions
         return {'thread': {'id': self.thread_id, 'sessionId': self.session_id}}
 
     async def start_turn(self, message, output_schema=None, client_message_id=None, **kwargs):
@@ -109,8 +113,11 @@ class ScriptedActor:
 
     async def await_turn(self, turn_id, *, on_usage=None):
         if self.kind == 'master':
-            output = type(self).master_script(self, self.number, self.message, self.schema)
-            self.log.append(('master', self.number, output.get('decision')))
+            output = dict(type(self).master_script(self, self.number, self.message, self.schema))
+            delay = output.pop('__sleep__', None)  # a slow Master turn, for scheduling tests
+            if delay:
+                await asyncio.sleep(delay)
+            self.log.append((self.key, self.number, output.get('decision')))
             if on_usage:
                 on_usage(10 * self.number)
             return {'text': json.dumps(output), 'turn': {'id': turn_id, 'status': 'completed'}}

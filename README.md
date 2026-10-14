@@ -56,14 +56,19 @@ A handoff may carry an optional `runtime_policy` object. `init` validates it str
 | `prices` | none | USD per million tokens per model (`input`, `cached_input`, `output`, optional `cache_write`) for estimates |
 | `preflight` | false (`init`: true) | Host-only checks before any agent session: check executables, creatable paths and each check's result on the unchanged project |
 | `final_acceptance` | `master` (`init`: `user`) | `user` stops a passing integration for your acceptance instead of accepting it |
-| `module_review` | `always` | `checks_only` accepts a module on its admitted checks without a Master review turn and returns failing checks directly |
+| `module_review` | `always` (`init`: `checks_only`) | `checks_only` accepts a module on its admitted checks without a Master review turn and returns failing checks directly |
 | `review_modules` | none | Modules that keep their Master review under `checks_only` |
 | `max_decisions` | 3 | Owner questions per module the Master answers before further questions go to you |
 | `master_token_budget` | none | Master tokens after which reviews fall back to checks, questions go to you and you accept the integration |
+| `parallel_dependents` | `off` (`init`: `contract`) | `contract` starts an owner before its providers are accepted when an interface contract covers the dependency; the host rebases its sealed work onto the accepted code |
+| `planning`, `max_obligations` | false (`init`: true), 30 | One Master planning turn before owners start: checkable obligations per module, and contracts for dependencies that have none |
+| `master_probes`, `max_probes` | false (`init`: true), 8 | Executable probes that the host seals, confirms and re-runs on every later version and on the integrated project |
+| `probe_author` | `master` (`init`: `verifier`) | `verifier`: an independent readonly session per module writes the probes against each accepted version's code, without the plan, and the Master rules on every confirmed failure before its owner sees it |
+| `probe_timing`, `max_probe_rounds` | `accepted`, 1 | `accepted`: white-box probe turns per module after acceptance, up to `max_probe_rounds`. `draft` (Master only): the Master writes each module's probes black-box while its owner works, and they run on every submission |
 
 **Stopped turns continue.** A deadline, budget stop, native failure, lost transport or missing receipt interrupts the turn and waits for the owned process to exit. The host then checkpoints the owner's files and sends a continuation to the same owner and context. The module blocks only after `max_continuations`, and a budget stop does not consume one. Without an observed exit the operation stays held for `reconcile`.
 
-**Scheduling is event-driven.** One Master lane takes evidence recovery first, then reviews in submission order, then integration. Owners fill `max_parallel` slots by how many modules depend on them, directly or indirectly. A blocked or failed module stops only its dependents.
+**Scheduling is event-driven.** One Master lane takes evidence recovery first, then reviews in submission order, then integration. Each verifier works in its own lane beside it. Owners fill `max_parallel` slots by how many modules depend on them, directly or indirectly. A blocked or failed module stops only its dependents.
 
 **Admission is never implied.** A refused, stopped or malformed admission turn is retried within the bound, and no module work starts before an approval. `reconcile` records the verdict of an admission turn that already completed instead of asking again. A store without a verdict event counts as admitted only when the Master has already reviewed work.
 
@@ -87,13 +92,49 @@ The standalone CLI must be logged in; check with `claude auth status`. File tool
 
 ### Operator mode: the Master runs the team, you check the result
 
-`init` admits new projects in operator mode unless their `runtime_policy` says otherwise: a host preflight replaces the Master's admission turn, and you are the final checker. Owners still work in parallel, each writing only its own module.
+`init` admits new projects in operator mode unless their `runtime_policy` says otherwise:
+- a host preflight replaces the Master's admission turn;
+- the Master plans before owners start;
+- owners of dependent modules work in parallel against interface contracts;
+- admitted checks accept modules, and an independent verifier probes each accepted module's code;
+- you are the final checker.
 
-**Owners ask, the Master answers.** An owner blocked by a decision outside its module returns `needs_decision` with a question, options and its recommendation. Its files are checkpointed. The Master answers within the brief, and the owner resumes the same session with the answer. The Master escalates questions that belong to you: scope, objective or acceptance criteria, external effects, spending beyond the envelope, or an open product choice. Escalated questions, questions past `max_decisions` and questions the Master cannot answer wait for you while other modules continue. `status` lists them under `pending_questions`, and `health` names the command. An owner that returns `blocked` now keeps its files for the next attempt.
+Each owner still writes only its own module.
+
+**Owners ask, the Master answers.** An owner blocked by a decision outside its module returns `needs_decision` with a question, options and its recommendation. Its files are checkpointed. The Master answers within the brief, and the owner resumes the same session with the answer. The Master escalates questions that belong to you: scope, objective or acceptance criteria, external effects, spending beyond the envelope, or an open product choice. Escalated questions, questions past `max_decisions` and questions the Master cannot answer wait for you while other modules continue. `status` lists them under `pending_questions`, and `health` names the command. An owner that returns `blocked` now keeps its files for the next attempt. When settling a question needs another module's code to change, the Master's answer lists that change and the host delivers it to that module's owner:
+- an accepted module, or one waiting for its inputs, is reopened with the change as a correction;
+- an idle owner reads it on its next turn;
+- an owner at work, or a module with a review or rebase in flight, gets it once that ends.
+
+Integration waits for every routed change, and the report lists them.
 
 **You accept the integration.** When every module is accepted and the integration checks and the Master's whole-project review pass, the run ends in `awaiting_acceptance`. Nothing is applied to your project. A report at `<state>/projects/<id>/reports/` lists the integrated files, checks, modules, answered questions and usage. `accept` records your acceptance. `reject` returns the work with feedback: to named modules and their dependents with `--module`, or, without it, the Master decides which owners must change their files on the next run.
 
 **Interface contracts.** A handoff may list `interfaces`: `name`, owning module, consuming modules and the contract text. Owners see the contracts they provide and consume, and reviews cite them. A consumer need not depend on the provider, so both can be built in parallel against the contract and the integration checks prove the composition.
+
+**Dependent modules in parallel.** Under `parallel_dependents: contract`, a module that depends on another starts at once when an interface contract covers that dependency.
+- Its view keeps the provider's original files, and the contract tells it what to code against.
+- If it finishes before the provider is accepted, its files are sealed and the module waits in `awaiting_inputs`.
+- When the provider is accepted, the host re-runs the dependent's checks on the sealed files against the accepted code, with no Master turn, and sends the result to review. A failure goes back to the owner with the real output, and the provider's code is now in its view.
+- If an accepted provider is later sent back, its contract-built dependents keep their work and are rebased again rather than redone.
+
+**The Master plans first.** Under `planning`, one Master turn before any owner starts expands the requirements into checkable obligations: one module, a verbatim quote of the requirement, a concrete case and the expected result.
+- The host refuses obligations that do not quote the admitted objective or module objective. The Master expands scope; it cannot add any.
+- Each owner gets its obligations and must name each one in its owner tests (`test_O3_...`). A host check returns a submission whose tests omit an assigned id.
+- For dependencies without a contract, the plan also drafts the contract, so those owners can work in parallel too.
+- A plan refused twice is recorded as unavailable, and the run continues without it.
+
+**Independent verifiers probe every module.** Under `master_probes`, executable probes (Python scripts returned in a turn's structured output) check each module. With `probe_author: verifier`, the operator default, the Master assigns each module a verifier.
+- **Who.** A verifier is a readonly actor with its own session. It did not plan, write or review the module, and it never sees the plan's obligations. It reads the accepted version's code and the owner's tests, and probes the requirements: each entry point crossed with missing, empty, foreign, partial, corrupt, concurrently changed and crashed state, every storage mode and leftover file, and every lifecycle point.
+- **Why independent.** In live runs of increment 2b, the owner tests, the probes the Master drafted from its plan, and the Master's review primed by that plan all checked the same planned cases. The 48 drafted probes caught none of the hidden defects, and every defect that survived was a case the plan had never listed.
+- **In parallel.** Verifiers run in their own lane, up to `max_parallel` at once, while owners build and the Master works. Their usage is reported as `verifiers` in `status`.
+- **The Master rules.** A confirmed failure first goes to the Master, who upholds it when a requirement demands the behaviour, or dismisses it with a reason. Upheld failures go back to the owner with the behaviour and the expected and observed results, but not the probe code. Dismissed probes are retired and listed in your report. Without a usable ruling, every failure stands.
+- **Routing.** When the fix for an upheld failure belongs in a module the verified one depends on, the Master names that module. The host sends the failure to that module's owner, and the probe then runs at integration, where a failure names that module, instead of failing every version of a module that cannot fix it.
+- **Sealing and running.** The host seals the probes where no owner can read them and runs them in the validator sandbox against the module's composed view. A failure counts only when two of three runs confirm it and the probe printed its `EXPECTED:` and `OBSERVED:` lines; inconclusive probes never block.
+- **All sealed probes.** They re-run on every later version and on the integrated project, where a failure names the module that must change.
+- **What waits.** Dependents without a contract wait for their provider's probes and ruling, and integration waits for all of them. A failed verification job is journaled and never halts a module.
+- **The Master as author.** With `probe_author: master`, the Master writes the probes instead: white-box after acceptance or, with `probe_timing: draft`, black-box while the owner works, so they gate each submission. Its probes skip the ruling.
+- **Report.** It lists the plan, the drafted contracts, each probe's outcome on the accepted versions and every dismissed probe with the Master's reason.
 
 **Your private acceptance checks.** A handoff may name an `acceptance_directory` outside the project and `acceptance_checks`, each with a `name`, `argv`, optional `timeout_seconds` and `description`. `{acceptance}` in `argv` expands to a sealed copy of that directory. No agent can read the checks, their logs or the report. The checks run against the integrated project after the Master's approval, their results go only to your report, and any failure stops the integration for your acceptance even under `final_acceptance: master`.
 
@@ -103,7 +144,7 @@ python3.12 -m master_agent_runtime --state /absolute/runtime-state accept PROJEC
 python3.12 -m master_agent_runtime --state /absolute/runtime-state reject PROJECT_ID --feedback 'what is wrong' --module KEY --authorization 'reason'
 ```
 
-Offline verification on macOS with Python 3.12 and 3.14 passes 206 runtime cases, including 30 for operator mode, and 20 owner-suite cases. Live Codex checks on 2026-10-09 with CLI 0.162.0-alpha.17.2 and `gpt-6-luna` covered both a smoke project and a kill test. The smoke project was accepted after one journaled rearm; the first attempt exposed that exact write grants could not create a missing parent directory, so the host now creates parents of admitted paths. In the kill test, the owner's app-server was killed mid-turn; the runtime checkpointed the owner's files, resumed the same thread and was accepted 37 seconds later without operator action. On 2026-10-09 the historical Store/CLI and atomic-publication tasks were replayed from their frozen inputs with Haiku 5.5 fulfilling every turn through a validation relay. Both were accepted without a rejection, revision or continuation. The two `test_runtime_sandbox.py` cases create a directory under `/private/tmp`, so they pass only where that is writable.
+Offline verification on macOS with Python 3.12 and 3.14 passes 244 runtime cases, including 30 for operator mode, 24 for parallel dependents, planning and probes, and 14 for independent verifiers and routing, and 20 owner-suite cases. Live Codex checks on 2026-10-09 with CLI 0.162.0-alpha.17.2 and `gpt-6-luna` covered both a smoke project and a kill test. The smoke project was accepted after one journaled rearm; the first attempt exposed that exact write grants could not create a missing parent directory, so the host now creates parents of admitted paths. In the kill test, the owner's app-server was killed mid-turn; the runtime checkpointed the owner's files, resumed the same thread and was accepted 37 seconds later without operator action. On 2026-10-09 the historical Store/CLI and atomic-publication tasks were replayed from their frozen inputs with Haiku 5.5 fulfilling every turn through a validation relay. Both were accepted without a rejection, revision or continuation. The two `test_runtime_sandbox.py` cases create a directory under `/private/tmp`, so they pass only where that is writable.
 
 ## What This Provides
 
