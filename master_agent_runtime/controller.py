@@ -21,13 +21,13 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import time
 import uuid
 from pathlib import Path, PurePosixPath
 
+from . import oscompat
 from .artifacts import capture, context_hashes, file_names, owned_path, verify
 from .contracts import (AuthorityError, BudgetError, ConflictError, ContractError, DispatchRejected,
                         EnvironmentFailure, InterfaceSpec, ProjectCancelled, ScopeViolation, TurnStopped,
@@ -419,7 +419,7 @@ def probe_text(result):
     """A probe run's printed output, from its validator log or, without one, the result itself."""
     log = result.get("log")
     if log and Path(log).is_file():
-        return Path(log).read_text(errors="replace")
+        return Path(log).read_text(encoding="utf-8", errors="replace")
     return result.get("stdout")
 
 
@@ -461,13 +461,13 @@ def copy_public_project(source: Path, target: Path):
     target.mkdir(parents=True, exist_ok=True)
     for directory, dirs, files in os.walk(source, followlinks=False):
         dirs[:] = [name for name in dirs if name not in excluded and not name.startswith(".env")]
-        if any((Path(directory) / name).is_symlink() for name in dirs):
+        if any(oscompat.is_link_like(Path(directory) / name) for name in dirs):
             raise ContractError("Initial runtime requires a source tree without symlink inputs")
         for name in files:
             if name.startswith(".env") or name.endswith((".pyc", ".pyo")):
                 continue
             path = Path(directory) / name
-            if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            if oscompat.is_link_like(path) or not path.is_file() or path.stat().st_nlink != 1:
                 raise ContractError("Initial inputs must be ordinary single-link files")
             if path.stat().st_size > 16 * 1024 * 1024:
                 raise ContractError("Initial public input contains oversized artifact")
@@ -489,7 +489,8 @@ def overlay_candidate(directory, snapshot, manifest):
 
 def _cli_version(cli):
     try:
-        result = subprocess.run([cli, "--version"], text=True, capture_output=True, timeout=15)
+        result = subprocess.run([cli, "--version"], encoding="utf-8", errors="replace", capture_output=True,
+                                timeout=15)
     except (OSError, subprocess.SubprocessError):
         return None
     return (result.stdout or result.stderr).strip().splitlines()[-1][:200] if result.returncode == 0 else None
@@ -563,7 +564,7 @@ class Controller:
         if not self.context.exists():
             staging = self.public / ("base-" + uuid.uuid4().hex)
             copy_public_project(Path(self.spec.root), staging)
-            staging.rename(self.context)
+            oscompat.rename_directory(staging, self.context)
         for directory in (self.snapshots, self.checkpoints, self.evidence, self.workspaces, self.traces):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -894,12 +895,12 @@ class Controller:
                 manifest = verify(snapshot,by_key[key].paths,expected_hash=candidate["tree_hash"])
                 overlay_candidate(staging,snapshot,manifest)
             try:
-                staging.rename(directory)
+                oscompat.rename_directory(staging, directory)
             except OSError:
                 # Another concurrent owner built the same immutable view first.
                 if not directory.exists():
                     raise
-                shutil.rmtree(staging, ignore_errors=True)
+                oscompat.remove_tree(staging, ignore_errors=True)
         return directory
 
     def presubmission_commands(self, module, input_context, workspace, provider):
@@ -1211,7 +1212,7 @@ class Controller:
             (self.traces/(operation+'.json')).write_text(json.dumps({'actor':principal.actor_id,
                 'thread_id':principal.thread_id,'effective':effective if isinstance(effective, dict) else None,
                 'compactions': compactions if isinstance(compactions, int) else 0,
-                'events':events[before:] if isinstance(events, list) else []},indent=2)+'\n')
+                'events':events[before:] if isinstance(events, list) else []},indent=2)+'\n',encoding='utf-8')
 
     def capture_checkpoint(self, workspace, module, operation, inputs, context, mandate_revision):
         try:
@@ -1367,7 +1368,7 @@ class Controller:
         obligations = self.obligations_for(module.key)
         if not obligations or not module.test_paths:
             return []
-        text = "\n".join((snapshot / name).read_text(errors="replace") for name in module.test_paths
+        text = "\n".join((snapshot / name).read_text(encoding="utf-8", errors="replace") for name in module.test_paths
                          if (snapshot / name).is_file())
         missing = [item["id"] for item in obligations
                    if not re.search(r"(?<![A-Za-z0-9])" + re.escape(item["id"]) + r"(?![0-9])", text)]
@@ -1376,7 +1377,7 @@ class Controller:
         log.write_text(("Every assigned obligation id appears in the owner tests.\n" if not missing else
                         "Owner tests do not name these assigned obligations: " + ", ".join(missing) + "\n"
                         + "\n".join(f"{item['id']}: {item['case']} -> {item['expected']}" for item in obligations
-                                    if item["id"] in missing) + "\n"))
+                                    if item["id"] in missing) + "\n"), encoding="utf-8")
         return [{"argv": ["host", "obligation-coverage", module.key], "kind": "obligation_coverage",
                  "status": "failed" if missing else "passed", "exit_code": 1 if missing else 0, "seconds": 0.0,
                  "log": str(log), "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(), "missing": missing,
@@ -1541,7 +1542,7 @@ class Controller:
         for item, check in zip(probes, checks):
             tail = ""
             if check.get("log") and Path(check["log"]).is_file():
-                tail = "\n".join(Path(check["log"]).read_text(errors="replace").splitlines()[-12:])
+                tail = "\n".join(Path(check["log"]).read_text(encoding="utf-8", errors="replace").splitlines()[-12:])
             results.append({name: item.get(name) for name in ("name", "obligations", "description", "expected", "sha256")}
                            | {"status": check["outcome"], "runs": check["runs"], "output": tail[-1500:]})
         failed = [item for item in results if item["status"] == "failed"]
@@ -1642,7 +1643,7 @@ class Controller:
         module = next(m for m in self.spec.modules if m.key == key)
         directory = self.private / "probes" / key / record["candidate"]
         failed = [item for item in record["probes"] if item["status"] == "failed"]
-        failures = [{**item, "code": (directory / f"{item['name']}.py").read_text(errors="replace")
+        failures = [{**item, "code": (directory / f"{item['name']}.py").read_text(encoding="utf-8", errors="replace")
                      if (directory / f"{item['name']}.py").is_file() else ""} for item in failed]
         names = [item["name"] for item in failed]
         interfaces = [item for item in self.all_interfaces() if item.owner == key or key in item.consumers]
@@ -1690,11 +1691,11 @@ class Controller:
             copy_public_project(Path(context), staging)
             overlay_candidate(staging, Path(snapshot), verify(Path(snapshot), module.paths, expected_hash=tree_hash))
             try:
-                staging.rename(directory)
+                oscompat.rename_directory(staging, directory)
             except OSError:
                 if not directory.exists():
                     raise
-                shutil.rmtree(staging, ignore_errors=True)
+                oscompat.remove_tree(staging, ignore_errors=True)
         return directory
 
     async def run_probe_checks(self, key, probes, view, destination, *, python=None):
@@ -2067,7 +2068,7 @@ class Controller:
         for index, check in failing:
             tail = ""
             if check.get("log") and Path(check["log"]).is_file():
-                tail = "\n".join(Path(check["log"]).read_text(errors="replace").splitlines()[-40:])
+                tail = "\n".join(Path(check["log"]).read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
             issues.append({"obligation": f"check:{index}", "evidence": tail or json.dumps(check)[:2000],
                            "required_change": "Make this admitted check pass against your sealed files."})
         rationale = ("Host fail-fast: admitted checks failed on the sealed candidate, so no Master turn was spent. "
@@ -2311,8 +2312,8 @@ class Controller:
         if not target.exists():
             staging = self.private / ("acceptance-" + uuid.uuid4().hex)
             copy_public_project(Path(self.spec.acceptance_directory), staging)
-            staging.rename(target)
-            files = sorted(str(path.relative_to(target)) for path in target.rglob("*") if path.is_file())
+            oscompat.rename_directory(staging, target)
+            files = sorted(path.relative_to(target).as_posix() for path in target.rglob("*") if path.is_file())
             self.note("acceptance-checks-sealed", {"files": files, "tree_hash": digest(
                 {name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in files})})
         return target
@@ -2388,21 +2389,22 @@ class Controller:
         with closing(self.store.connect()) as con:
             answered = [json.loads(row["payload"]) for row in con.execute(
                 "SELECT payload FROM event WHERE project_id=? AND kind='decision-answered' ORDER BY seq", (self.project_id,))]
-        state_dir = shlex.quote(str(self.runtime_root))
+        state_dir = oscompat.shell_quote(str(self.runtime_root))
         def shown(argv):
             # Readable check commands: placeholders for the views, file names for other paths.
             names = {str(self.context): "{context}", str(directory): "{candidate}"}
             parts = []
             for arg in map(str, argv or []):
-                prefix = next((path for path in names if arg == path or arg.startswith(path + "/")), None)
-                parts.append(names[prefix] + arg[len(prefix):] if prefix else (Path(arg).name if arg.startswith("/") else arg))
+                prefix = next((path for path in names
+                               if arg == path or arg.startswith(path + "/") or arg.startswith(path + os.sep)), None)
+                parts.append(names[prefix] + arg[len(prefix):] if prefix else (Path(arg).name if Path(arg).is_absolute() else arg))
             return " ".join(parts)
         lines = [f"# Integration report", "", f"Objective: {self.spec.objective}", "",
                  ("**Waiting for your acceptance.** Nothing has been applied to your project." if user_gate
                   else "Accepted by the Master. Nothing has been applied to your project."), "",
                  f"Integrated files: `{directory}`", ""]
         if user_gate:
-            lines += ["Accept or return it with feedback:", "", "```bash",
+            lines += ["Accept or return it with feedback:", "", "```" + oscompat.shell_fence(),
                       f"python -m master_agent_runtime --state {state_dir} accept {self.project_id} --authorization 'reason'",
                       f"python -m master_agent_runtime --state {state_dir} reject {self.project_id} --feedback 'what is wrong' --authorization 'reason'",
                       "```", "", "Add `--module KEY` to `reject` to send the feedback to specific modules; without it the "

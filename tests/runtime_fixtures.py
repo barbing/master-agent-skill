@@ -1,8 +1,11 @@
 """Scripted synthetic actors for control-loop tests; never live-model evidence."""
 from contextlib import closing
+from functools import lru_cache
 import asyncio
 import json
+import os
 from pathlib import Path
+import tempfile
 
 from master_agent_runtime import ModuleSpec, ProjectSpec, Store, ValidationStep
 from master_agent_runtime.contracts import RuntimePolicy
@@ -158,3 +161,33 @@ def events(store, project_id, kind=None):
     with closing(store.connect()) as con:
         rows = con.execute('SELECT kind,payload FROM event WHERE project_id=? ORDER BY seq', (project_id,)).fetchall()
     return [(row['kind'], json.loads(row['payload'])) for row in rows if kind is None or row['kind'] == kind]
+
+
+def fake_executable(path):
+    """An executable that exits 0: a sh script on POSIX, an empty .exe on Windows, where PATHEXT decides."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == 'nt':
+        path = path.with_name(path.name + '.exe')
+        path.write_bytes(b'')
+    else:
+        path.write_text('#!/bin/sh\nexit 0\n')
+        path.chmod(0o755)
+    return path
+
+
+@lru_cache(maxsize=1)
+def symlinks_available():
+    """Windows needs Developer Mode or an elevated token to create symlinks."""
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            (Path(tmp) / 'link').symlink_to(Path(tmp) / 'target')
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+def make_junction(link, target):
+    """A Windows directory junction, which any account may create (Windows only)."""
+    import _winapi
+    _winapi.CreateJunction(str(target), str(link))

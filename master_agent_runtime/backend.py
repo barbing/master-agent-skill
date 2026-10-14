@@ -1,21 +1,29 @@
 """Choose an existing compatible CLI while preserving the requested model."""
 from pathlib import Path
-import shutil
 
+from . import oscompat
+from .contracts import ContractError
 from .native import JsonRpcClient,ModelUnavailable
 from .sandbox import sandbox_prefix
 
 
+def native_cli(path):
+    """An explicit --codex/--claude path as the runtime will run it; shims are resolved or refused."""
+    native = oscompat.native_executable(path)
+    if native is None:
+        raise ContractError(oscompat.shim_refusal(path))
+    return native
+
+
 async def select_cli(*,model=None,candidates=None):
-    paths = candidates if candidates is not None else (
-        shutil.which('codex'),
-        '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
-        '/Applications/Codex.app/Contents/Resources/codex')
+    paths = candidates if candidates is not None else oscompat.codex_candidates()
     failures=[];seen=set()
     for path in paths:
         if not path or not Path(path).is_file() or str(Path(path).resolve()) in seen:
             continue
         seen.add(str(Path(path).resolve()))
+        if oscompat.is_shim(path):
+            failures.append(oscompat.shim_refusal(path));continue
         client=JsonRpcClient((str(path),'app-server','--stdio'))
         try:
             sandbox_prefix(str(path))
@@ -39,8 +47,9 @@ async def select_claude_cli(*,candidates=None):
     """Choose an existing Claude Code CLI new enough for restricted unattended turns."""
     import asyncio
     from .claude_native import MINIMUM_VERSION, parse_version
-    paths = candidates if candidates is not None else (
-        shutil.which('claude'), str(Path.home()/'.local'/'bin'/'claude'))
+    if not oscompat.claude_sandbox_supported():
+        raise ContractError(oscompat.CLAUDE_WINDOWS_REFUSAL)
+    paths = candidates if candidates is not None else oscompat.claude_candidates()
     failures=[];seen=set()
     for path in paths:
         if not path or not Path(path).is_file() or str(Path(path).resolve()) in seen:

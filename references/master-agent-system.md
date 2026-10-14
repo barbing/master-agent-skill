@@ -315,6 +315,15 @@ Use round-log evidence when the local `codex-round-log` / `change-round-logger` 
 
 Git remains the source for current boundary enforcement through `enforce-master-boundary` and work-order write sets. Round-log manifests add temporal evidence: which Codex round produced a snapshot, which files were captured, which branch/worktree was active, and which prior snapshot it followed. This is especially useful when several sub-agents run concurrently or when ignored source/document files are changed locally.
 
+The tool reads the logger's current record layout, one record per real user prompt at `.codex-round-log/snapshots/<id>/manifest.json` (snapshot format 4), and still reads records an older logger kept at `.codex-round-log/<id>/`. A record's `record_status` decides its use:
+
+- `complete`: files changed in that round; bindable as evidence.
+- `no_changes`: the round changed no maintained file; bindable, but it satisfies no `--expected-path`.
+- `incomplete`: the logger recorded a failure for that interaction (under `.codex-round-log/failures/`); never evidence, and `require-round-log-evidence` fails if a bound record later becomes incomplete.
+- `legacy_capture`: a record from an older logger without a status.
+
+Renamed files (`renamed_paths`, old and new path) count as changed paths. `round-log-status` also reports the recording scope from `.codex-round-log/capture-scope.json`: `declared`, `draft` (proposed by the logger, not yet confirmed by the user), `off`, `missing` or `invalid`.
+
 Normal evidence loop:
 
 ```bash

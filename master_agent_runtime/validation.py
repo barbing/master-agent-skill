@@ -11,10 +11,13 @@ import tempfile
 import time
 import shutil
 
+from . import oscompat
 from .contracts import ContractError, ValidationStep
 from .sandbox import check_scope, sandbox_prefix, toml_literal
 from .permissions import filesystem_profile
 
+# cmd.exe re-reads these inside arguments it passes to a batch file.
+BATCH_UNSAFE = frozenset('"%^&|<>!\r\n')
 
 
 def validate(steps: tuple[ValidationStep, ...], candidate: Path, context: Path, evidence: Path, *, cli="codex",
@@ -33,27 +36,42 @@ def validate(steps: tuple[ValidationStep, ...], candidate: Path, context: Path, 
             executable_name = shutil.which(argv[0])
             if not executable_name:
                 raise ContractError("Admitted validation executable is unavailable")
-            executable = Path(executable_name).resolve()
+            command = list(argv)
+            if oscompat.WINDOWS:
+                # The sandbox launches argv[0] without PATHEXT search, so it gets
+                # the resolved file; a batch file must not receive arguments cmd.exe re-reads.
+                command[0] = executable_name
+                if Path(executable_name).suffix.lower() in (".cmd", ".bat") and any(
+                        set(arg) & BATCH_UNSAFE for arg in argv[1:]):
+                    raise ContractError(f"Validation command {argv[0]!r} is a batch file and an argument holds a "
+                                        "character cmd.exe would re-read; use a native executable")
             profile = filesystem_profile(scratch,readable,writable=True,executables=(argv[0],))
             check_scope(cli,"runtime-validator",profile,scratch,
-                        evidence / f"scope-{index}-{time.time_ns()}.json",writable=True)
+                        evidence / f"scope-{index}-{time.time_ns()}.json",writable=True,protected=evidence)
             launch = [*sandbox_prefix(cli),
-                      "-c", "permissions=" + toml_literal({"runtime-validator": profile}), "--", *argv]
+                      "-c", "permissions=" + toml_literal({"runtime-validator": profile}), "--", *command]
             started = time.monotonic()
             try:
                 result = subprocess.run(launch, cwd=scratch, stdin=subprocess.DEVNULL,
-                    text=True, capture_output=True, timeout=step.timeout_seconds,
-                    env={"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1",
-                         "LANG": "en_US.UTF-8",'TMPDIR':str(private_temp),'TMP':str(private_temp),'TEMP':str(private_temp)})
+                    encoding="utf-8", errors="replace", capture_output=True, timeout=step.timeout_seconds,
+                    env=oscompat.minimal_environment(PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(private_temp),
+                                                     TMP=str(private_temp), TEMP=str(private_temp)))
                 stdout, stderr, exit_code = result.stdout, result.stderr, result.returncode
                 status = "passed" if exit_code == 0 else "failed"
             except subprocess.TimeoutExpired as error:
-                stdout, stderr, exit_code, status = str(error.stdout or ""), str(error.stderr or ""), None, "timeout"
+                stdout, stderr, exit_code, status = _text(error.stdout), _text(error.stderr), None, "timeout"
             text = stdout + "\nSTDERR\n" + stderr
             log = evidence / f"check-{index}-{time.time_ns()}.log"
-            log.write_text(text)
+            log.write_text(text, encoding="utf-8")
             checks.append({"argv": argv, "status": status, "exit_code": exit_code,
                            "seconds": time.monotonic() - started, "log": str(log),
                            "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
                            "scope": "admitted argv under native filesystem/network sandbox; semantic oracle adequacy requires Master review"})
     return checks
+
+
+def _text(value) -> str:
+    """Partial output of a timed-out run; bytes when the stream had not been decoded yet."""
+    if value is None:
+        return ""
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)

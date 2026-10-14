@@ -1,5 +1,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,6 +8,8 @@ import unittest
 from master_agent_runtime import ModuleSpec, Principal, ProjectSpec, Store, ValidationStep
 from master_agent_runtime.contracts import AuthorityError, BudgetError, ConflictError, ContractError
 from master_agent_runtime.artifacts import capture, context_hashes, verify
+
+from runtime_fixtures import make_junction, symlinks_available
 
 
 class ModuleRuntimeTests(unittest.TestCase):
@@ -204,11 +207,24 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             capture(self.work, self.root / "snapshots", ("src",), bindings={})
         (self.work / "other.py").unlink()
+        if not symlinks_available():
+            self.skipTest("this account cannot create symlinks; the junction test covers Windows")
         secret = self.root / "private.py"
         secret.write_text("protected")
         (self.work / "src" / "escape.py").symlink_to(secret)
         with self.assertRaises(OSError):
             capture(self.work, self.root / "snapshots", ("src",), bindings={})
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory junctions")
+    def test_junction_inside_a_candidate_is_rejected(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text("protected")
+        make_junction(self.work / "src" / "linked", outside)
+        with self.assertRaises((ContractError, OSError)):
+            capture(self.work, self.root / "snapshots", ("src",), bindings={})
+        with self.assertRaises((ContractError, OSError)):
+            context_hashes(self.work, ("other",))
 
     def test_protected_git_target_cannot_be_hidden_in_candidate_namespace(self):
         (self.work / "src" / ".git").mkdir()

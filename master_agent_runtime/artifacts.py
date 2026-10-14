@@ -5,48 +5,40 @@ from pathlib import Path
 import hashlib
 import json
 import os
-import shutil
 import stat
 import tempfile
 
-from .contracts import (ConflictError, ContextModified, ContractError, PROTECTED_PARTS, ScopeViolation,
-                        canonical, digest, in_scope, relative_path)
+from .contracts import (ConflictError, ContextModified, ContractError, ScopeViolation,
+                        canonical, digest, in_scope, is_protected_part, relative_path)
+from .oscompat import close_directory, is_link_like, open_beneath, open_directory, remove_tree, rename_directory
 
 
 IGNORED_GENERATED = {"__pycache__", ".pytest_cache", ".tmp"}
 
 
-def read_regular(root_fd: int, relative: str, *, metadata_read=False) -> bytes:
-    """Anchor every component to directory FDs; no symlink/parent-race reads."""
+def read_regular(anchor, relative: str, *, metadata_read=False) -> bytes:
+    """Anchor every component to the root (directory FDs on POSIX); no symlink/parent-race reads."""
     if metadata_read:
         if Path(relative).is_absolute() or '..' in Path(relative).parts or '\\' in relative:
             raise ContractError('Invalid readonly context path')
         parts=relative.split('/')
     else:parts = relative_path(relative).split("/")
-    directory = os.dup(root_fd)
+    fd = open_beneath(anchor, parts)
     try:
-        for part in parts[:-1]:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = nxt
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-        try:
-            before = os.fstat(fd)
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-                raise ScopeViolation(f"Artifacts must be ordinary single-link files: {relative}")
-            if before.st_size > 16 * 1024 * 1024:
-                raise ScopeViolation(f"Artifact file exceeds the admitted 16 MiB limit: {relative}")
-            with os.fdopen(fd, "rb", closefd=False) as stream:
-                data = stream.read()
-            after = os.fstat(fd)
-            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                    after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                raise ConflictError("Artifact changed during capture; finish/fence its writer")
-            return data
-        finally:
-            os.close(fd)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ScopeViolation(f"Artifacts must be ordinary single-link files: {relative}")
+        if before.st_size > 16 * 1024 * 1024:
+            raise ScopeViolation(f"Artifact file exceeds the admitted 16 MiB limit: {relative}")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read()
+        after = os.fstat(fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ConflictError("Artifact changed during capture; finish/fence its writer")
+        return data
     finally:
-        os.close(directory)
+        os.close(fd)
 
 
 def file_names(root: Path) -> list[str]:
@@ -54,7 +46,7 @@ def file_names(root: Path) -> list[str]:
     for directory, dirs, files in os.walk(root, followlinks=False):
         for name in list(dirs):
             path = Path(directory) / name
-            if path.is_symlink():
+            if is_link_like(path):
                 raise ScopeViolation(f"Symlink directories cannot be submitted: {path.relative_to(root).as_posix()}")
             if name in IGNORED_GENERATED:
                 dirs.remove(name)
@@ -66,23 +58,24 @@ def file_names(root: Path) -> list[str]:
 
 
 def owned_path(name,paths):
-    return not set(Path(name).parts)&PROTECTED_PARTS and any(name==p or name.startswith(p+'/') for p in paths)
+    return (not any(is_protected_part(part) for part in Path(name).parts)
+            and any(name==p or name.startswith(p+'/') for p in paths))
 
 
 def context_hashes(root,paths):
-    fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    fd=open_directory(root)
     try:return {name:hashlib.sha256(read_regular(fd,name,metadata_read=True)).hexdigest()
                 for name in file_names(root) if not owned_path(name,paths)}
-    finally:os.close(fd)
+    finally:close_directory(fd)
 
 
 def tree(root: Path, paths: tuple[str, ...] | list[str], *, context_inputs=None,
          ignore_unowned=False) -> tuple[list[dict], dict[str, bytes]]:
     root = root.absolute()
-    if root.is_symlink() or not root.is_dir():
+    if is_link_like(root) or not root.is_dir():
         raise ContractError("Artifact root must be a real directory")
     names = file_names(root)
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = open_directory(root)
     data = {}
     rows = []
     total = 0
@@ -106,7 +99,7 @@ def tree(root: Path, paths: tuple[str, ...] | list[str], *, context_inputs=None,
             data[name] = content
             rows.append({"path": name, "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)})
     finally:
-        os.close(fd)
+        close_directory(fd)
     if names != file_names(root):
         raise ConflictError("Candidate membership changed during capture")
     if context_inputs is not None and not ignore_unowned and set(context_inputs)-set(names):
@@ -139,19 +132,19 @@ def capture(workspace: Path, destination: Path, paths, *, bindings: dict, baseli
             path = staging / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
-        (staging / "candidate-manifest.json").write_text(canonical(manifest) + "\n")
-        os.rename(staging, target)
+        (staging / "candidate-manifest.json").write_text(canonical(manifest) + "\n", encoding="utf-8")
+        rename_directory(staging, target)
         for path in target.rglob("*"):
             if path.is_file():
                 path.chmod(0o444)
     finally:
         if staging.exists():
-            shutil.rmtree(staging)
+            remove_tree(staging)
     return {"path": str(target), "tree_hash": content_hash, "manifest": manifest}
 
 
 def verify(snapshot: Path, paths, *, expected_hash: str) -> dict:
-    manifest = json.loads((snapshot / "candidate-manifest.json").read_text())
+    manifest = json.loads((snapshot / "candidate-manifest.json").read_text(encoding="utf-8"))
     if digest(manifest) != expected_hash:
         raise ConflictError("Immutable candidate manifest changed after capture/review")
     expected = {x["path"]: x for x in manifest["files"]}
@@ -163,7 +156,7 @@ def verify(snapshot: Path, paths, *, expected_hash: str) -> dict:
     actual = [x for x in file_names(snapshot) if x != "candidate-manifest.json"]
     if sorted(expected) != actual:
         raise ConflictError("Immutable candidate membership changed")
-    fd = os.open(snapshot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = open_directory(snapshot)
     try:
         for name, info in expected.items():
             if not in_scope(name, paths):
@@ -172,5 +165,5 @@ def verify(snapshot: Path, paths, *, expected_hash: str) -> dict:
             if hashlib.sha256(content).hexdigest() != info["sha256"] or len(content) != info["bytes"]:
                 raise ConflictError("Candidate bytes changed after capture/review")
     finally:
-        os.close(fd)
+        close_directory(fd)
     return manifest

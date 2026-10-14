@@ -26,14 +26,15 @@ import hashlib
 import json
 import os
 import re
-import signal
 import time
 import uuid
 from pathlib import Path
 
+from . import oscompat
 from .contracts import AuthorityError, ContractError, UnknownOutcome
 from .evidence import MAX_COMMANDS, MAX_COMMAND_OUTPUT, command_observation
 from .native import NativeRejected
+from .oscompat import ProcessGroup, interrupt_process, process_group_options
 
 
 # The read block, the forced default mode under the credential scrub and the
@@ -108,13 +109,13 @@ def transcript_path(session_id):
 def executable_reads(executables):
     """Install roots the sandboxed commands must read to run admitted executables."""
     import shutil
-    from .permissions import executable_read_roots
+    from .permissions import executable_read_roots, is_python, python_library_roots
     roots = set()
     for executable in executables or ():
         roots.update(executable_read_roots(executable))
         resolved = Path(shutil.which(str(executable))).resolve()
-        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", resolved.name):
-            roots.add(str(resolved.parents[1]))  # the interpreter's stdlib and site-packages
+        if is_python(resolved):
+            roots.update(python_library_roots(resolved))  # the interpreter's stdlib and site-packages
     return sorted(roots)
 
 
@@ -179,6 +180,8 @@ def claude_preflight(actor, receipt_path):
     settings = actor.settings
     sandbox = settings["sandbox"]
     problems = []
+    if not oscompat.claude_sandbox_supported():
+        problems.append(oscompat.CLAUDE_WINDOWS_REFUSAL)
     if not (sandbox["enabled"] and sandbox["failIfUnavailable"]) or sandbox["allowUnsandboxedCommands"]:
         problems.append("Bash sandbox is not strict")
     if sandbox["network"]["allowedDomains"] or not sandbox["network"]["strictAllowlist"]:
@@ -217,7 +220,7 @@ def claude_preflight(actor, receipt_path):
                         "are a separate admitted experiment")}
     receipt_path = Path(receipt_path)
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_text(json.dumps(report, indent=2) + "\n")
+    receipt_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if problems:
         raise ContractError("Claude actor configuration refused: " + "; ".join(problems))
     return report
@@ -317,7 +320,7 @@ def claude_trace_result(path):
     if not path.is_file():
         return None, None
     result = None
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             message = json.loads(line)
         except ValueError:
@@ -338,7 +341,7 @@ def claude_trace_commands(path, *, thread_id, turn_id):
     if not path.is_file():
         return [], f"host stream trace unavailable: {path.name}"
     state = StreamState(thread_id, turn_id, None)
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             message = json.loads(line)
         except ValueError:
@@ -385,6 +388,7 @@ class ClaudeActor:
         self.usage_base = 0
         self.usage_detail_base = {}
         self.process = None
+        self._group = None
         self.state = None
         self.trace_file = None
         self.version = None
@@ -477,9 +481,10 @@ class ClaudeActor:
         try:
             self.process = await asyncio.create_subprocess_exec(*self.argv(output_schema), cwd=str(self.workspace),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=self.environment(), start_new_session=True, limit=16 * 1024 * 1024)
+                env=self.environment(), limit=16 * 1024 * 1024, **process_group_options())
         except OSError as error:
             raise NativeRejected(f"Claude CLI could not start: {error}") from error
+        self._group = ProcessGroup(self.process.pid)
         prompt = f"[runtime operation {turn_id}]\n{message}"
         try:
             self.process.stdin.write(prompt.encode())
@@ -600,7 +605,7 @@ class ClaudeActor:
     async def interrupt(self, turn_id):
         # SIGINT ends the running turn and records it; the session stays resumable.
         if self.process and self.process.returncode is None:
-            self.process.send_signal(signal.SIGINT)
+            interrupt_process(self.process)
         return {}
 
     async def read(self):
@@ -608,7 +613,8 @@ class ClaudeActor:
         if path is None:
             return {"thread": {"id": self.session_id, "sessionId": self.session_id, "turns": []}}
         return {"thread": {"id": self.session_id, "sessionId": self.session_id,
-                           "transcript": str(path), "entries": len(path.read_text(errors="replace").splitlines())}}
+                           "transcript": str(path),
+                           "entries": len(path.read_text(encoding="utf-8", errors="replace").splitlines())}}
 
     async def set_goal(self, objective, token_budget):
         raise ContractError("Claude actors have no native goal primitive; the host owns the envelope")
@@ -617,23 +623,19 @@ class ClaudeActor:
         process = self.process
         if process is None:
             return {"process_exited": True, "reason": "no process started"}
+        group = self._group or ProcessGroup(process.pid)
         if process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), 5)
             except asyncio.TimeoutError:
-                for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
-                    try:
-                        os.killpg(process.pid, sig)
-                    except ProcessLookupError:
+                for force, wait in ((False, 5), (True, 5)):
+                    if not group.signal(force=force):
                         break
                     try:
                         await asyncio.wait_for(process.wait(), wait)
                         break
                     except asyncio.TimeoutError:
                         continue
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        group.reap()
         return {"process_exited": process.returncode is not None, "exit_code": process.returncode,
                 "effect_coverage": "owned claude process group; arbitrary escaped processes not certified"}

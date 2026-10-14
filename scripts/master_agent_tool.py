@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -764,7 +765,8 @@ def process_is_alive(pid_value: object) -> bool:
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=5,
             )
@@ -3676,7 +3678,7 @@ def command_supervisor_start(args: argparse.Namespace) -> int:
                 cwd=str(SKILL_ROOT),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                text=True,
+                encoding="utf-8",
                 close_fds=True,
                 creationflags=creationflags,
             )
@@ -3947,7 +3949,8 @@ def git_repo_root(project_root: Path) -> tuple[Path | None, str | None]:
     try:
         result = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=10,
         )
@@ -3968,7 +3971,8 @@ def normalize_git_output_path(value: str) -> str:
 def git_tracked_paths(repo_root: Path) -> tuple[list[str], str | None]:
     result = subprocess.run(
         ["git", "-C", str(repo_root), "ls-files"],
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=10,
     )
@@ -3980,7 +3984,8 @@ def git_tracked_paths(repo_root: Path) -> tuple[list[str], str | None]:
 def git_path_is_ignored(repo_root: Path, relative_path: str) -> bool:
     result = subprocess.run(
         ["git", "-C", str(repo_root), "check-ignore", "--quiet", "--", relative_path],
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=10,
     )
@@ -4067,7 +4072,8 @@ def run_session_provider_command(
         result = subprocess.run(
             argv,
             input=json.dumps(request, sort_keys=True) + "\n",
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout_seconds,
             shell=False,
@@ -5261,7 +5267,8 @@ def git_changed_paths(project_root: Path) -> tuple[list[str], str | None]:
     try:
         root_result = subprocess.run(
             ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=10,
         )
@@ -5272,7 +5279,8 @@ def git_changed_paths(project_root: Path) -> tuple[list[str], str | None]:
     git_root = Path(root_result.stdout.strip()).resolve()
     status = subprocess.run(
         ["git", "-C", str(git_root), "status", "--porcelain=v1", "--untracked-files=all"],
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=10,
     )
@@ -5489,8 +5497,29 @@ def append_round_log_event(state_dir: Path, entry: dict) -> None:
     append_jsonl_locked(state_dir / "state" / "round-log-events.jsonl", entry)
 
 
+# Change Round Logger record layout (snapshot format 4): one record per real
+# user prompt under .codex-round-log/snapshots/<id>/. Older loggers kept
+# records directly under .codex-round-log/<id>/, which is still read.
+ROUND_LOG_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ROUND_LOG_SERVICE_DIRS = {"snapshots", "exports", "failures", ".tmp", ".captures"}
+
+
 def round_log_root(repo_root: Path) -> Path:
     return repo_root / ".codex-round-log"
+
+
+def round_log_snapshot_root(repo_root: Path) -> Path:
+    return round_log_root(repo_root) / "snapshots"
+
+
+def round_log_snapshot_dir(repo_root: Path, snapshot_id: str) -> Path | None:
+    """A record's directory: the current layout first, then the legacy root layout."""
+    if not ROUND_LOG_SNAPSHOT_ID_RE.match(snapshot_id or ""):
+        return None
+    for candidate in (round_log_snapshot_root(repo_root) / snapshot_id, round_log_root(repo_root) / snapshot_id):
+        if not candidate.is_symlink() and (candidate / "manifest.json").is_file():
+            return candidate
+    return None
 
 
 def read_json_object(path: Path) -> dict | None:
@@ -5501,11 +5530,32 @@ def read_json_object(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def round_log_manifest_record(snapshot_dir: Path) -> dict | None:
+def round_log_failure(log_root: Path, manifest: dict) -> dict:
+    """The logger's durable recording failure for this record's interaction, if any.
+
+    The logger keys failures by session and user turn (or interaction key)
+    under failures/, and marks the record incomplete while one is present.
+    """
+    recorded = manifest.get("recording_failure")
+    if isinstance(recorded, dict):
+        return recorded
+    payload = manifest.get("tool_payload") if isinstance(manifest.get("tool_payload"), dict) else {}
+    session = str(manifest.get("interaction_session_id") or payload.get("session_id") or "")
+    if not session:
+        return {}
+    turn = str(manifest.get("interaction_user_turn_id") or payload.get("turn_id")
+               or manifest.get("interaction_key") or "unknown")
+    identity = hashlib.sha256((session + "\0" + turn).encode()).hexdigest()
+    return read_json_object(log_root / "failures" / (identity + ".json")) or {}
+
+
+def round_log_manifest_record(snapshot_dir: Path, log_root: Path | None = None) -> dict | None:
     manifest_path = snapshot_dir / "manifest.json"
     manifest = read_json_object(manifest_path)
     if not manifest:
         return None
+    if log_root is None:
+        log_root = snapshot_dir.parent.parent if snapshot_dir.parent.name == "snapshots" else snapshot_dir.parent
     snapshot_id = str(manifest.get("id") or snapshot_dir.name)
     copied_paths = [
         normalize_repo_path(str(path))
@@ -5517,11 +5567,28 @@ def round_log_manifest_record(snapshot_dir: Path) -> dict | None:
         for path in manifest.get("deleted_paths", [])
         if str(path).strip()
     ]
+    renamed_paths = [
+        {"old": normalize_repo_path(str(item["old"])), "new": normalize_repo_path(str(item["new"])),
+         "basis": str(item.get("basis") or "")}
+        for item in manifest.get("renamed_paths", [])
+        if isinstance(item, dict) and str(item.get("old") or "").strip() and str(item.get("new") or "").strip()
+    ]
+    # A rename changes both paths, also when the logger copied no new bytes.
+    changed_paths = list(dict.fromkeys(
+        copied_paths + deleted_paths + [path for item in renamed_paths for path in (item["old"], item["new"])]))
+    failure = round_log_failure(log_root, manifest)
+    record_status = "incomplete" if failure else str(manifest.get("record_status") or "legacy_capture")
     file_index_path = str(manifest.get("file_index_path") or "")
     return {
         "snapshot_id": snapshot_id,
         "snapshot_path": str(snapshot_dir),
         "manifest_path": str(manifest_path),
+        "snapshot_format_version": manifest.get("snapshot_format_version"),
+        "record_status": record_status,
+        "capture_status": str(manifest.get("capture_status") or (manifest.get("record_status") if failure else "") or ""),
+        "recording_failure": (f"{failure.get('error_type') or 'error'}: {failure.get('error') or ''}".strip()
+                              if failure else ""),
+        "end_reason": str(manifest.get("end_reason") or ""),
         "created_at": str(manifest.get("created_at") or ""),
         "mode": str(manifest.get("mode") or ""),
         "label": str(manifest.get("label") or ""),
@@ -5529,8 +5596,9 @@ def round_log_manifest_record(snapshot_dir: Path) -> dict | None:
         "previous_snapshot_id": str(manifest.get("previous_snapshot_id") or ""),
         "copied_paths": copied_paths,
         "deleted_paths": deleted_paths,
-        "changed_paths": copied_paths + deleted_paths,
-        "file_count": len(copied_paths) + len(deleted_paths),
+        "renamed_paths": renamed_paths,
+        "changed_paths": changed_paths,
+        "file_count": len(changed_paths),
         "file_index_path": file_index_path,
     }
 
@@ -5539,15 +5607,45 @@ def list_round_log_snapshots(repo_root: Path) -> list[dict]:
     log_root = round_log_root(repo_root)
     if not log_root.exists():
         return []
-    snapshots: list[dict] = []
-    for path in log_root.iterdir():
-        if not path.is_dir() or path.name in {".tmp", "exports"}:
+    found: dict[str, dict] = {}
+    for folder, layout in ((round_log_snapshot_root(repo_root), "current"), (log_root, "legacy")):
+        if not folder.is_dir():
             continue
-        record = round_log_manifest_record(path)
-        if record:
-            snapshots.append(record)
+        for path in sorted(folder.iterdir()):
+            if (not path.is_dir() or path.is_symlink() or path.name.startswith(".")
+                    or (layout == "legacy" and path.name in ROUND_LOG_SERVICE_DIRS)):
+                continue
+            record = round_log_manifest_record(path, log_root)
+            if record and record["snapshot_id"] not in found:
+                found[record["snapshot_id"]] = {**record, "layout": layout}
+    snapshots = list(found.values())
     snapshots.sort(key=lambda item: (item.get("created_at") or "", item.get("snapshot_id") or ""))
     return snapshots
+
+
+def round_log_capture_scope(log_root: Path) -> str:
+    """declared, draft, off, missing or invalid: whether the logger records this project."""
+    path = log_root / "capture-scope.json"
+    if not path.is_file():
+        return "missing"
+    scope = read_json_object(path)
+    if scope is None:
+        return "invalid"
+    if scope.get("recording") == "off":
+        return "off"
+    if scope.get("recording", "on") != "on":
+        return "invalid"
+    return "draft" if scope.get("draft") is True else "declared"
+
+
+def round_log_failures(log_root: Path) -> list[dict]:
+    folder = log_root / "failures"
+    failures = [value for path in sorted(folder.glob("*.json")) if (value := read_json_object(path))] \
+        if folder.is_dir() else []
+    legacy = read_json_object(log_root / "hook-failure.json")
+    if legacy:
+        failures.append({**legacy, "legacy_unattributed": True})
+    return failures
 
 
 def latest_round_log_snapshot(repo_root: Path) -> dict | None:
@@ -5562,17 +5660,20 @@ def inspect_round_log(repo_root: Path) -> dict:
             "status": "missing",
             "repo_root": str(repo_root),
             "round_log_root": str(log_root),
+            "capture_scope": "missing",
             "latest_snapshot_id": "",
+            "latest_record_status": "",
             "snapshot_count": 0,
+            "failure_count": 0,
             "hook_failure": "",
         }
     snapshots = list_round_log_snapshots(repo_root)
     state = read_json_object(log_root / "state.json") or {}
-    failure = read_json_object(log_root / "hook-failure.json")
+    failures = round_log_failures(log_root)
     latest = snapshots[-1] if snapshots else None
     last_state_snapshot = str(state.get("last_snapshot_id") or "")
     latest_id = str((latest or {}).get("snapshot_id") or last_state_snapshot)
-    if failure:
+    if failures or (latest and latest.get("record_status") == "incomplete"):
         status = "warning"
     elif latest:
         status = "available"
@@ -5582,11 +5683,14 @@ def inspect_round_log(repo_root: Path) -> dict:
         "status": status,
         "repo_root": str(repo_root),
         "round_log_root": str(log_root),
+        "capture_scope": round_log_capture_scope(log_root),
         "latest_snapshot_id": latest_id,
+        "latest_record_status": str((latest or {}).get("record_status") or ""),
         "snapshot_count": len(snapshots),
+        "failure_count": len(failures),
         "state_last_snapshot_id": last_state_snapshot,
         "active_hook_snapshot_id": str(state.get("active_hook_snapshot_id") or ""),
-        "hook_failure": json.dumps(failure, ensure_ascii=False, sort_keys=True) if failure else "",
+        "hook_failure": json.dumps(failures[-1], ensure_ascii=False, sort_keys=True) if failures else "",
         "latest_snapshot": latest or {},
     }
 
@@ -5597,15 +5701,23 @@ def run_round_log_command(
     timeout_seconds: float,
 ) -> tuple[subprocess.CompletedProcess[str] | None, str | None]:
     try:
-        argv = shlex.split(command, posix=os.name != "nt")
+        # Windows CreateProcess consumes its native command line directly.
+        # shlex's non-POSIX mode retains quotes and would pass them as data.
+        if os.name == "nt":
+            argv = command.strip()
+            launch = f"{argv} {subprocess.list2cmdline(extra_args)}" if argv and extra_args else argv
+        else:
+            argv = shlex.split(command)
+            launch = [*argv, *extra_args]
     except ValueError as exc:
         return None, f"Round-log command could not be parsed: {exc}"
     if not argv:
         return None, "Round-log command is empty"
     try:
         result = subprocess.run(
-            [*argv, *extra_args],
-            text=True,
+            launch,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout_seconds,
         )
@@ -5643,8 +5755,11 @@ def render_round_log_control(state_dir: Path) -> None:
         f"- Status: {latest_status.get('status', '')}",
         f"- Repo root: {latest_status.get('repo_root', '')}",
         f"- Round log root: {latest_status.get('round_log_root', '')}",
+        f"- Capture scope: {latest_status.get('capture_scope', '')}",
         f"- Latest snapshot id: {latest_status.get('latest_snapshot_id', '')}",
+        f"- Latest record status: {latest_status.get('latest_record_status', '')}",
         f"- Snapshot count: {latest_status.get('snapshot_count', '')}",
+        f"- Recording failures: {latest_status.get('failure_count', '')}",
         "",
         "## Evidence Binding",
         "",
@@ -5652,12 +5767,14 @@ def render_round_log_control(state_dir: Path) -> None:
         f"- Latest plan id: {latest_evidence.get('plan_id', '')}",
         f"- Latest worktree id: {latest_evidence.get('worktree_id', '')}",
         f"- Latest evidence snapshot id: {latest_evidence.get('snapshot_id', '')}",
+        f"- Latest evidence record status: {latest_evidence.get('record_status', '')}",
         f"- Latest manifest path: {latest_evidence.get('manifest_path', '')}",
         "",
         "## Snapshot Policy",
         "",
         "- Master may inspect status, record evidence, require evidence, and export readable evidence explicitly.",
         "- Master must not use round-log evidence as mutation authority.",
+        "- An incomplete record (a recording failure) is never evidence; no_changes records an unchanged round.",
         "- Restore is a human-directed recovery operation, not an autonomous Master action.",
         "",
         "## Export Policy",
@@ -5716,8 +5833,12 @@ def command_round_log_status(args: argparse.Namespace) -> int:
     print(f"Round log status: {status.get('status')}")
     print(f"Repo root: {status.get('repo_root')}")
     print(f"Round log root: {status.get('round_log_root')}")
+    print(f"Capture scope: {status.get('capture_scope')}")
     print(f"Latest snapshot id: {status.get('latest_snapshot_id')}")
+    print(f"Latest record status: {status.get('latest_record_status')}")
     print(f"Snapshot count: {status.get('snapshot_count')}")
+    if status.get("failure_count"):
+        print(f"Recording failures: {status.get('failure_count')}")
     if command_stdout:
         print("Command output:")
         print(command_stdout)
@@ -5743,10 +5864,17 @@ def command_record_round_log_evidence(args: argparse.Namespace) -> int:
         print(f"Round-log evidence requires a Git repository: {repo_error}", file=sys.stderr)
         return 2
     assert repo_root is not None
-    snapshot_dir = round_log_root(repo_root) / args.snapshot_id
-    snapshot = round_log_manifest_record(snapshot_dir)
+    snapshot_dir = round_log_snapshot_dir(repo_root, args.snapshot_id)
+    snapshot = round_log_manifest_record(snapshot_dir) if snapshot_dir else None
     if not snapshot:
         print(f"Valid round-log snapshot not found: {args.snapshot_id}", file=sys.stderr)
+        return 1
+    if snapshot["record_status"] == "incomplete":
+        print(
+            f"Round-log snapshot {args.snapshot_id} is an incomplete recording and cannot serve as evidence: "
+            + (snapshot["recording_failure"] or "recording failure"),
+            file=sys.stderr,
+        )
         return 1
     agent = agents[args.agent_id]
     if args.plan_id and agent.get("plan_id") and args.plan_id != agent.get("plan_id"):
@@ -5777,6 +5905,10 @@ def command_record_round_log_evidence(args: argparse.Namespace) -> int:
         "snapshot_id": snapshot["snapshot_id"],
         "snapshot_path": snapshot["snapshot_path"],
         "manifest_path": snapshot["manifest_path"],
+        "snapshot_format_version": snapshot["snapshot_format_version"],
+        "record_status": snapshot["record_status"],
+        "end_reason": snapshot["end_reason"],
+        "renamed_paths": snapshot["renamed_paths"],
         "created_at": snapshot["created_at"],
         "mode": snapshot["mode"],
         "label": snapshot["label"],
@@ -5846,8 +5978,17 @@ def command_require_round_log_evidence(args: argparse.Namespace) -> int:
             return 2
         assert repo_root is not None
         snapshot_id = str(event.get("snapshot_id") or "")
-        if not round_log_manifest_record(round_log_root(repo_root) / snapshot_id):
+        snapshot_dir = round_log_snapshot_dir(repo_root, snapshot_id)
+        snapshot = round_log_manifest_record(snapshot_dir) if snapshot_dir else None
+        if not snapshot:
             print(f"Round-log manifest is missing or unreadable: {snapshot_id}", file=sys.stderr)
+            return 1
+        if snapshot["record_status"] == "incomplete":
+            print(
+                f"Round-log snapshot {snapshot_id} became an incomplete recording and is no longer evidence: "
+                + (snapshot["recording_failure"] or "recording failure"),
+                file=sys.stderr,
+            )
             return 1
     print(f"Round-log evidence present for {args.agent_id}: {event.get('snapshot_id')}")
     return 0
@@ -5862,7 +6003,9 @@ def command_round_log_export(args: argparse.Namespace) -> int:
         print(f"Round-log export requires a Git repository: {repo_error}", file=sys.stderr)
         return 2
     assert repo_root is not None
-    if not round_log_manifest_record(round_log_root(repo_root) / args.snapshot_id):
+    snapshot_dir = round_log_snapshot_dir(repo_root, args.snapshot_id)
+    snapshot = round_log_manifest_record(snapshot_dir) if snapshot_dir else None
+    if not snapshot:
         print(f"Valid round-log snapshot not found: {args.snapshot_id}", file=sys.stderr)
         return 1
     extra_args = ["export", "--snapshot", args.snapshot_id, "--repo", str(repo_root)]
@@ -5884,6 +6027,7 @@ def command_round_log_export(args: argparse.Namespace) -> int:
         "at": timestamp,
         "event": "round-log-export",
         "snapshot_id": args.snapshot_id,
+        "record_status": snapshot["record_status"],
         "repo_root": str(repo_root),
         "export_path": output_path,
         "command_returncode": result.returncode,
@@ -5897,6 +6041,8 @@ def command_round_log_export(args: argparse.Namespace) -> int:
         print(f"Round-log export failed: {detail}", file=sys.stderr)
         return 2
     print(f"Round-log export recorded: {output_path}")
+    if snapshot["record_status"] == "incomplete":
+        print("Warning: this record is an incomplete recording; it is readable review material, not evidence.")
     if result.stdout.strip():
         print(result.stdout.strip())
     return 0
@@ -7752,6 +7898,8 @@ Return `{return_packet}` with:
   display_name: {yaml_quoted(role_title)}
   short_description: {yaml_quoted("Project-defined Master Agent role")}
   default_prompt: {yaml_quoted(f"Use ${skill_name} to complete the assigned {role_name} role packet and return {return_packet}.")}
+policy:
+  allow_implicit_invocation: false
 """
     atomic_write_text(destination / "SKILL.md", skill_text)
     atomic_write_text(destination / "agents" / "openai.yaml", metadata)

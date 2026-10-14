@@ -26,7 +26,8 @@ def run_step(name: str, command: list[object], cwd: Path = ROOT) -> subprocess.C
     result = subprocess.run(
         args,
         cwd=cwd,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=120,
     )
@@ -415,21 +416,26 @@ def write_guard_obligation(path: Path) -> None:
 
 
 def write_round_log_snapshot(repo_root: Path, snapshot_id: str) -> None:
+    """A Change Round Logger format-4 record at .codex-round-log/snapshots/<id>/."""
     log_root = repo_root / ".codex-round-log"
-    snapshot_dir = log_root / snapshot_id
+    snapshot_dir = log_root / "snapshots" / snapshot_id
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     (snapshot_dir / "manifest.json").write_text(
         "\n".join(
             [
                 "{",
+                '  "snapshot_format_version": 4,',
                 f'  "id": "{snapshot_id}",',
                 '  "created_at": "2026-07-30T00:00:00+00:00",',
-                '  "mode": "checkpoint",',
+                '  "mode": "hook",',
                 '  "label": "soak snapshot",',
-                '  "branch": "main",',
+                '  "branch": "",',
+                '  "record_status": "complete",',
                 '  "previous_snapshot_id": "",',
                 '  "copied_paths": ["docs/master-agent/runtime-status.md"],',
                 '  "deleted_paths": [],',
+                '  "renamed_paths": [],',
+                '  "end_reason": "stop",',
                 '  "file_index_path": "files-index.html"',
                 "}",
                 "",
@@ -459,7 +465,8 @@ def run_soak(cycles: int, quick: bool) -> None:
             else shlex.join(provider_argv)
         )
 
-        subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True, encoding="utf-8",
+                       errors="replace")
 
         run_step("bootstrap", [TOOL, "init", "--project-root", project])
         run_step("validate", [TOOL, "validate", "--state-dir", state_dir])

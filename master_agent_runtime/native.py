@@ -9,18 +9,25 @@ import asyncio
 from collections import deque
 from pathlib import Path
 import json
-import os
-import signal
 import shutil
 import sys
 import time
 
 from .contracts import AuthorityError, ContractError, RuntimeErrorBase, UnknownOutcome
+from .oscompat import ProcessGroup, codex_home, minimal_environment, process_group_options
 from .permissions import filesystem_profile
 
 
 class NativeRejected(RuntimeErrorBase):
     pass
+
+
+def _end_leader(process, *, force=False):
+    """Fallback for a group that could not be signalled: end the leader if it still runs."""
+    try:
+        process.kill() if force else process.terminate()
+    except ProcessLookupError:
+        pass
 
 
 class ModelUnavailable(ContractError):
@@ -33,6 +40,7 @@ class JsonRpcClient:
         self.cwd = cwd
         self.timeout = timeout
         self.process = None
+        self._group = None
         self._reader = None
         self._errors = None
         self._serial = 0
@@ -44,10 +52,10 @@ class JsonRpcClient:
         self._close_lock = asyncio.Lock()
 
     async def start(self):
-        kwargs = {"start_new_session": True} if os.name == "posix" else {}
         self.process = await asyncio.create_subprocess_exec(*self.argv, cwd=self.cwd,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024, **kwargs)
+            stderr=asyncio.subprocess.PIPE, limit=4 * 1024 * 1024, **process_group_options())
+        self._group = ProcessGroup(self.process.pid)
         self._reader = asyncio.create_task(self._read())
         self._errors = asyncio.create_task(self._read_errors())
         return self
@@ -127,45 +135,43 @@ class JsonRpcClient:
         if not self.process:
             return {"process_exited": True, "reason": "not started"}
         process = self.process
+        group = self._group or ProcessGroup(process.pid)
         if process.returncode is None:
             if process.stdin:
                 process.stdin.close()
             try:
                 await asyncio.wait_for(process.wait(), 2)
             except asyncio.TimeoutError:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGTERM)
-                else:
-                    process.terminate()
+                if not group.signal():
+                    _end_leader(process)
                 try:
                     await asyncio.wait_for(process.wait(), 3)
                 except asyncio.TimeoutError:
-                    if os.name == "posix":
-                        os.killpg(process.pid, signal.SIGKILL)
-                    else:
-                        process.kill()
+                    if not group.signal(force=True):
+                        _end_leader(process, force=True)
                     await process.wait()
-        if os.name=='posix':
-            # Reap remaining members of the process group we created; closing
-            # only its leader can leave background writers holding the pipes.
-            try:os.killpg(process.pid,signal.SIGTERM)
-            except ProcessLookupError:pass
+        # Reap remaining members of the process group (Windows: job) we
+        # created; closing only its leader can leave background writers
+        # holding the pipes.
+        group.reap()
         tasks=[task for task in (self._reader,self._errors) if task]
         if tasks:
             done,pending=await asyncio.wait(tasks,timeout=2)
             for task in pending:task.cancel()
             await asyncio.gather(*tasks,return_exceptions=True)
         return {"process_exited": process.returncode is not None, "exit_code": process.returncode,
-                "effect_coverage": "owned native service/process group; arbitrary escaped processes not certified"}
+                "effect_coverage": ("owned native service/process group; arbitrary escaped processes not certified"
+                                    if group.contained else "owned native service and its live descendants "
+                                    "(no job object); arbitrary escaped processes not certified")}
 
 
 def permission_config(workspace: Path, context: Path, control: Path, *, readonly=False, cli="codex",write_paths=None,runtime_executables=()) -> tuple[str, dict]:
     """Ephemeral, narrow profile; no mutation of the operator's config file."""
     name = "master-runtime-review" if readonly else "master-runtime-module"
     profile = filesystem_profile(workspace,(context,),writable=not readonly,executables=(cli,*runtime_executables),
-        denied=(control,Path.home()/'.codex'/'auth.json',Path.home()/'.aws',Path.home()/'.ssh'),write_paths=write_paths)
+        denied=(control,codex_home()/'auth.json',Path.home()/'.aws',Path.home()/'.ssh'),write_paths=write_paths)
     fs = profile['filesystem']
-    global_instructions = Path.home() / ".codex" / "AGENTS.md"
+    global_instructions = codex_home() / "AGENTS.md"
     if global_instructions.exists():
         fs[str(global_instructions)] = "read"
     # Do not extend :workspace: its implicit global temp writes would broaden
@@ -183,13 +189,12 @@ def permission_config(workspace: Path, context: Path, control: Path, *, readonly
                   'in_app_local_automation','goals','skill_mcp_dependency_install')},
               "agents": {"enabled": False}, "allow_login_shell": False,
               "shell_environment_policy": {"inherit": "none", "ignore_default_excludes": False,
-                  "set": {"PATH": os.environ.get("PATH", os.defpath), "LANG": "en_US.UTF-8",
-                          "PYTHONDONTWRITEBYTECODE": "1",'TMPDIR':str(private_temp),
-                          'TMP':str(private_temp),'TEMP':str(private_temp)}}}
+                  "set": minimal_environment(PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(private_temp),
+                                             TMP=str(private_temp), TEMP=str(private_temp))}}
     # Names only are examined, never credential values. Existing MCP transports
     # are separate effects and are not admitted by this local-code first slice.
     import tomllib
-    config_path = Path.home() / ".codex" / "config.toml"
+    config_path = codex_home() / "config.toml"
     if config_path.is_file():
         with config_path.open("rb") as stream:
             operator = tomllib.load(stream)

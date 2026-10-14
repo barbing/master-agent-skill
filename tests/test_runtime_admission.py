@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,8 @@ from master_agent_runtime import ModuleSpec, ProjectSpec, Store, ValidationStep
 from master_agent_runtime.admission import describe_handoff, load_handoff
 from master_agent_runtime.contracts import ContractError, FORBIDDEN_EFFECTS
 from master_agent_runtime.native import JsonRpcClient
+
+from runtime_fixtures import make_junction, symlinks_available
 
 
 class AdmissionTests(unittest.TestCase):
@@ -216,7 +219,10 @@ class AdmissionTests(unittest.TestCase):
 
     def test_invalid_roots_preserve_contract_failure(self):
         link = self.root / "linked-project"
-        link.symlink_to(self.project, target_is_directory=True)
+        if os.name == "nt" and not symlinks_available():
+            make_junction(link, self.project)  # the redirection any Windows account can create
+        else:
+            link.symlink_to(self.project, target_is_directory=True)
         for root in ("relative", str(self.root / "absent"), str(self.path), str(link)):
             data = self.spec.to_dict()
             data["root"] = root

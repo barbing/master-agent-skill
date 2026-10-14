@@ -7,7 +7,7 @@ A runtime in which a non-implementing **Master Agent** runs a software project f
 - **The host.** Plain Python, not a model. It enforces every scope, runs every check in a sandbox and journals every step in SQLite.
 - **Your project is untouched.** You get an integrated copy and a report.
 
-The runtime is the `master_agent_runtime/` package and uses only the Python standard library. This repository also carries an older, file-based Codex skill pack for coordinating agent sessions by hand; see [The Codex skill pack](#the-codex-skill-pack). The runtime neither uses nor activates it.
+The runtime is the `master_agent_runtime/` package and uses only the Python standard library. It runs on macOS and Windows. This repository also carries an optional manual coordination mode, a file-based Codex skill pack that Codex runs only when you invoke it by name; see [Optional: manual coordination mode](#optional-manual-coordination-mode). The runtime neither uses nor activates it.
 
 ## How a project runs
 
@@ -65,13 +65,21 @@ Earlier live runs exercised both providers.
 
 ## Requirements
 
-- **macOS.** The isolation profiles are built and tested there.
-- **Python 3.12 or later.** Tested with 3.12 and 3.14.
+- **macOS or Windows.** On Windows the target is Windows 11; its release validation is in [`references/windows-validation.md`](references/windows-validation.md). Linux shares the macOS code paths but has not been validated.
+- **Python 3.12 or later.** Tested with 3.12 and 3.14. On Windows use a python.org install; a Microsoft Store app alias may not start inside the sandbox.
 - **The Codex CLI, always,** because every check runs in its sandbox.
-  - The runtime looks for `codex` on `PATH` and in the ChatGPT and Codex app bundles; pass `--codex PATH` to pin one.
+  - **Where the runtime looks.** `codex` on `PATH`, then the standard install locations: the ChatGPT and Codex app bundles on macOS; the standalone installer's folder and npm's packaged `codex.exe` on Windows. Pass `--codex PATH` to pin one.
+  - **Windows.** The runtime runs `codex.exe` itself, never the npm `codex.cmd` shim, whose `cmd.exe` would re-parse the probe code and permission tables. Codex must use its MXC or elevated sandbox; the unelevated sandbox cannot enforce read restrictions, so the conformance probe refuses it.
   - For Codex actors it must offer the configured model. The runtime never substitutes a model or installs anything.
-- **Claude Code 2.1.263 or later, logged in, for Claude actors.** Check with `claude auth status`. It is found on `PATH` or at `~/.local/bin/claude`; pass `--claude PATH` to pin one.
-- **A runtime state directory** outside the project. Keep it under your home folder, not in a shared temp tree.
+- **Claude Code 2.1.263 or later, logged in, for Claude actors, on macOS or Linux (including WSL2).** Check with `claude auth status`. It is found on `PATH` or at `~/.local/bin/claude`; pass `--claude PATH` to pin one.
+  - **Native Windows.** Claude Code's Bash sandbox does not run there, so the runtime refuses Claude actors before any session. Run the runtime inside WSL2, or route those actors to Codex.
+- **A runtime state directory** outside the project. Keep it under your home folder, not in a shared temp tree. On Windows also keep it out of OneDrive-synced folders, and keep its path short unless long paths are enabled.
+
+**Check a machine first.** `doctor` runs every platform mechanism a run depends on against the installed CLIs, without a project or a model call, and leaves its probe evidence under `STATE/doctor/`:
+
+```bash
+python3 -m master_agent_runtime --state ~/runtime-state doctor
+```
 
 ## Quick start
 
@@ -129,6 +137,8 @@ python3 -m master_agent_runtime --state ~/runtime-state accept PROJECT_ID --auth
   - Each outcome comes with a remedy.
   - Run it again after acting; owners resume their own sessions.
 - **`health`** always names the next command to run.
+
+**On Windows**, run the same commands from PowerShell with `py -m master_agent_runtime --state $HOME\runtime-state ...`, and give the handoff Windows paths (`"root": "C:\\work\\project"`). Save the handoff as UTF-8 without a byte-order mark; Windows PowerShell 5.1's `Set-Content -Encoding utf8` adds one, which JSON does not allow. The report prints its accept and reject commands quoted for PowerShell.
 
 ## The handoff
 
@@ -210,6 +220,7 @@ Every command takes `--state DIR` before the command name, and prints JSON.
 | Command | What it does |
 | --- | --- |
 | `init HANDOFF` | Validate and admit a handoff, and print its project id. No model calls. |
+| `doctor [--codex PATH] [--claude PATH]` | Check this machine: Python, the project lease, owned process groups, the Codex CLI, its app-server and sandbox contract, the write and read conformance probes, and one sandboxed check. No project or model calls; exits 0 when ready. |
 | `run PROJECT [--codex PATH] [--claude PATH]` | Run until the project needs you or ends. It exits 0 for `accepted` or `awaiting_acceptance` and 1 otherwise. Running an accepted project again returns the original delivery without native work. |
 | `status PROJECT` | The recorded state: modules, operations, waiting questions, usage by role (`master`, `owners`, `verifiers`) and the cost estimate. |
 | `health PROJECT` | Whether it is safe to run, what needs reconciling, and the next action, with the command to use. |
@@ -232,7 +243,7 @@ Every command takes `--state DIR` before the command name, and prints JSON.
 
 - **Write scope.** Every owner activation gets a fresh workspace. Only the module's admitted paths and a private `.tmp` are writable; the rest of the project, the oracle files and dependency code stay readonly.
   - **Sealing.** The host checks the workspace before sealing. Changes outside the grant, or to readonly context, are refused.
-  - **Protected names.** Paths containing `.git`, `.gitignore`, `.codex`, `.agents`, `.aws`, `.claude` or `CLAUDE.md` can never be admitted.
+  - **Protected names.** Paths containing `.git`, `.gitignore`, `.codex`, `.agents`, `.aws`, `.claude` or `CLAUDE.md`, in any letter case, can never be admitted. On Windows, names the filesystem treats specially, such as drive-relative `D:x`, alternate streams `a:b` and device names like `nul`, are refused too.
 - **Readonly roles.** The Master and the verifiers cannot write project files; each writes only scratch in its own workspace.
 - **No external effects.** Git staging and commits, policy changes, publication, deployment, installs and credential changes cannot be admitted. Actors' commands and all checks run without network access.
 - **Private storage.** Your acceptance checks, the sealed probes and the reports sit where no actor profile can read them. An owner gets a failing probe's behaviour and expected and observed results, never its code.
@@ -241,10 +252,12 @@ Every command takes `--state DIR` before the command name, and prints JSON.
   - **What a submission records:** file hashes, the dependency versions it was built on, its mandate revision and its native operation.
   - **The Master's view:** an index of the evidence.
 - **One controller per project.** A lease refuses a second `run` while one is active.
+- **Conformance before trust.** Before each actor binding and each check, a probe in the same sandbox and profile must write its own workspace (when writable), fail to write outside it, and fail to read two sentinels the host plants: one in a fresh shared temp folder, and one inside the control state, or beside a check's scratch. Any other outcome refuses the run with the evidence.
+- **Owned processes.** Each actor process starts in its own process group, a job object on Windows, and the host ends every member of it when the actor closes.
 
 **Codex actors** run through `codex app-server`, under least-privilege permission profiles that the host checks before any turn. Each activation resumes the same thread.
 
-**Claude Code actors** run one non-interactive `claude -p` process per turn, on a host-chosen session id that later turns resume.
+**Claude Code actors** run one non-interactive `claude -p` process per turn, on a host-chosen session id that later turns resume. They need macOS or Linux.
 - **Tools.** The flags give an explicit tool list with no subagents, web access or MCP servers. Permission prompts are refused rather than asked.
 - **Edits.** File edits are allowed only on the admitted paths and `.tmp`.
 - **Bash** always runs in Claude Code's OS sandbox with the network off, and writes only where edits may. The kernel denies reads of the home folder, credential folders and the control state.
@@ -278,6 +291,7 @@ Every command takes `--state DIR` before the command name, and prints JSON.
 | `projects/<id>/reports/` | Your integration reports. |
 | `projects/<id>/native-traces/` | Per-turn traces, including Claude Code's streams. |
 | `projects/<id>/workspaces/` | Owner workspaces, one per activation, and the Master's and verifiers' scratch. |
+| `doctor/<run>/` | Each `doctor` run's probe evidence and sandboxed-check log. |
 
 ## Testing and the release gate
 
@@ -287,7 +301,7 @@ python3 -m unittest discover -s pilots -p 'owned_*_test.py'
 python3 scripts/release_validate.py --quick-validate <path-to-skill-creator>/scripts/quick_validate.py
 ```
 
-**`tests/`** holds 384 tests: 244 for the runtime and 140 for the skill pack's tool.
+**`tests/`** holds 423 tests: 278 for the runtime and 145 for the skill pack's tool. `test_runtime_windows_compat.py` covers the Windows port in three layers: static guards that keep POSIX-only calls in `oscompat.py` and make every text read, write and pipe name its encoding; the Windows branches' logic, simulated on any OS; and native Windows behaviour, which runs only there.
 
 **`pilots/`** keeps the frozen files of two completed runtime pilots byte for byte. The second command reruns the tests their module owners wrote, 20 executions; see `pilots/README.md`.
 
@@ -305,9 +319,9 @@ python3 scripts/release_validate.py --quick-validate <path-to-skill-creator>/scr
 `quick_validate` needs PyYAML in the validating interpreter. `--installed-skill-dir` compares an installed copy of the skill pack with this source.
 
 **Gate notes.**
-- **Versions.** It passes on macOS with Python 3.12 and 3.14.
-- **Temp folder.** Two tests in `test_runtime_sandbox.py` create a directory under `/private/tmp`, so they pass only where that is writable.
-- **Interpreter path.** Run the gate from an interpreter whose path has no spaces; two legacy tests build unquoted commands from it.
+- **Versions.** It passes on macOS with Python 3.12 and 3.14. The Windows run, and what to report from it, is in [`references/windows-validation.md`](references/windows-validation.md).
+- **Temp folder.** The tests in `test_runtime_sandbox.py` create a directory in the shared temp root (`/private/tmp` on macOS), so they pass only where that is writable.
+- **Not inside an agent sandbox.** Run the suite, the gate and `doctor` from an ordinary terminal. Inside Codex's or Claude Code's own sandbox, writes to Git metadata and shared temp folders are refused, and a nested sandbox cannot start.
 
 **CI.** `assets/examples/release-validate.yml` is a GitHub Actions example. It runs the gate and the owner suite on Python 3.12 and 3.14. Copy it to `.github/workflows/` to activate it; this repository keeps `.github/` excluded.
 
@@ -324,51 +338,27 @@ python3 scripts/release_validate.py --quick-validate <path-to-skill-creator>/scr
 │   ├── claude_native.py    Claude Code actors
 │   ├── validation.py       sandboxed checks
 │   ├── recovery.py         reconcile
+│   ├── oscompat.py         macOS, Linux and Windows differences: lease, process groups, environments, links, CLIs
+│   ├── doctor.py           machine readiness checks
 │   └── …                   admission, artifacts, evidence, health, permissions, sandbox
 ├── tests/                  regression suites for the runtime and the skill pack's tool
 ├── pilots/                 frozen artifacts of two completed runtime pilots
-├── SKILL.md                the Codex skill pack: main skill
-├── role-skills/            the Codex skill pack: Strategy, Coding, Review, Policy Review and Learning Distiller roles
-├── scripts/                the Codex skill pack: tool, state pack, providers, soak and release gate
+├── SKILL.md                manual coordination mode: main skill
+├── role-skills/            manual coordination mode: Strategy, Coding, Review, Policy Review and Learning Distiller roles
+├── scripts/                manual coordination mode's tool, state pack, providers and soak; the release gate
 ├── assets/                 state-pack templates and CI / pre-commit examples
-├── references/             the skill pack's reference manual and provider-command contract
-└── agents/openai.yaml      skill metadata
+├── references/             the manual mode's reference and provider-command contract; the Windows validation plan
+└── agents/openai.yaml      skill metadata (explicit invocation only)
 ```
 
-## The Codex skill pack
+## Optional: manual coordination mode
 
-The older layer is a project-neutral Codex skill for coordinating long-running, multi-agent work by hand. Its Master is again a non-implementing control plane, but project continuity lives in a file-based **state pack**: ledgers, context packets, work orders, heartbeats, receipts, review verdicts, token budgets and a governed correction-learning loop. Agents are short-lived Codex sessions launched through a provider command or the Codex app, and evidence is recorded with the tool.
+The repository also carries the system's earlier, file-based form: a Codex skill pack for coordinating agent sessions by hand. Its Master is again a non-implementing control plane, but project continuity lives in a **state pack** of ledgers, packets, receipts and verdicts, and agents are short-lived Codex sessions that you or a provider command launch. It is optional, and hidden by default: every skill in it sets `allow_implicit_invocation: false`, so Codex runs it only when you invoke it by name, as `$master-agent-system` or `$master-coding-agent`.
 
-**Install.**
-- **Main skill.** Copy this folder to `~/.codex/skills/master-agent-system` (on Windows, `$HOME\.codex\skills\master-agent-system`).
-- **Role skills.** To trigger them directly, install each folder under `role-skills/` separately.
-- Restart Codex afterwards.
-
-**Start.**
-
-```bash
-python scripts/master_agent_tool.py init --project-root <project-root>
-python scripts/master_agent_tool.py validate --state-dir <project-root>/docs/master-agent --strict
-```
-
-This creates the state pack at `<project-root>/docs/master-agent`. Read `references/master-agent-system.md`, the full manual, before using it on a real project; `SKILL.md` gives the load order and core rules.
-
-`scripts/master_agent_tool.py` covers the whole workflow:
-
-| Area | Commands |
-| --- | --- |
-| Strategy and governance | `accept-strategy`, `strategy-packet-lint`, `require-strategy-packet-before-work`, `governance-lint`, `record-governance-status`, `record-acceptance-gate`, `record-authority-required` |
-| Sessions and isolation | `session-confirm-create`, `session-confirm-send`, `session-confirm-read`, `session-confirm-archive`, `request-rotation`, `validate-predecessor-state`, `rotate-session` |
-| Worktrees | `worktree-plan`, `worktree-confirm-create`, `worktree-assign-session`, `worktree-reconcile`, `worktree-close`, `worktree-confirm-close`, `validate-worktreeinclude` |
-| Boundaries and parallelism | `enforce-master-boundary`, `assess-parallelism` |
-| Document memory | `repair-log-init`, `repair-log-status`, `require-current-repair-row`, `record-task`, `open-repair-cycle`, `record-repair-attempt` |
-| Round-log evidence (optional) | `round-log-status`, `record-round-log-evidence`, `require-round-log-evidence`, `round-log-export` |
-| Learning | `record-learning-correction`, `learning-cycle-start`, `learning-proposal-lint`, `accept-learning-proposal`, `record-learning-effectiveness` |
-
-**Providers and soak.**
-- `provider=codex` runs sessions unattended through a provider command, given by `--provider-command` or `MASTER_AGENT_SESSION_PROVIDER`. `scripts/file_session_provider.py` is the reference adapter, and `references/provider-command-adapter.md` its contract.
-- `provider=codex-app` records Codex app thread operations as evidence.
-- `python scripts/soak_validate.py --quick` exercises the runtime controls before a release.
+- **Install.** Copy this folder to `~/.codex/skills/master-agent-system` (on Windows, `$HOME\.codex\skills\master-agent-system`), and each folder under `role-skills/` beside it to invoke the roles directly; restart Codex.
+- **Start.** `python scripts/master_agent_tool.py init --project-root <project-root>` creates the state pack at `<project-root>/docs/master-agent`.
+- **Read first.** `SKILL.md` gives the load order and core rules, and `references/master-agent-system.md` is the full manual; `python scripts/master_agent_tool.py --help` lists every command.
+- **Round-log evidence.** With the Change Round Logger plugin, the tool binds the logger's records (`.codex-round-log/snapshots/<id>/`) to agent receipts and refuses incomplete recordings as evidence.
 
 ## License
 

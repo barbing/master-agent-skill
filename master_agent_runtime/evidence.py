@@ -5,11 +5,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import tempfile
 
 from .artifacts import read_regular
 from .contracts import ConflictError, ContractError, canonical, digest
+from .oscompat import close_directory, is_link_like, open_directory, remove_tree, rename_directory
 
 MAX_COMMAND_OUTPUT = 128 * 1024
 MAX_COMMANDS = 512
@@ -79,22 +79,22 @@ def seal_review_evidence(destination: Path, *, bindings: dict, commands: list,
         try:
             for name, payload in files.items():
                 path = staging / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(payload)
-            staging.rename(target)
+            rename_directory(staging, target)
             for path in target.rglob('*'):
                 if path.is_file(): path.chmod(0o444)
         finally:
-            if staging.exists(): shutil.rmtree(staging)
+            if staging.exists(): remove_tree(staging)
     verify_review_evidence(target, expected_hash=evidence_hash, bindings=bindings)
     return {'path': str(target), 'hash': evidence_hash}
 
 
 def verify_review_evidence(root: Path, *, expected_hash: str, bindings: dict) -> dict:
-    if root.is_symlink(): raise ContractError('Evidence root must not be a symlink')
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if is_link_like(root): raise ContractError('Evidence root must not be a symlink')
+    fd = open_directory(root)
     try:
         names = []
         for directory, dirs, files in os.walk(root, followlinks=False):
-            if any((Path(directory) / name).is_symlink() for name in dirs):
+            if any(is_link_like(Path(directory) / name) for name in dirs):
                 raise ContractError('Evidence directories must not be symlinks')
             names.extend((Path(directory) / name).relative_to(root).as_posix() for name in files)
         contents = {name: read_regular(fd, name) for name in sorted(names)}
@@ -104,4 +104,4 @@ def verify_review_evidence(root: Path, *, expected_hash: str, bindings: dict) ->
         if body['bindings'] != bindings: raise ConflictError('Review evidence binds a different candidate/mandate')
         return body
     finally:
-        os.close(fd)
+        close_directory(fd)

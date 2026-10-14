@@ -24,14 +24,18 @@ SECRET_RE = re.compile(
 )
 
 
-def run_step(name: str, command: list[str], cwd: Path = ROOT) -> tuple[str, int, str]:
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        text=True,
-        capture_output=True,
-        timeout=240,
-    )
+def run_step(name: str, command: list[str], cwd: Path = ROOT, timeout: float = 240) -> tuple[str, int, str]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return name, 1, f"timed out after {timeout:g}s"
     detail = (result.stdout + result.stderr).strip()
     return name, result.returncode, detail
 
@@ -295,7 +299,9 @@ def main() -> int:
     if skip_core:
         checks.append(("core command checks", 0, "skipped by MASTER_AGENT_RELEASE_VALIDATE_SKIP_CORE"))
     else:
-        checks.append(run_step("unit tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]))
+        # Process start-up is far slower on Windows, and the suite starts hundreds.
+        checks.append(run_step("unit tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                               timeout=900))
         checks.append(run_step("py_compile", [sys.executable, "-m", "py_compile", *map(str, python_files)]))
         checks.append(run_step("template state pack", [sys.executable, "scripts/validate_state_pack.py", "assets/templates"]))
         checks.append(run_step("operating-system soak", [sys.executable, "scripts/soak_validate.py", "--quick"]))

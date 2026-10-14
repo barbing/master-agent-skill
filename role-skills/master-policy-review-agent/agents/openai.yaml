@@ -2,3 +2,5 @@ interface:
   display_name: "Master Policy Review Agent"
   short_description: "Authority compliance checks"
   default_prompt: "Use $master-policy-review-agent to check this packet against authority docs and project policy."
+policy:
+  allow_implicit_invocation: false

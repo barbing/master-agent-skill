@@ -103,6 +103,12 @@ result(subtype='success', is_error=False, result='Done.', structured_output=outp
 '''
 
 
+# Claude Code's Bash sandbox does not run on native Windows, so the runtime
+# refuses Claude actors there (test_runtime_windows_compat covers the refusal),
+# and this fake is a POSIX shell wrapper.
+NATIVE_WINDOWS = "Claude actors are refused on native Windows"
+
+
 class FakeClaude:
     def __init__(self, root):
         self.root = Path(root)
@@ -123,6 +129,7 @@ class FakeClaude:
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
 
+@unittest.skipIf(os.name == "nt", NATIVE_WINDOWS)
 class ClaudeActorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -300,6 +307,7 @@ class ClaudeActorTests(unittest.IsolatedAsyncioTestCase):
                 await owner.await_turn(await owner.start_turn('x', client_message_id='op-e'))
 
 
+@unittest.skipIf(os.name == "nt", NATIVE_WINDOWS)
 class ClaudeControllerTests(unittest.IsolatedAsyncioTestCase):
     async def test_claude_master_and_owners_deliver_with_same_session_rework(self):
         with tempfile.TemporaryDirectory() as tmp:

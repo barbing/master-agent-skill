@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -310,11 +311,17 @@ def write_round_log_snapshot(
     snapshot_id: str = "0001_20260730T000000",
     copied_paths: list[str] | None = None,
     deleted_paths: list[str] | None = None,
+    *,
+    layout: str = "current",
+    record_status: str = "complete",
+    renamed_paths: list[dict] | None = None,
+    extra: dict | None = None,
 ) -> Path:
+    """A Change Round Logger record: format 4 under snapshots/<id>/, or an older root-level record."""
     copied = copied_paths if copied_paths is not None else ["src/module.py"]
     deleted = deleted_paths if deleted_paths is not None else []
     log_root = repo_root / ".codex-round-log"
-    snapshot_dir = log_root / snapshot_id
+    snapshot_dir = (log_root / "snapshots" if layout == "current" else log_root) / snapshot_id
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "id": snapshot_id,
@@ -327,6 +334,10 @@ def write_round_log_snapshot(
         "deleted_paths": deleted,
         "file_index_path": "files-index.html",
     }
+    if layout == "current":
+        manifest.update({"snapshot_format_version": 4, "mode": "hook", "record_status": record_status,
+                         "renamed_paths": renamed_paths or [], "end_reason": "stop"})
+    manifest.update(extra or {})
     (snapshot_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -3492,7 +3503,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 "--provider",
                 "codex",
                 "--provider-command",
-                f"{PYTHON} {provider_script}",
+                provider_command_from_argv([PYTHON, provider_script]),
             ]
         )
 
@@ -3529,7 +3540,7 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIsNone(error)
         run.assert_called_once_with(
             command, input=json.dumps(request, sort_keys=True) + "\n",
-            text=True, capture_output=True, timeout=7, shell=False,
+            encoding="utf-8", errors="replace", capture_output=True, timeout=7, shell=False,
         )
 
     def test_provider_command_posix_preserves_arguments_and_rejects_invalid_input(self):
@@ -3543,7 +3554,7 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertEqual(payload, {"status": "active"})
         self.assertIsNone(error)
         run.assert_called_once_with(
-            argv, input="{}\n", text=True, capture_output=True, timeout=7, shell=False,
+            argv, input="{}\n", encoding="utf-8", errors="replace", capture_output=True, timeout=7, shell=False,
         )
         for command, detail in [("  ", "empty"), ('python "unterminated', "parsed")]:
             with self.subTest(command=command), \
@@ -5761,7 +5772,7 @@ class MasterAgentToolTests(unittest.TestCase):
                 "--snapshot-id",
                 "0004_20260730T000000",
                 "--round-log-command",
-                f"{PYTHON} {fake_command}",
+                provider_command_from_argv([PYTHON, fake_command]),
                 "--output",
                 output,
             ]
@@ -5775,6 +5786,93 @@ class MasterAgentToolTests(unittest.TestCase):
             .splitlines()
         ]
         self.assertEqual(events[-1]["event"], "round-log-export")
+
+    def register_round_agent(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        accept_valid_strategy(self.state_dir, self.tmp, "PLAN-ROUND")
+        run_cmd([TOOL, "register-agent", "--state-dir", self.state_dir, "--agent-id", "coding-round",
+                 "--role", "Coding", "--task-id", "TASK-ROUND", "--objective", "Implement bounded work",
+                 "--scope", "src", "--plan-id", "PLAN-ROUND"])
+
+    def record_round_evidence(self, snapshot_id, *expected, check=True):
+        args = [TOOL, "record-round-log-evidence", "--state-dir", self.state_dir, "--project-root", self.tmp,
+                "--agent-id", "coding-round", "--snapshot-id", snapshot_id]
+        for path in expected:
+            args += ["--expected-path", path]
+        return run_cmd(args, check=check)
+
+    def test_round_log_still_reads_records_of_an_older_logger(self):
+        self.register_round_agent()
+        write_round_log_snapshot(self.tmp, "0005_20260730T000000", layout="legacy")
+        status = run_cmd([TOOL, "round-log-status", "--state-dir", self.state_dir, "--project-root", self.tmp])
+        self.assertIn("Round log status: available", status.stdout)
+        self.assertIn("Latest record status: legacy_capture", status.stdout)
+        self.assertIn("Recorded round-log evidence",
+                      self.record_round_evidence("0005_20260730T000000", "src/module.py").stdout)
+
+    def test_incomplete_round_log_records_are_never_evidence(self):
+        self.register_round_agent()
+        write_round_log_snapshot(self.tmp, "0006_20260730T000000", record_status="incomplete",
+                                 extra={"capture_status": "complete",
+                                        "recording_failure": {"error_type": "OSError", "error": "disk full"}})
+        refused = self.record_round_evidence("0006_20260730T000000", check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("incomplete recording", refused.stderr)
+        self.assertIn("disk full", refused.stderr)
+
+        # A record the logger later marks failed (failures/<identity>.json) stops being evidence.
+        session = {"interaction_session_id": "session-1", "interaction_user_turn_id": "turn-1"}
+        write_round_log_snapshot(self.tmp, "0007_20260730T000000", extra=session)
+        self.record_round_evidence("0007_20260730T000000", "src/module.py")
+        required = [TOOL, "require-round-log-evidence", "--state-dir", self.state_dir, "--agent-id", "coding-round",
+                    "--project-root", self.tmp]
+        self.assertIn("Round-log evidence present", run_cmd(required).stdout)
+        identity = hashlib.sha256(b"session-1\0turn-1").hexdigest()
+        failures = self.tmp / ".codex-round-log" / "failures"
+        failures.mkdir(parents=True)
+        (failures / f"{identity}.json").write_text(json.dumps(
+            {"status": "incomplete", "error_type": "TimeoutError", "error": "stop sweep timed out"}), encoding="utf-8")
+        later = run_cmd(required, check=False)
+        self.assertEqual(later.returncode, 1)
+        self.assertIn("no longer evidence", later.stderr)
+        status = run_cmd([TOOL, "round-log-status", "--state-dir", self.state_dir, "--project-root", self.tmp])
+        self.assertIn("Round log status: warning", status.stdout)
+        self.assertIn("Recording failures: 1", status.stdout)
+
+    def test_round_log_renames_count_as_changed_paths(self):
+        self.register_round_agent()
+        write_round_log_snapshot(self.tmp, "0008_20260730T000000", copied_paths=[],
+                                 renamed_paths=[{"old": "src/old.py", "new": "src/new.py",
+                                                 "basis": "captured_file_identity"}])
+        self.assertIn("Recorded round-log evidence",
+                      self.record_round_evidence("0008_20260730T000000", "src/new.py", "src/old.py").stdout)
+        event = json.loads((self.state_dir / "state" / "round-log-events.jsonl")
+                           .read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(event["renamed_paths"][0]["new"], "src/new.py")
+        self.assertEqual(event["record_status"], "complete")
+        self.assertEqual(event["snapshot_format_version"], 4)
+
+    def test_round_log_status_reports_the_capture_scope(self):
+        subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
+        run_cmd([TOOL, "init", "--project-root", self.tmp])
+        write_round_log_snapshot(self.tmp, "0009_20260730T000000")
+        scope = self.tmp / ".codex-round-log" / "capture-scope.json"
+        for content, expected in (({"project_root": str(self.tmp), "include": ["src"], "exclude": [], "draft": True}, "draft"),
+                                  ({"project_root": str(self.tmp), "include": ["src"], "exclude": []}, "declared"),
+                                  ({"recording": "off"}, "off")):
+            scope.write_text(json.dumps(content), encoding="utf-8")
+            status = run_cmd([TOOL, "round-log-status", "--state-dir", self.state_dir, "--project-root", self.tmp])
+            self.assertIn(f"Capture scope: {expected}", status.stdout)
+        control = (self.state_dir / "round-log-control.md").read_text(encoding="utf-8")
+        self.assertIn("- Capture scope: off", control)
+        self.assertIn("- Latest record status: complete", control)
+
+    def test_round_log_ids_cannot_leave_the_log(self):
+        self.register_round_agent()
+        refused = self.record_round_evidence("../../outside", check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("Valid round-log snapshot not found", refused.stderr)
 
     def test_repair_log_init_status_and_task_current_row_gate(self):
         subprocess.run(["git", "init"], cwd=self.tmp, check=True, capture_output=True, text=True)
@@ -6200,6 +6298,7 @@ class MasterAgentToolTests(unittest.TestCase):
         self.assertIn('description: "Use when a Quoted Research Agent', skill_text)
         self.assertIn('\\"source packets\\"', skill_text)
         self.assertIn('default_prompt: "Use $master-quoted-research-agent', metadata)
+        self.assertIn("allow_implicit_invocation: false", metadata)
 
     def test_scaffold_role_skill_output_passes_quick_validate(self):
         run_cmd([TOOL, "init", "--project-root", self.tmp])
@@ -6284,6 +6383,9 @@ class MasterAgentToolTests(unittest.TestCase):
     def test_role_skills_are_present_and_triggerable(self):
         root_metadata = (ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn("Use $master-agent-system", root_metadata)
+        # The skill pack is an optional manual mode: Codex runs it only when
+        # someone invokes it by name, never by implicit selection.
+        self.assertIn("allow_implicit_invocation: false", root_metadata)
 
         expected = {
             "master-strategy-agent": "Strategy Agent",
@@ -6306,6 +6408,8 @@ class MasterAgentToolTests(unittest.TestCase):
             self.assertIn("description: Use when", skill_text)
             self.assertIn(role_name, skill_text)
             self.assertIn(f"Use ${folder}", metadata)
+            self.assertTrue(metadata.startswith("interface:\n"), folder)
+            self.assertIn("allow_implicit_invocation: false", metadata)
 
     def test_role_skills_can_be_installed_to_skills_dir(self):
         skills_dir = self.tmp / "skills"

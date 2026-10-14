@@ -42,7 +42,8 @@ def _process_is_alive(pid_value: object) -> bool:
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=5,
             )

@@ -11,8 +11,11 @@
 - Status:
 - Repo root:
 - Round log root: .codex-round-log
+- Capture scope:
 - Latest snapshot id:
+- Latest record status:
 - Snapshot count:
+- Recording failures:
 - Plugin command:
 
 ## Evidence Binding
@@ -21,6 +24,7 @@
 - Latest plan id:
 - Latest worktree id:
 - Latest evidence snapshot id:
+- Latest evidence record status:
 - Latest manifest path:
 - Required before receipt acceptance: yes
 
@@ -29,6 +33,7 @@
 - Inspect status before accepting concurrent implementation receipts.
 - Record snapshot id, manifest path, agent id, plan id, and worktree id when available.
 - Treat manifest paths as evidence, not implementation authority.
+- Records live at `.codex-round-log/snapshots/<id>/manifest.json`; an incomplete record (a recording failure) is never evidence.
 - Use Git boundary enforcement for current write-set blocking.
 
 ## Export Policy

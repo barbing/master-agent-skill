@@ -6,6 +6,8 @@ from pathlib import Path, PurePosixPath
 import hashlib
 import json
 
+from . import oscompat
+
 
 class RuntimeErrorBase(Exception):
     pass
@@ -75,16 +77,30 @@ def digest(value: object) -> str:
 # .claude holds executable agent configuration; CLAUDE.md is loaded as instructions
 # by Claude actors, so neither can travel inside a deliverable artifact.
 PROTECTED_PARTS = {".git", ".gitignore", ".codex", ".agents", ".aws", ".claude", "CLAUDE.md"}
+# Default Windows and macOS filesystems ignore case, so .Git or claude.md
+# would be the protected file itself.
+_PROTECTED_FOLDED = {part.casefold() for part in PROTECTED_PARTS}
 FORBIDDEN_EFFECTS = frozenset({"git_commit", "git_stage", "git_policy", "publish",
                              "deploy", "install", "credential_change", "policy_change"})
+
+
+def is_protected_part(part: str) -> bool:
+    return part.casefold() in _PROTECTED_FOLDED
 
 
 def relative_path(value: str) -> str:
     p = PurePosixPath(value)
     if (not value or p.is_absolute() or ".." in p.parts or "\\" in value
-            or any(x in PROTECTED_PARTS for x in p.parts)
+            or any(is_protected_part(x) for x in p.parts)
             or p.as_posix() in {".", ""}):
         raise ContractError(f"Invalid or protected project-relative path: {value!r}")
+    if oscompat.WINDOWS:
+        # Drive-relative (D:x), alternate-stream (a:b) and device names would
+        # leave the workspace or the ordinary file namespace there.
+        for part in p.parts:
+            problem = oscompat.windows_name_problem(part)
+            if problem:
+                raise ContractError(f"Invalid project-relative path on Windows: {value!r} ({part!r} {problem})")
     return p.as_posix()
 
 
@@ -193,7 +209,7 @@ class ProjectSpec:
 
     def __post_init__(self):
         root = Path(self.root)
-        if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+        if not root.is_absolute() or not root.is_dir() or oscompat.is_link_like(root):
             raise ContractError("Project root must be an existing absolute real directory")
         if not self.objective.strip() or not self.modules or self.token_budget < 1:
             raise ContractError("Project handoff needs objective, modules and resource envelope")
@@ -233,7 +249,7 @@ class ProjectSpec:
             if not self.acceptance_checks or self.acceptance_directory is None:
                 raise ContractError("Private acceptance checks need both a directory and at least one check")
             directory = Path(self.acceptance_directory)
-            if not directory.is_absolute() or not directory.is_dir() or directory.is_symlink():
+            if not directory.is_absolute() or not directory.is_dir() or oscompat.is_link_like(directory):
                 raise ContractError("Acceptance directory must be an existing absolute real directory")
             resolved, project = directory.resolve(), root.resolve()
             if resolved == project or project in resolved.parents or resolved in project.parents:

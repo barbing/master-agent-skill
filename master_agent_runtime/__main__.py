@@ -10,11 +10,12 @@ import sqlite3
 from .contracts import Principal,ProjectSpec, RuntimeErrorBase, ContractError, OPERATOR_POLICY
 from .controller import Controller
 from .store import Store
-from .backend import select_cli, select_claude_cli
+from .backend import native_cli, select_cli, select_claude_cli
 from .recovery import reconcile
 from .admission import load_handoff_with_policy,describe_handoff
 from .health import inspect_project_state
 from .lease import project_lease
+from . import oscompat
 
 
 OPERATOR_COMMANDS = ('resolve', 'rearm', 'admission', 'budget', 'policy', 'answer', 'accept', 'reject')
@@ -24,9 +25,11 @@ async def resolve_clis(store, project_id, codex=None, claude=None):
     project = store.project(project_id)
     spec, policy = project['contract'], project['policy']
     providers = policy.providers(spec)
+    if 'claude' in providers and not oscompat.claude_sandbox_supported():
+        raise ContractError(oscompat.CLAUDE_WINDOWS_REFUSAL)
     # Validators always run under the Codex native sandbox; Codex actors need it too.
-    resolved = codex or await select_cli(model=spec.model if 'codex' in providers else None)
-    claude_cli = (claude or await select_claude_cli()) if 'claude' in providers else None
+    resolved = native_cli(codex) if codex else await select_cli(model=spec.model if 'codex' in providers else None)
+    claude_cli = (native_cli(claude) if claude else await select_claude_cli()) if 'claude' in providers else None
     return resolved, claude_cli
 
 
@@ -89,6 +92,9 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="Admit the Strategy handoff/project envelope")
     init.add_argument("handoff", type=Path)
+    doctor = commands.add_parser("doctor", help="Check this machine's CLIs, sandbox and process control; no model turn")
+    doctor.add_argument("--codex", help="Exact Codex CLI; otherwise inspect installed compatible runtimes")
+    doctor.add_argument("--claude", help="Exact Claude Code CLI for Claude actors")
     for name in ("status", "health", "run", "stop", "reconcile"):
         command = commands.add_parser(name)
         command.add_argument("project_id")
@@ -127,6 +133,11 @@ def main():
             store = Store(args.state / 'runtime.sqlite')
             result = {"project_id": store.create_project(spec, runtime_policy), "state": "admitted",
                       **describe_handoff(spec), "runtime_policy": runtime_policy.to_dict()}
+        elif args.command == "doctor":
+            from .doctor import run_doctor
+            result = run_doctor(args.state, args.codex, args.claude)
+            print(json.dumps(result, indent=2))
+            return 0 if result["ready"] else 1
         elif args.command in OPERATOR_COMMANDS:
             result = operator_action(args)
         else:
